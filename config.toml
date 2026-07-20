@@ -1,0 +1,24 @@
+[llm]
+advisor_provider = "openai"
+providers = [
+  { name = "openai", provider = "openai", model = "gpt-4o", api_key = "${OPENAI_API_KEY}", base_url = "https://api.openai.com" },
+  { name = "ollama", provider = "ollama", model = "llama3", base_url = "http://localhost:11434" },
+]
+
+[standard_ruleset]
+enabled = true
+starting_funds = 1000
+funds_per_city = 1.0
+game_speed = 60
+recruitment_rate = 10
+water_speed = 1.2
+
+unit_types = [
+  { name = "Light Infantry", symbol = "L", men = 100, equipment = ["rifles:100:0.5", "radios:10:2.0"], soft_attack = 10.0, soft_defense = 10.0, hard_attack = 0.0, hard_defense = 0.0, speed = 1.2, max_organisation = 100.0, reinforcement_rate = 5.0, base_attrition = 1.0, fighting_attrition = 2.0, recruitment_cost = 100 },
+  { name = "Heavy Infantry", symbol = "H", men = 150, equipment = ["rifles:100:0.5", "anti-tank:20:3.0", "radios:10:2.0"], soft_attack = 15.0, soft_defense = 15.0, hard_attack = 5.0, hard_defense = 10.0, speed = 0.8, max_organisation = 100.0, reinforcement_rate = 3.0, base_attrition = 2.0, fighting_attrition = 3.0, recruitment_cost = 200 },
+  { name = "Tank", symbol = "T", men = 30, equipment = ["tanks:1:20.0", "anti-tank:5:3.0", "radios:2:2.0"], soft_attack = 5.0, soft_defense = 10.0, hard_attack = 20.0, hard_defense = 15.0, speed = 1.0, max_organisation = 100.0, reinforcement_rate = 2.0, base_attrition = 5.0, fighting_attrition = 8.0, recruitment_cost = 500 },
+]
+
+[storage]
+database_path = "war_of_dots.db"
+replay_path = "replays"

@@ -1,0 +1,32 @@
+# Build artifacts
+target/
+frontend/dist/
+frontend/node_modules/
+
+# SQLite databases
+*.db
+
+# Replay files
+replays/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cargo.lock for library crates (though this is a binary)
+# Cargo.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated files
+frontend/src/generated/
+frontend/schema/node_modules
+
+# Benchmark reports (moved to reports/ for local reference)
+reports/
+*.html
+war_of_dots.db*

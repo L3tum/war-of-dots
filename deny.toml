@@ -1,0 +1,26 @@
+[licenses]
+# Allowed licenses — permissive and copyleft
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Warn about duplicate crates (multiple versions)
+multiple-versions = "warn"
+
+[advisories]
+# Block crates with unresolved security advisories
+ignore = [
+    "RUSTSEC-2021-0127",  # serde_cbor unmaintained (used by console client and server protocol)
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained (used by reqwest)
+    "RUSTSEC-2026-0098",  # rustls-webpki URI name constraint (reqwest -> rustls)
+    "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraint (reqwest -> rustls)
+    "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic (reqwest -> rustls)
+]

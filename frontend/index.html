@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>War of Dots</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      color: #fff;
+    }
+    #game-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #ui-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    #ui-overlay > * {
+      pointer-events: auto;
+    }
+    .panel {
+      background: rgba(0, 0, 0, 0.85);
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 12px;
+      margin: 8px;
+    }
+    #lobby-panel {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      min-width: 420px;
+      max-width: 520px;
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+    }
+    #lobby-panel > .panel-content {
+      overflow-y: auto;
+      overflow-x: hidden;
+      flex: 1;
+      min-height: 0;
+    }
+    .hidden { display: none !important; }
+
+    /* ── Lobby tabs ─────────────────────────────────── */
+    #lobby-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 16px;
+      border-bottom: 2px solid #333;
+    }
+    #lobby-tabs button {
+      flex: 1;
+      padding: 10px 0;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      color: #888;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+      border-bottom: 2px solid transparent;
+      margin: 0;
+    }
+    #lobby-tabs button:hover {
+      color: #ccc;
+      background: transparent;
+    }
+    #lobby-tabs button.active {
+      color: #4af;
+      border-bottom-color: #4af;
+    }
+
+    /* ── Form styling ────────────────────────────────── */
+    .form-group {
+      margin-bottom: 12px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: #aaa;
+      margin-bottom: 4px;
+    }
+    .form-group input,
+    .form-group select {
+      width: 100%;
+      box-sizing: border-box;
+      margin: 0;
+    }
+    .form-row {
+      display: flex;
+      gap: 12px;
+    }
+    .form-row .form-group {
+      flex: 1;
+    }
+    .checkbox-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .checkbox-group input[type="checkbox"] {
+      width: auto;
+      margin: 0;
+    }
+
+    /* ── Buttons ─────────────────────────────────────── */
+    .btn-primary {
+      background: #2a6dd4;
+      color: #fff;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 8px;
+    }
+    .btn-primary:hover {
+      background: #3a7de4;
+    }
+    .btn-secondary {
+      background: #444;
+      color: #fff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      margin: 4px;
+    }
+    .btn-secondary:hover {
+      background: #555;
+    }
+    .btn-danger {
+      background: #a33;
+      color: #fff;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .btn-danger:hover {
+      background: #b44;
+    }
+
+    /* ── Custom ruleset section ──────────────────────── */
+    #advanced-settings-panel {
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 12px;
+      background: rgba(255,255,255,0.03);
+    }
+    #advanced-settings-panel h4 {
+      margin: 0 0 12px 0;
+      font-size: 13px;
+      color: #aaa;
+    }
+
+    /* ── Collapsible settings sections ───────────────── */
+    .settings-section {
+      border: 1px solid #444;
+      border-radius: 6px;
+      margin-bottom: 10px;
+      background: rgba(255,255,255,0.02);
+      overflow: hidden;
+    }
+    .settings-section h4 {
+      margin: 0;
+      padding: 8px 12px;
+      font-size: 13px;
+      color: #ccc;
+      cursor: pointer;
+      user-select: none;
+      background: rgba(255,255,255,0.03);
+      transition: background 0.15s;
+    }
+    .settings-section h4:hover {
+      background: rgba(255,255,255,0.06);
+    }
+    .settings-section.collapsed .settings-body {
+      display: none;
+    }
+    .settings-body {
+      padding: 10px 12px;
+    }
+
+    /* ── Unit type editor ────────────────────────────── */
+    .unit-type-row {
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 10px;
+      background: rgba(255,255,255,0.02);
+    }
+    .unit-type-row .form-group label {
+      font-size: 11px;
+    }
+
+    /* ── Leaderboard table ───────────────────────────── */
+    #leaderboard-panel {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      min-width: 480px;
+      max-width: 600px;
+      z-index: 10001;
+    }
+    #leaderboard-panel table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    #leaderboard-panel th {
+      background: #2a2a3e;
+      padding: 8px 6px;
+      text-align: left;
+      font-size: 12px;
+      color: #aaa;
+      border-bottom: 1px solid #444;
+    }
+    #leaderboard-panel td {
+      padding: 6px;
+      font-size: 13px;
+      border-bottom: 1px solid #2a2a2a;
+    }
+    #leaderboard-panel tbody tr:nth-child(even) {
+      background: rgba(255,255,255,0.03);
+    }
+    #leaderboard-panel h4 {
+      margin: 0 0 4px 0;
+      font-size: 16px;
+    }
+
+    /* ── Slot controls ───────────────────────────────── */
+    .slot-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 4px 0;
+    }
+    .slot-row span {
+      min-width: 120px;
+      font-size: 13px;
+    }
+    .slot-row select {
+      flex: 1;
+      margin: 0;
+    }
+
+    /* ── Status messages ─────────────────────────────── */
+    .status-msg {
+      text-align: center;
+      padding: 8px;
+      font-size: 13px;
+      color: #4f4;
+      margin-top: 8px;
+    }
+    .status-msg.error {
+      color: #f44;
+    }
+
+    /* ── Debug overlay ───────────────────────────────── */
+    #debug-overlay {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0, 0, 0, 0.85);
+      border: 1px solid #ff6600;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #0f0;
+      min-width: 220px;
+      pointer-events: auto;
+      z-index: 1000;
+    }
+    #debug-overlay h4 {
+      margin: 0 0 8px 0;
+      color: #ff6600;
+      font-size: 13px;
+    }
+    #debug-overlay .stat-row {
+      display: flex;
+      justify-content: space-between;
+      margin: 2px 0;
+    }
+    #debug-overlay .stat-label { color: #888; }
+    #debug-overlay .stat-value { color: #0f0; }
+    #debug-overlay .error { color: #f00; }
+
+    input, button, select {
+      margin: 4px;
+      padding: 6px;
+      border: 1px solid #555;
+      border-radius: 4px;
+      background: #333;
+      color: #fff;
+      font-size: 14px;
+    }
+    button {
+      background: #444;
+      cursor: pointer;
+    }
+    button:hover { background: #555; }
+    #spectator-panel {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      max-height: 60vh;
+      overflow-y: auto;
+      min-width: 300px;
+    }
+    .player-reason {
+      background: #222;
+      padding: 8px;
+      margin: 4px 0;
+      border-left: 3px solid #0af;
+      font-size: 12px;
+    }
+    #advisor-panel {
+      position: absolute;
+      bottom: 8px;
+      left: 8px;
+      max-width: 400px;
+    }
+    #stats-panel {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      font-size: 14px;
+    }
+    #map-editor {
+      position: absolute;
+      bottom: 8px;
+      right: 8px;
+    }
+    #disconnected-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.8);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      font-size: 24px;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+  <div id="ui-overlay">
+    <div id="disconnected-overlay">
+      <span>Disconnected from server</span>
+    </div>
+    <div id="game-over-overlay" class="hidden" style="position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);align-items:center;justify-content:center;z-index:9999;">
+      <div class="panel" style="text-align:center;padding:32px;min-width:400px;">
+        <h2 id="game-over-title" style="color:#4caf50;font-size:32px;margin-bottom:16px;"></h2>
+        <p style="margin-bottom:24px;">Game Over — Last player standing wins!</p>
+        <div>
+          <a id="replay-link" href="/replay" style="padding:12px 24px;background:#4caf50;color:#fff;border:none;border-radius:8px;text-decoration:none;font-size:16px;cursor:pointer;">📼 Watch Replay</a>
+          <a href="/" style="padding:12px 24px;background:#444;color:#fff;border:none;border-radius:8px;text-decoration:none;font-size:16px;cursor:pointer;margin-left:12px;">🏠 Return to Lobby</a>
+        </div>
+      </div>
+    </div>
+    <div id="lobby-panel" class="panel">
+      <h2 style="margin:0 0 16px 0;text-align:center;">⚔ War of Dots</h2>
+
+      <!-- Tabs -->
+      <div id="lobby-tabs">
+        <button id="tab-create" class="active">Create</button>
+        <button id="tab-join">Join</button>
+        <button id="tab-leaderboard">🏆 Leaderboard</button>
+      </div>
+
+      <div class="panel-content">
+      <!-- Create tab -->
+      <div id="lobby-panel-create">
+        <div class="form-group">
+          <label>Map</label>
+          <select id="map-select"></select>
+        </div>
+        <div class="checkbox-group">
+          <input type="checkbox" id="use-standard-ruleset" checked>
+          <label for="use-standard-ruleset">Use Standard Ruleset</label>
+        </div>
+
+        <!-- Advanced settings (hidden when standard ruleset is checked) -->
+        <div id="advanced-settings-panel" class="hidden">
+          <!-- Basic Economy -->
+          <div class="settings-section">
+            <h4 onclick="this.parentElement.classList.toggle('collapsed')">⚙ Economy &amp; Speed</h4>
+            <div class="settings-body">
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Starting Funds</label>
+                  <input type="number" id="starting-funds" value="1000" min="0">
+                </div>
+                <div class="form-group">
+                  <label>Funds per City / tick</label>
+                  <input type="number" id="funds-per-city" value="1.0" step="0.1" min="0">
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Game Speed (TPS)</label>
+                  <input type="number" id="game-speed" value="60" min="1" max="240">
+                </div>
+                <div class="form-group">
+                  <label>Max Players</label>
+                  <select id="max-players">
+                    <option value="2">2</option>
+                    <option value="4">4</option>
+                    <option value="6">6</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Recruitment Cooldown (ticks)</label>
+                  <input type="number" id="recruitment-rate" value="10" min="0" step="1" title="Ticks between recruitment actions (0 = no cooldown)">
+                </div>
+                <div class="form-group">
+                  <label>Water Speed Modifier</label>
+                  <input type="number" id="water-speed" value="1.2" step="0.1" min="0" title="Speed multiplier for water tiles">
+                </div>
+              </div>
+              <div class="checkbox-group">
+                <input type="checkbox" id="spectator-vision">
+                <label for="spectator-vision">Enable spectator vision</label>
+              </div>
+            </div>
+          </div>
+
+          <!-- City Upgrades -->
+          <div class="settings-section">
+            <h4 onclick="this.parentElement.classList.toggle('collapsed')">🏰 City Upgrades</h4>
+            <div class="settings-body">
+              <div class="checkbox-group">
+                <input type="checkbox" id="city-upgrades-enabled">
+                <label for="city-upgrades-enabled">Enable city upgrades &amp; supply system</label>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Max City Level</label>
+                  <input type="number" id="city-max-level" value="100" min="1">
+                </div>
+                <div class="form-group">
+                  <label>Base Upgrade Cost</label>
+                  <input type="number" id="city-base-upgrade-cost" value="200" min="0">
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Income Growth / Level</label>
+                  <input type="number" id="city-income-growth" value="0.5" step="0.1" min="0" title="Income multiplier increase per level">
+                </div>
+                <div class="form-group">
+                  <label>Base Supply Range</label>
+                  <input type="number" id="city-base-supply-range" value="5.0" step="0.5" min="0" title="Supply range at level 1">
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Supply Range Growth / Level</label>
+                  <input type="number" id="city-supply-range-growth" value="3.0" step="0.5" min="0" title="Extra range per level above 1">
+                </div>
+                <div class="form-group">
+                  <label>Secondary City Decay</label>
+                  <input type="number" id="city-secondary-decay" value="0.5" step="0.1" min="0" max="1" title="Decay for non-closest city supply (0=ignored, 1=equal)">
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Manpower Regen / tick / city level</label>
+                <input type="number" id="city-manpower-regen" value="10.0" step="0.5" min="0" title="Manpower added per economy tick per city level">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Custom unit types (only shown when standard ruleset is unchecked) -->
+        <div id="custom-ruleset-panel" class="hidden" style="margin-top:12px;">
+          <h4 style="font-size:13px;color:#aaa;margin:0 0 8px 0;">Custom Unit Types</h4>
+          <div id="unit-types-editor"></div>
+          <button id="add-unit-type-btn" class="btn-secondary" style="margin-top:8px;">+ Add Unit Type</button>
+        </div>
+
+        <div class="form-group" style="margin-top:12px;">
+          <label>Your Name</label>
+          <input type="text" id="create-player-name" placeholder="Enter your name (required)">
+        </div>
+        <div class="form-group" style="margin-top:12px;">
+          <label>Password (optional)</label>
+          <input type="password" id="lobby-password" placeholder="Leave empty for public lobby">
+        </div>
+
+        <button id="create-lobby-btn" class="btn-primary">Create Lobby</button>
+        <div id="create-status" class="status-msg hidden"></div>
+      </div>
+
+      <!-- Join tab -->
+      <div id="lobby-panel-join" class="hidden">
+        <div class="form-group">
+          <label>Lobby Code</label>
+          <input type="text" id="lobby-code" placeholder="Enter the lobby code">
+        </div>
+        <div class="form-group">
+          <label>Your Name (optional)</label>
+          <input type="text" id="join-player-name" placeholder="Auto-generated if empty">
+        </div>
+        <div class="form-group">
+          <label>Password (if required)</label>
+          <input type="password" id="join-password" placeholder="Leave empty if no password">
+        </div>
+        <button id="join-lobby-btn" class="btn-primary">Join Lobby</button>
+        <div id="join-status" class="status-msg hidden"></div>
+      </div>
+
+      <!-- Waiting room (shown after joining/creating a lobby) -->
+      <div id="lobby-info" class="hidden">
+        <h3 style="margin:0 0 12px 0;">Waiting Room</h3>
+        <p style="font-size:13px;color:#aaa;">Code: <strong id="lobby-code-display" style="color:#fff;font-size:16px;letter-spacing:2px;"></strong></p>
+        <div id="lobby-players" style="margin:12px 0;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;min-height:24px;"></div>
+        <div id="slot-controls" class="hidden" style="margin-top:8px;"></div>
+        <button id="start-game-btn" class="btn-primary" style="margin-top:12px;">Start Game</button>
+      </div>
+      </div>
+    </div>
+
+    <!-- ── Leaderboard panel (outside lobby, stays visible during game) ── -->
+    <div id="leaderboard-panel" class="panel hidden">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h4>🏆 Leaderboard</h4>
+        <button id="leaderboard-close-btn" class="btn-danger">✕</button>
+      </div>
+      <div id="leaderboard-content" style="margin-top:8px;"></div>
+    </div>
+    <div id="stats-panel" class="panel hidden"></div>
+    <div id="city-labels" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:hidden;"></div>
+    <div id="unit-info-panel" class="panel hidden" style="position:absolute;top:8px;right:8px;min-width:200px;font-size:13px;">
+      <h4 id="unit-info-title" style="margin:0 0 8px 0;">Unit Info</h4>
+      <div id="unit-info-details"></div>
+      <div id="unit-info-actions" style="margin-top:8px;"></div>
+    </div>
+    <div id="city-info-panel" class="panel hidden" style="position:absolute;top:8px;right:8px;min-width:200px;font-size:13px;">
+      <h4 id="city-info-title" style="margin:0 0 8px 0;">City Info</h4>
+      <div id="city-info-details"></div>
+      <div id="city-info-actions" style="margin-top:8px;"></div>
+    </div>
+    <div id="spectator-panel" class="panel hidden">
+      <h3>Spectator View</h3>
+      <div id="spectator-players" style="margin-bottom: 8px;"></div>
+      <div id="spectator-reasons"></div>
+    </div>
+    <div id="advisor-panel" class="panel hidden"></div>
+    <div id="watch-panel" class="panel hidden" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:300px;">
+      <h2>📼 Spectator Mode</h2>
+      <p>Connect to watch the current game as a spectator.</p>
+      <button id="watch-connect-btn" style="padding:12px 24px;font-size:16px;">Connect as Spectator</button>
+      <button id="watch-close-btn" style="padding:12px 24px;font-size:16px;margin-left:12px;">Back to Lobby</button>
+    </div>
+  <!-- Debug overlay (hidden by default, shown when debug stats available) -->
+    <div id="debug-overlay" class="hidden">
+      <h4>⚡ Debug Stats</h4>
+      <div id="debug-stats-content">
+        <div class="stat-row"><span class="stat-label">Tick:</span><span class="stat-value" id="debug-tick">-</span></div>
+        <div class="stat-row"><span class="stat-label">Last tick:</span><span class="stat-value" id="debug-last-tick">-</span></div>
+        <div class="stat-row"><span class="stat-label">Avg tick:</span><span class="stat-value" id="debug-avg-tick">-</span></div>
+        <div class="stat-row"><span class="stat-label">Entities:</span><span class="stat-value" id="debug-entities">-</span></div>
+        <div class="stat-row"><span class="stat-label">Archetypes:</span><span class="stat-value" id="debug-archetypes">-</span></div>
+        <div class="stat-row"><span class="stat-label">Active games:</span><span class="stat-value" id="debug-games">-</span></div>
+        <div class="stat-row"><span class="stat-label">FPS:</span><span class="stat-value" id="debug-fps">-</span></div>
+        <div class="stat-row"><span class="stat-label">Render:</span><span class="stat-value" id="debug-render-error" style="color:#4f4;">ok</span></div>
+        <hr style="border-color:#444;margin:8px 0;">
+        <div style="font-size:11px;color:#888;margin-bottom:4px;">SYSTEM TIMING (avg):</div>
+        <div id="debug-systems"></div>
+      </div>
+    </div>
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>

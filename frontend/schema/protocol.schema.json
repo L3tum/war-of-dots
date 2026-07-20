@@ -1,0 +1,890 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ServerMessage",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "ClearSpectator"
+      ]
+    },
+    {
+      "type": "object",
+      "required": [
+        "FullState"
+      ],
+      "properties": {
+        "FullState": {
+          "$ref": "#/definitions/GameStateMessage"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "DeltaState"
+      ],
+      "properties": {
+        "DeltaState": {
+          "$ref": "#/definitions/GameDeltaMessage"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "LobbyCreated"
+      ],
+      "properties": {
+        "LobbyCreated": {
+          "type": "object",
+          "required": [
+            "lobby_code"
+          ],
+          "properties": {
+            "lobby_code": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "LobbyUpdate"
+      ],
+      "properties": {
+        "LobbyUpdate": {
+          "type": "object",
+          "required": [
+            "players",
+            "settings"
+          ],
+          "properties": {
+            "players": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/LobbyPlayer"
+              }
+            },
+            "settings": {
+              "$ref": "#/definitions/LobbySettings"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "Error"
+      ],
+      "properties": {
+        "Error": {
+          "type": "object",
+          "required": [
+            "message"
+          ],
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "LlmReasonLog"
+      ],
+      "properties": {
+        "LlmReasonLog": {
+          "type": "object",
+          "required": [
+            "action",
+            "player_name",
+            "reason"
+          ],
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "player_name": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "Advice"
+      ],
+      "properties": {
+        "Advice": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "Leaderboard"
+      ],
+      "properties": {
+        "Leaderboard": {
+          "type": "object",
+          "required": [
+            "entries"
+          ],
+          "properties": {
+            "entries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/LeaderboardEntry"
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "GameOver"
+      ],
+      "properties": {
+        "GameOver": {
+          "type": "object",
+          "required": [
+            "game_id",
+            "message",
+            "winner"
+          ],
+          "properties": {
+            "game_id": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "winner": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "CityState": {
+      "type": "object",
+      "required": [
+        "id",
+        "level",
+        "manpower",
+        "position"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "level": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "manpower": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "position": {
+          "type": "array",
+          "items": [
+            {
+              "type": "number",
+              "format": "float"
+            },
+            {
+              "type": "number",
+              "format": "float"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        }
+      }
+    },
+    "CityUpdate": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "level": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "manpower": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "CustomUnitType": {
+      "description": "Configuration for a custom unit type in lobby settings",
+      "type": "object",
+      "required": [
+        "equipment",
+        "hard_attack",
+        "hard_defense",
+        "max_organisation",
+        "men",
+        "name",
+        "recruitment_cost",
+        "reinforcement_rate",
+        "soft_attack",
+        "soft_defense",
+        "speed",
+        "symbol"
+      ],
+      "properties": {
+        "equipment": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0.0
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "hard_attack": {
+          "type": "number",
+          "format": "float"
+        },
+        "hard_defense": {
+          "type": "number",
+          "format": "float"
+        },
+        "max_organisation": {
+          "type": "number",
+          "format": "float"
+        },
+        "men": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "type": "string"
+        },
+        "recruitment_cost": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reinforcement_rate": {
+          "type": "number",
+          "format": "float"
+        },
+        "soft_attack": {
+          "type": "number",
+          "format": "float"
+        },
+        "soft_defense": {
+          "type": "number",
+          "format": "float"
+        },
+        "speed": {
+          "type": "number",
+          "format": "float"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      }
+    },
+    "EquipmentState": {
+      "type": "object",
+      "required": [
+        "cost_per_item",
+        "count",
+        "name"
+      ],
+      "properties": {
+        "cost_per_item": {
+          "type": "number",
+          "format": "float"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "GameDeltaMessage": {
+      "type": "object",
+      "required": [
+        "city_updates",
+        "player",
+        "unit_updates",
+        "units_added",
+        "units_removed"
+      ],
+      "properties": {
+        "border_grid_diff": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        "city_updates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CityUpdate"
+          }
+        },
+        "player": {
+          "$ref": "#/definitions/PlayerState"
+        },
+        "unit_updates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnitUpdate"
+          }
+        },
+        "units_added": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnitState"
+          }
+        },
+        "units_removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "vision_grid_diff": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "GameStateMessage": {
+      "type": "object",
+      "required": [
+        "cities",
+        "player",
+        "units"
+      ],
+      "properties": {
+        "border_grid": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        "cities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CityState"
+          }
+        },
+        "player": {
+          "$ref": "#/definitions/PlayerState"
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnitState"
+          }
+        },
+        "vision_grid": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "LeaderboardEntry": {
+      "description": "Leaderboard entry",
+      "type": "object",
+      "required": [
+        "avg_casualties",
+        "games_played",
+        "games_won",
+        "name",
+        "player_id"
+      ],
+      "properties": {
+        "avg_casualties": {
+          "type": "number",
+          "format": "float"
+        },
+        "games_played": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "games_won": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "player_id": {
+          "type": "string"
+        }
+      }
+    },
+    "LobbyPlayer": {
+      "type": "object",
+      "required": [
+        "id",
+        "is_human",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "is_human": {
+          "type": "boolean"
+        },
+        "llm_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "LobbySettings": {
+      "type": "object",
+      "required": [
+        "custom_unit_types",
+        "funds_per_city",
+        "game_speed",
+        "llm_thinking_delay",
+        "map",
+        "max_players",
+        "spectator_vision",
+        "starting_funds",
+        "use_standard_ruleset"
+      ],
+      "properties": {
+        "custom_unit_types": {
+          "description": "Custom unit types when use_standard_ruleset is false",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CustomUnitType"
+          }
+        },
+        "funds_per_city": {
+          "type": "number",
+          "format": "float"
+        },
+        "game_speed": {
+          "type": "number",
+          "format": "float"
+        },
+        "llm_thinking_delay": {
+          "type": "number",
+          "format": "double"
+        },
+        "map": {
+          "type": "string"
+        },
+        "max_players": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "spectator_vision": {
+          "description": "If true, spectators see union of all players' vision",
+          "type": "boolean"
+        },
+        "starting_funds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "use_standard_ruleset": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PlayerState": {
+      "type": "object",
+      "required": [
+        "funds",
+        "units_owned"
+      ],
+      "properties": {
+        "funds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "units_owned": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UnitState": {
+      "type": "object",
+      "required": [
+        "attacking",
+        "boat_supply_percent",
+        "disembarking",
+        "embarking",
+        "encircled",
+        "equipment",
+        "healing",
+        "id",
+        "max_equipment",
+        "max_men",
+        "men",
+        "on_water",
+        "organisation",
+        "owner",
+        "path",
+        "position",
+        "resupply_enabled",
+        "supply_percent",
+        "symbol",
+        "unit_type"
+      ],
+      "properties": {
+        "attacking": {
+          "type": "boolean"
+        },
+        "boat_supply_percent": {
+          "description": "Boat supply as percentage of max boat supply (0-100)",
+          "type": "number",
+          "format": "float"
+        },
+        "disembarking": {
+          "description": "Whether this unit is disembarking (transitioning from water to land)",
+          "type": "boolean"
+        },
+        "embarking": {
+          "description": "Whether this unit is embarking (transitioning from land to water)",
+          "type": "boolean"
+        },
+        "encircled": {
+          "type": "boolean"
+        },
+        "equipment": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EquipmentState"
+          }
+        },
+        "healing": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "max_equipment": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EquipmentState"
+          }
+        },
+        "max_men": {
+          "type": "number",
+          "format": "float"
+        },
+        "men": {
+          "type": "number",
+          "format": "float"
+        },
+        "on_water": {
+          "description": "Whether this unit is currently traveling on water",
+          "type": "boolean"
+        },
+        "organisation": {
+          "type": "number",
+          "format": "float"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "number",
+                "format": "float"
+              },
+              {
+                "type": "number",
+                "format": "float"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "position": {
+          "type": "array",
+          "items": [
+            {
+              "type": "number",
+              "format": "float"
+            },
+            {
+              "type": "number",
+              "format": "float"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "resupply_enabled": {
+          "type": "boolean"
+        },
+        "supply_percent": {
+          "type": "number",
+          "format": "float"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "unit_type": {
+          "type": "string"
+        }
+      }
+    },
+    "UnitUpdate": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "attacking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "boat_supply_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "disembarking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "embarking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "encircled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "equipment": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/EquipmentState"
+          }
+        },
+        "healing": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "men": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "on_water": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "organisation": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "path": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "number",
+                "format": "float"
+              },
+              {
+                "type": "number",
+                "format": "float"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "position": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": [
+            {
+              "type": "number",
+              "format": "float"
+            },
+            {
+              "type": "number",
+              "format": "float"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "resupply_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supply_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "war-of-dots-frontend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --target=es2020 && cp index.html dist/index.html",
+    "dev": "esbuild src/main.ts --bundle --outfile=dist/index.html --target=es2020 --servedir=dist",
+    "generate-types": "cd .. && cargo run --bin generate_schema && npx json2ts frontend/schema/protocol.schema.json > frontend/src/generated/protocol.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/ --max-warnings=0",
+    "lint:fix": "eslint src/ --fix",
+    "fmt": "prettier --write 'src/**/*.ts'",
+    "fmt:check": "prettier --check 'src/**/*.ts'",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "cbor-x": "^1.6.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.37.0",
+    "@webgpu/types": "^0.1.71",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.37.0",
+    "happy-dom": "^20.11.1",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.46.0",
+    "vitest": "^4.1.10"
+  }
+}
