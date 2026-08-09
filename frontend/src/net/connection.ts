@@ -2,7 +2,13 @@
 
 import { decode, encode } from 'cbor-x';
 import { CELL_SIZE } from '../game/config';
-import { LeaderboardEntry, ServerMessage } from '../generated/protocol';
+import { TerrainType } from '../game/terrain';
+import {
+  GameDeltaMessage,
+  GameStateMessage,
+  LeaderboardEntry,
+  ServerMessage,
+} from '../generated/protocol';
 import { GameState } from '../game/game_state';
 import { Renderer } from '../game/renderer';
 import { Unit } from '../game/units';
@@ -120,7 +126,10 @@ export class Connection {
 
     this.ws.onclose = () => {
       try {
-        console.log('Disconnected');
+        // Debug-only log (avoid noisy prod logging)
+        if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+          console.log('Disconnected');
+        }
         this.showDisconnected(true);
         this.reconnect();
       } catch (err) {
@@ -249,10 +258,9 @@ export class Connection {
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private applyFullState(state: any) {
+  private applyFullState(state: GameStateMessage) {
     try {
-      this.gameState.terrain = state.terrain;
+      this.gameState.terrain = state.terrain as TerrainType[][];
       this.gameState.visionGrid = state.vision_grid ?? [];
       this.gameState.borderGrid = state.border_grid ?? [];
       this.renderer.markFogDirty();
@@ -348,8 +356,7 @@ export class Connection {
     if (cityLabels) cityLabels.classList.remove('hidden');
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private applyDelta(delta: any) {
+  private applyDelta(delta: GameDeltaMessage) {
     try {
       if (delta.vision_grid_diff) {
         this.gameState.visionGrid = delta.vision_grid_diff;
@@ -370,29 +377,29 @@ export class Connection {
         const unit = this.gameState.units.get(update.id);
         if (unit) {
           if (update.position) unit.position = { x: update.position[0], y: update.position[1] };
-          if (update.men !== undefined) unit.men = update.men;
-          if (update.organisation !== undefined) unit.organisation = update.organisation;
+          if (update.men != null) unit.men = update.men;
+          if (update.organisation != null) unit.organisation = update.organisation;
           if (update.equipment) unit.equipment = update.equipment;
           if (update.path) unit.path = update.path;
-          if (update.healing !== undefined) unit.healing = update.healing;
-          if (update.resupply_enabled !== undefined) unit.resupplyEnabled = update.resupply_enabled;
-          if (update.supply_percent !== undefined) unit.supplyPercent = update.supply_percent;
-          if (update.encircled !== undefined) unit.encircled = update.encircled;
-          if (update.attacking !== undefined) unit.attacking = update.attacking;
+          if (update.healing != null) unit.healing = update.healing;
+          if (update.resupply_enabled != null) unit.resupplyEnabled = update.resupply_enabled;
+          if (update.supply_percent != null) unit.supplyPercent = update.supply_percent;
+          if (update.encircled != null) unit.encircled = update.encircled;
+          if (update.attacking != null) unit.attacking = update.attacking;
           // Water travel fields
-          if (update.on_water !== undefined) unit.onWater = update.on_water;
-          if (update.boat_supply_percent !== undefined)
+          if (update.on_water != null) unit.onWater = update.on_water;
+          if (update.boat_supply_percent != null)
             unit.boatSupplyPercent = update.boat_supply_percent;
-          if (update.embarking !== undefined) unit.embarking = update.embarking;
-          if (update.disembarking !== undefined) unit.disembarking = update.disembarking;
+          if (update.embarking != null) unit.embarking = update.embarking;
+          if (update.disembarking != null) unit.disembarking = update.disembarking;
         }
       }
       for (const update of delta.city_updates || []) {
         const city = this.gameState.cities.get(update.id);
         if (city) {
-          if (update.manpower !== undefined) city.manpower = update.manpower;
-          if (update.owner !== undefined) city.owner = update.owner;
-          if (update.level !== undefined) city.level = update.level;
+          if (update.manpower != null) city.manpower = update.manpower;
+          if (update.owner != null) city.owner = update.owner;
+          if (update.level != null) city.level = update.level;
         }
       }
       if (delta.player) {

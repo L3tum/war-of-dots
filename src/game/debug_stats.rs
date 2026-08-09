@@ -175,6 +175,41 @@ impl DetailedTimer {
     }
 }
 
+/// Record a whole-system timing into `system_timings` (the per-system breakdown
+/// read by the benchmark and the debug overlay). Called once per system invocation
+/// by the `tick_system!` macro; the world/world_entity are passed explicitly so
+/// the macro does not need to touch `self`/`guard` (macro-hygiene safe).
+#[cfg(any(debug_assertions, feature = "debug-overlay"))]
+pub fn record_system_timing(
+    world: &mut World,
+    world_entity: hecs::Entity,
+    system_name: &str,
+    duration_ms: f64,
+) {
+    if let Some(wb) = world.world_data_mut(world_entity) {
+        let ds = &mut wb.debug_stats;
+        let timings = &mut ds.system_timings;
+        let entry = timings.entry(system_name.to_string()).or_insert_with(|| {
+            super::components::SystemTimings {
+                total_ms: 0.0,
+                call_count: 0,
+                last_ms: 0.0,
+                avg_ms: 0.0,
+                durations_ms: Vec::new(),
+            }
+        });
+        entry.total_ms += duration_ms;
+        entry.call_count += 1;
+        entry.last_ms = duration_ms;
+        entry.avg_ms = entry.total_ms / entry.call_count as f64;
+        // Keep bounded buffer for P90/P99
+        if entry.durations_ms.len() > 200 {
+            entry.durations_ms.remove(0);
+        }
+        entry.durations_ms.push(duration_ms);
+    }
+}
+
 /// Get debug stats as JSON-serializable structure.
 pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serde_json::Value> {
     let wb_ref = world.world_data(world_entity)?;

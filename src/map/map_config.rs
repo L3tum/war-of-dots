@@ -3,9 +3,14 @@
 use crate::game::unit::Terrain;
 use crate::map::map::{Map, MapConfig};
 
-pub fn load_map(path: &str) -> anyhow::Result<Map> {
-    let content = std::fs::read_to_string(path)?;
-    let config: MapConfig = serde_json::from_str(&content)?;
+pub fn load_map(path: &str) -> Result<Map, crate::errors::MapError> {
+    let content = std::fs::read_to_string(path).map_err(|_| crate::errors::MapError::NotFound {
+        path: path.to_string(),
+    })?;
+    let config: MapConfig =
+        serde_json::from_str(&content).map_err(|e| crate::errors::MapError::InvalidFormat {
+            detail: e.to_string(),
+        })?;
     Ok(Map::from_config(&config))
 }
 

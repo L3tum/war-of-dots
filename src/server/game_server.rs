@@ -478,9 +478,8 @@ impl GameRoom {
                         while let Ok(cmd) = cmd_rx.try_recv() {
                             match cmd {
                                 Command::MoveTroop { unit_id, owner_id, path } => {
-                                    if game.get_unit_owner(&unit_id) == Some(owner_id) {
-                                        game.move_troops(&unit_id, path);
-                                    }
+                                    // Ownership is enforced inside game.move_troops (single check).
+                                    game.move_troops(&unit_id, &owner_id, path);
                                 }
                                 Command::RecruitUnit(city_id, unit_type_name, owner) => {
                                     if let Some(unit_type) = game.settings().unit_types.iter().find(|u| u.name == unit_type_name).cloned() {
@@ -488,14 +487,10 @@ impl GameRoom {
                                     }
                                 }
                                 Command::ToggleHealing { unit_id, owner_id, enabled } => {
-                                    if game.get_unit_owner(&unit_id) == Some(owner_id) {
-                                        game.toggle_healing(&unit_id, enabled);
-                                    }
+                                    game.toggle_healing(&unit_id, &owner_id, enabled);
                                 }
                                 Command::ToggleResupply { unit_id, owner_id, enabled } => {
-                                    if game.get_unit_owner(&unit_id) == Some(owner_id) {
-                                        game.toggle_resupply(&unit_id, enabled);
-                                    }
+                                    game.toggle_resupply(&unit_id, &owner_id, enabled);
                                 }
                                 Command::UpgradeCity(city_id, owner) => {
                                     let _ = game.upgrade_city(&city_id, &owner);
@@ -543,7 +538,7 @@ impl GameRoom {
                         }
 
                         // --- Check game over ---
-                        let winner_id_opt = determine_winner(&game);
+                        let winner_id_opt = game.determine_winner();
                         let player_ids: Vec<String> = game.players().keys().cloned().collect();
                         let total_players = player_ids.len();
                         let active_count = player_ids.iter().filter(|pid| {
@@ -663,7 +658,7 @@ impl GameRoom {
                             .filter(|p| matches!(p, PlayerConnection::Player { .. }))
                             .count();
                         if human_count == 0 {
-                            let winner_id = determine_winner(&game);
+                            let winner_id = game.determine_winner();
                             let player_ids: Vec<&str> = game.players().keys().map(|s| s.as_str()).collect();
                             let end_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -698,7 +693,7 @@ impl GameRoom {
                         }
 
                         if players.is_empty() {
-                            let winner_id = determine_winner(&game);
+                            let winner_id = game.determine_winner();
                             let player_ids: Vec<&str> = game.players().keys().map(|s| s.as_str()).collect();
                             let end_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -725,10 +720,8 @@ impl GameRoom {
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(Command::MoveTroop { unit_id, owner_id, path }) => {
-                                // Verify unit ownership
-                                if game.get_unit_owner(&unit_id) == Some(owner_id) {
-                                    game.move_troops(&unit_id, path);
-                                }
+                                // Ownership is enforced inside game.move_troops (single check).
+                                game.move_troops(&unit_id, &owner_id, path);
                             }
                             Some(Command::RecruitUnit(city_id, unit_type_name, owner)) => {
                                 if let Some(unit_type) = game.settings().unit_types.iter().find(|u| u.name == unit_type_name).cloned() {
@@ -736,14 +729,10 @@ impl GameRoom {
                                 }
                             }
                             Some(Command::ToggleHealing { unit_id, owner_id, enabled }) => {
-                                if game.get_unit_owner(&unit_id) == Some(owner_id) {
-                                    game.toggle_healing(&unit_id, enabled);
-                                }
+                                game.toggle_healing(&unit_id, &owner_id, enabled);
                             }
                             Some(Command::ToggleResupply { unit_id, owner_id, enabled }) => {
-                                if game.get_unit_owner(&unit_id) == Some(owner_id) {
-                                    game.toggle_resupply(&unit_id, enabled);
-                                }
+                                game.toggle_resupply(&unit_id, &owner_id, enabled);
                             }
                             Some(Command::UpgradeCity(city_id, owner)) => {
                                 let _ = game.upgrade_city(&city_id, &owner);
@@ -798,29 +787,6 @@ impl From<&crate::game::economy::City> for CityState {
 }
 
 /// Determine the winner of the game — the last player with units/cities
-fn determine_winner(game: &Game) -> Option<String> {
-    // Find players with remaining units or cities
-    let mut players_with_power: Vec<(&String, u32)> = Vec::new();
-    for pid in game.players().keys() {
-        let unit_count = game
-            .unit_states()
-            .iter()
-            .filter(|u| &u.owner == pid)
-            .count() as u32;
-        let city_count = game
-            .query_cities()
-            .iter()
-            .filter(|c| c.owner.as_deref() == Some(pid))
-            .count() as u32;
-        let total_funds = game.all_player_funds().get(pid).copied().unwrap_or(0);
-        if unit_count > 0 || city_count > 0 {
-            players_with_power.push((pid, unit_count + city_count + total_funds / 100));
-        }
-    }
-    players_with_power.sort_by_key(|b| std::cmp::Reverse(b.1));
-    players_with_power.first().map(|(pid, _)| pid.to_string())
-}
-
 #[allow(dead_code)]
 impl Game {
     fn full_state(&self) -> GameStateMessage {
@@ -860,8 +826,16 @@ impl Game {
         let units: Vec<UnitState> = self.unit_states().to_vec();
         let cities: Vec<CityState> = self.query_cities().iter().map(|c| c.into()).collect();
         let terrain = self.terrain_grid_2d();
-        let player_funds: u32 = self.all_player_funds().values().sum();
-        let units_owned: u32 = self.unit_states().len() as u32;
+        // Per-player funds/units for the viewing player, matching the delta system.
+        // For a supervisor view (player_id == None) fall back to the aggregate totals.
+        let player_funds: u32 = match player_id {
+            Some(pid) => self.player_funds(pid),
+            None => self.all_player_funds().values().sum(),
+        };
+        let units_owned: u32 = match player_id {
+            Some(pid) => units.iter().filter(|u| u.owner == pid).count() as u32,
+            None => units.len() as u32,
+        };
         GameStateMessage {
             vision_grid,
             border_grid,
@@ -1174,6 +1148,7 @@ pub(crate) async fn handle_replay_ws(
                     map,
                     crate::game::game::GameSettings {
                         starting_funds: 100,
+                        initial_manpower: 2000,
                         funds_per_city: 10.0,
                         recruitment_rate: 10.0,
                         game_speed: 60.0,
@@ -1307,17 +1282,24 @@ pub(crate) async fn handle_tcp_client(
                     Ok(msg) => {
                         handle_client_message(&conn_id, server_state.clone(), &msg, &player_sender)
                             .await;
+                        // Message fully consumed — reset the buffer. The console client writes
+                        // one complete CBOR message per write, so a single message either
+                        // arrives within one read or is fully reassembled before this point.
+                        buf.clear();
                     }
                     Err(e) => {
-                        tracing::info!(error = %e, msg_len = buf.len(), "Failed to decode ClientMessage (TCP)");
-                        let resp = ServerMessage::Error {
-                            message: "Invalid message format".to_string(),
-                        };
-                        let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        // Do NOT clear on decode failure: a CBOR message can be split across
+                        // multiple TCP reads. Keep the undecoded bytes so the next read can
+                        // reassemble the partial message instead of discarding it.
+                        // Buffer growth is bounded by the size-limit check above (1MB), so a
+                        // client that sends malformed data will eventually be disconnected.
+                        tracing::info!(
+                            error = %e,
+                            msg_len = buf.len(),
+                            "Failed to decode ClientMessage (TCP), buffering for reassembly"
+                        );
                     }
                 }
-                buf.clear();
             }
             Err(_) => break,
         }
@@ -1666,13 +1648,7 @@ pub(crate) async fn handle_client_message(
                         let _ = player_sender.send(encoded).await;
                     }
                 }
-                LobbyMessage::SetSlotLlmConfig {
-                    slot,
-                    provider,
-                    model,
-                    api_key,
-                    base_url,
-                } => {
+                LobbyMessage::SetSlotLlmConfig { slot, model } => {
                     if let Some((player_id, lobby_code)) = {
                         let server = server_state.lock().await;
                         let player_map = server.player_map.lock().await;
@@ -1696,11 +1672,33 @@ pub(crate) async fn handle_client_message(
                             let _ = player_sender.send(encoded).await;
                             return;
                         }
+
+                        // The wire message carries only { slot, model }. Resolve the
+                        // provider and its secret(s) (API key, base URL) server-side from
+                        // the configured LLM providers, so no secrets ever cross the wire.
+                        let (provider_name, api_key, base_url) = {
+                            let server = server_state.lock().await;
+                            let lobby_manager = server.lobby_manager.lock().await;
+                            let provider_name = lobby_manager
+                                .get_lobby(&lobby_code)
+                                .and_then(|l| l.players.get(*slot as usize))
+                                .and_then(|p| p.llm_provider.clone())
+                                .unwrap_or_default();
+                            let (api_key, base_url) =
+                                match server.config.llm.providers.iter().find(|c| {
+                                    c.name == provider_name || c.provider == provider_name
+                                }) {
+                                    Some(pc) => (pc.api_key.clone(), pc.base_url.clone()),
+                                    None => (None, None),
+                                };
+                            (provider_name, api_key, base_url)
+                        };
+
                         let config = crate::llm::agent::LlmAgentConfig {
-                            provider: provider.clone(),
+                            provider: provider_name.clone(),
                             model: model.clone(),
-                            api_key: api_key.clone(),
-                            base_url: base_url.clone(),
+                            api_key,
+                            base_url,
                         };
                         let result = {
                             let server = server_state.lock().await;
@@ -1712,12 +1710,19 @@ pub(crate) async fn handle_client_message(
                             let encoded = encode_message(&resp);
                             let _ = player_sender.send(encoded).await;
                         } else {
-                            // Also update the player's llm_provider for display
-                            let _result = {
-                                let server = server_state.lock().await;
-                                let mut lobby_manager = server.lobby_manager.lock().await;
-                                lobby_manager.set_slot_llm(&lobby_code, *slot, provider.clone())
-                            };
+                            // Also update the player's llm_provider for display (idempotent
+                            // when the provider was already selected via SetSlotLlm).
+                            if !provider_name.is_empty() {
+                                let _result = {
+                                    let server = server_state.lock().await;
+                                    let mut lobby_manager = server.lobby_manager.lock().await;
+                                    lobby_manager.set_slot_llm(
+                                        &lobby_code,
+                                        *slot,
+                                        provider_name.clone(),
+                                    )
+                                };
+                            }
                             // Broadcast LobbyUpdate
                             let (players, settings) = {
                                 let server = server_state.lock().await;
@@ -1899,20 +1904,8 @@ pub(crate) async fn handle_client_message(
                             };
 
                             let settings = lobby.settings.clone();
-                            // Convert protocol CityUpgradeSettings -> config CityUpgradeSettings
-                            let to_config_city =
-                                |cs: &crate::server::protocol::CityUpgradeSettings| {
-                                    crate::config::CityUpgradeSettings {
-                                        enabled: cs.enabled,
-                                        max_level: cs.max_level,
-                                        base_upgrade_cost: cs.base_upgrade_cost,
-                                        income_growth_per_level: cs.income_growth_per_level,
-                                        base_supply_range: cs.base_supply_range,
-                                        supply_range_growth: cs.supply_range_growth,
-                                        secondary_city_decay: cs.secondary_city_decay,
-                                        manpower_regen_per_tick: cs.manpower_regen_per_tick,
-                                    }
-                                };
+                            // CityUpgradeSettings is now a single shared type (config.rs),
+                            // so no protocol->config conversion is needed.
                             // Standard ruleset: pull all defaults from config.toml.
                             // Custom ruleset: use client-sent values.
                             let std = &server.config.standard_ruleset;
@@ -1921,6 +1914,11 @@ pub(crate) async fn handle_client_message(
                                     std.starting_funds
                                 } else {
                                     settings.starting_funds
+                                },
+                                initial_manpower: if settings.use_standard_ruleset {
+                                    std.initial_manpower
+                                } else {
+                                    settings.initial_manpower
                                 },
                                 funds_per_city: if settings.use_standard_ruleset {
                                     std.funds_per_city
@@ -1942,7 +1940,7 @@ pub(crate) async fn handle_client_message(
                                 city_upgrade_settings: if settings.use_standard_ruleset {
                                     server.config.city_upgrade_settings()
                                 } else {
-                                    to_config_city(&settings.city_upgrade_settings)
+                                    settings.city_upgrade_settings.clone()
                                 },
                                 water_speed: if settings.use_standard_ruleset {
                                     std.water_speed

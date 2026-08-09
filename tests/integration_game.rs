@@ -37,6 +37,7 @@ fn basic_unit_type() -> UnitType {
 fn test_settings() -> GameSettings {
     GameSettings {
         starting_funds: 1000,
+        initial_manpower: 10_000,
         funds_per_city: 1.0,
         recruitment_rate: 1.0,
         game_speed: 1.0,
@@ -259,6 +260,52 @@ fn city_ownership_persists_across_ticks() {
     }
 
     assert!(game.player_funds("player_0") > 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Recruitment / manpower economy
+// ---------------------------------------------------------------------------
+
+/// Manpower and funds always apply — manpower is NOT gated behind the city-upgrade
+/// flag. A standard game (city upgrades disabled) with a seeded initial manpower
+/// pool must be able to recruit immediately, and the recruit costs funds.
+#[test]
+fn recruit_uses_seeded_manpower_even_without_city_upgrades() {
+    let map = test_map();
+    let settings = test_settings(); // CityUpgradeSettings::default() => enabled = false, but initial_manpower = 10000
+    let mut game = Game::new(map, settings, 4);
+    game.assign_city_owner("city_0", "player_0");
+    let funds_before = game.player_funds("player_0");
+    let ut = basic_unit_type();
+
+    let unit = game.recruit_unit("city_0", &ut, "player_0");
+    assert!(
+        unit.is_some(),
+        "recruitment must work from the seeded manpower pool even when city upgrades are disabled"
+    );
+    assert!(
+        game.player_funds("player_0") == funds_before - ut.recruitment_cost,
+        "recruitment must still consume funds"
+    );
+}
+
+/// Manpower is a first-class recruitment resource: with an empty/manual manpower
+/// pool, recruitment must fail even if the player has enough funds and regardless
+/// of the city-upgrade flag.
+#[test]
+fn recruit_requires_manpower_always() {
+    let map = test_map();
+    let mut settings = test_settings();
+    settings.initial_manpower = 0; // empty manpower pool
+    let mut game = Game::new(map, settings, 4);
+    game.assign_city_owner("city_0", "player_0");
+    let ut = basic_unit_type();
+
+    let unit = game.recruit_unit("city_0", &ut, "player_0");
+    assert!(
+        unit.is_none(),
+        "recruit must fail when the manpower pool is empty, even with funds available"
+    );
 }
 
 // ---------------------------------------------------------------------------

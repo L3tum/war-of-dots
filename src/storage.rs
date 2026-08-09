@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context;
-
 /// Re-export player stats from game module
 pub use crate::game::game::PlayerGameStats;
 
@@ -25,23 +23,34 @@ impl Clone for Storage {
 }
 
 impl Storage {
-    pub fn new(path: &str) -> anyhow::Result<Self> {
+    pub fn new(path: &str) -> Result<Self, crate::errors::StorageError> {
         fs::create_dir_all(
             std::path::Path::new(path)
                 .parent()
                 .unwrap_or(std::path::Path::new(".")),
-        )?;
-        let db = sqlite::Connection::open(path)
-            .with_context(|| format!("Failed to open database at {}", path))?;
-        db.execute("CREATE TABLE IF NOT EXISTS game_metadata (id TEXT PRIMARY KEY, settings TEXT, players TEXT, start_time INTEGER, end_time INTEGER, winner TEXT, replay_path TEXT)")?;
-        db.execute("CREATE TABLE IF NOT EXISTS player_stats (player_id TEXT PRIMARY KEY, total_games INTEGER DEFAULT 0, games_won INTEGER DEFAULT 0, total_casualties INTEGER DEFAULT 0, standard_ruleset_games INTEGER DEFAULT 0, standard_ruleset_wins INTEGER DEFAULT 0, standard_ruleset_casualties INTEGER DEFAULT 0)")?;
+        )
+        .map_err(|source| crate::errors::StorageError::Open {
+            path: path.to_string(),
+            source: Box::new(source),
+        })?;
+        let db =
+            sqlite::Connection::open(path).map_err(|source| crate::errors::StorageError::Open {
+                path: path.to_string(),
+                source: Box::new(source),
+            })?;
+        db.execute("CREATE TABLE IF NOT EXISTS game_metadata (id TEXT PRIMARY KEY, settings TEXT, players TEXT, start_time INTEGER, end_time INTEGER, winner TEXT, replay_path TEXT)").map_err(|source| crate::errors::StorageError::Execute(Box::new(source)))?;
+        db.execute("CREATE TABLE IF NOT EXISTS player_stats (player_id TEXT PRIMARY KEY, total_games INTEGER DEFAULT 0, games_won INTEGER DEFAULT 0, total_casualties INTEGER DEFAULT 0, standard_ruleset_games INTEGER DEFAULT 0, standard_ruleset_wins INTEGER DEFAULT 0, standard_ruleset_casualties INTEGER DEFAULT 0)").map_err(|source| crate::errors::StorageError::Execute(Box::new(source)))?;
         db.execute(
             "CREATE TABLE IF NOT EXISTS player_names (player_id TEXT PRIMARY KEY, name TEXT)",
-        )?;
+        )
+        .map_err(|source| crate::errors::StorageError::Execute(Box::new(source)))?;
         // Enable WAL mode for better concurrent access
-        db.execute("PRAGMA journal_mode=WAL")?;
-        db.execute("PRAGMA synchronous=NORMAL")?;
-        db.execute("PRAGMA busy_timeout=5000")?;
+        db.execute("PRAGMA journal_mode=WAL")
+            .map_err(|source| crate::errors::StorageError::Execute(Box::new(source)))?;
+        db.execute("PRAGMA synchronous=NORMAL")
+            .map_err(|source| crate::errors::StorageError::Execute(Box::new(source)))?;
+        db.execute("PRAGMA busy_timeout=5000")
+            .map_err(|source| crate::errors::StorageError::Execute(Box::new(source)))?;
         Ok(Storage {
             db: Arc::new(Mutex::new(db)),
             path: path.to_string(),

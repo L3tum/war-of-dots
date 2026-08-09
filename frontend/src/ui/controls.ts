@@ -97,7 +97,9 @@ export class Controls {
           this.selectedUnitId = unitId;
           this.renderer.currentPath = [];
           this.unitInfo.selectUnit(unitId);
-          console.log('Selected unit:', unitId);
+          if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+            console.log('Selected unit:', unitId);
+          }
         } else {
           // Check if we clicked on a city
           const cityId = this.hitTestCity(e.clientX, e.clientY);
@@ -105,7 +107,9 @@ export class Controls {
             this.selectedUnitId = null;
             this.renderer.currentPath = [];
             this.unitInfo.selectCity(cityId);
-            console.log('Selected city:', cityId);
+            if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+              console.log('Selected city:', cityId);
+            }
           } else {
             // Deselect and start a new path from clicked position
             this.selectedUnitId = null;

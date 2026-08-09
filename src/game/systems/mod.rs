@@ -13,7 +13,3 @@ pub mod spatial_hash;
 pub mod supply;
 pub mod surrender;
 pub mod water;
-
-// Legacy systems — replaced by influence.rs (kept for reference, not called)
-// pub mod border;
-// pub mod vision;

@@ -50,6 +50,20 @@ impl SpatialHash {
         results
     }
 
+    /// Like [`Self::query_nearby`] but writes into `out`, clearing it first.
+    /// Reusing one buffer across candidates avoids a Vec allocation per call.
+    pub fn query_nearby_into(&self, x: f32, y: f32, out: &mut Vec<hecs::Entity>) {
+        let (cx, cy) = self.world_to_cell(x, y);
+        out.clear();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if let Some(entities) = self.cells.get(&(cx + dx, cy + dy)) {
+                    out.extend(entities.iter().copied());
+                }
+            }
+        }
+    }
+
     fn world_to_cell(&self, x: f32, y: f32) -> (i32, i32) {
         (
             (x / self.cell_size).floor() as i32,

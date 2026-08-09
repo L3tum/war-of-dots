@@ -7,7 +7,8 @@ providers = [
 
 [standard_ruleset]
 enabled = true
-starting_funds = 1000
+starting_funds = 2000
+initial_manpower = 2000
 funds_per_city = 1.0
 game_speed = 60
 recruitment_rate = 10

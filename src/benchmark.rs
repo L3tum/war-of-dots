@@ -113,7 +113,7 @@ impl BattleSimulator {
             let units = game.query_all_units();
             let players: Vec<String> = game.players().keys().cloned().collect();
             let player_count = players.len();
-            let mut moves: Vec<(String, (f32, f32))> = Vec::new();
+            let mut moves: Vec<(String, String, (f32, f32))> = Vec::new();
             for unit in &units {
                 if self.rand_f32() < 0.3 {
                     let enemy_idx = self.rand_idx(player_count);
@@ -125,12 +125,12 @@ impl BattleSimulator {
                             let ci = self.rand_idx(city_count);
                             self.city_positions[ci]
                         };
-                        moves.push((unit.id.clone(), target));
+                        moves.push((unit.id.clone(), unit.owner.clone(), target));
                     }
                 }
             }
-            for (unit_id, target) in moves {
-                game.move_troops(&unit_id, vec![target]);
+            for (unit_id, owner, target) in moves {
+                game.move_troops(&unit_id, &owner, vec![target]);
             }
         }
 
@@ -157,7 +157,11 @@ impl BattleSimulator {
             let units = game.query_all_units();
             if !units.is_empty() {
                 let unit_idx = self.rand_idx(units.len());
-                game.toggle_healing(&units[unit_idx].id, self.rand_f32() > 0.5);
+                game.toggle_healing(
+                    &units[unit_idx].id,
+                    &units[unit_idx].owner,
+                    self.rand_f32() > 0.5,
+                );
             }
         }
     }
@@ -194,6 +198,9 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
     let settings = GameSettings {
         starting_funds: 2000,
+        // Generous initial manpower so the pre-battle army spawns fully (each player
+        // fields ~60 units in the default config).
+        initial_manpower: 100_000,
         funds_per_city: 5.0,
         recruitment_rate: 10.0,
         game_speed: 1.0,

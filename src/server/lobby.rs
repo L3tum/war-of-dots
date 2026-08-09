@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,7 +105,7 @@ impl LobbyManager {
         connection: PlayerSender,
         custom_unit_types: Vec<super::protocol::CustomUnitType>,
     ) -> String {
-        let code = Uuid::new_v4().to_string()[..8].to_string();
+        let code = Uuid::new_v4().to_string()[..12].to_string();
         let lobby = Lobby {
             code: code.clone(),
             creator: creator_id.clone(),
@@ -136,7 +137,9 @@ impl LobbyManager {
     ) -> Result<&mut Lobby, String> {
         let lobby = self.lobbies.get_mut(code).ok_or("Lobby not found")?;
         if let Some(pass) = &lobby.password {
-            if password.as_ref() != Some(pass) {
+            // Constant-time comparison to avoid leaking password prefix info via timing.
+            let provided = password.as_deref().unwrap_or("");
+            if !bool::from(provided.as_bytes().ct_eq(pass.as_bytes())) {
                 return Err("Incorrect password".to_string());
             }
         }

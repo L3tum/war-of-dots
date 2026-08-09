@@ -15,27 +15,40 @@ use super::debug_stats::DebugSystemGuard;
 
 /// Macro to wrap system execution with timing in debug builds, no-op in release.
 ///
+/// Required args: a name label, the world (`&mut self.world`), the world entity
+/// (`self.world_entity`), and the expression to run.
+///
 /// Usage (statement):
-///   tick_system!("movement", systems::movement::run(&mut self.world, ...));
+///   tick_system!("movement", &mut self.world, self.world_entity,
+///                systems::movement::run(&mut self.world, ...));
 ///
 /// Usage (expression):
-///   let dead = tick_system!("combat", systems::combat::run(...));
+///   let dead = tick_system!("combat", &mut self.world, self.world_entity,
+///                           systems::combat::run(...));
 ///
-/// This eliminates the repeated #[cfg] blocks throughout tick_game(),
-/// reducing ~200 lines of boilerplate.
-///
-/// NOTE: debug timing was dropped from the macro because Rust's macro hygiene
-/// prevents macros from accessing `guard`/`self` in the caller's scope.
+/// In debug builds each system reports its own timing via
+/// `debug_stats::record_system_timing` (populating the `system_timings` breakdown
+/// read by the benchmark and the debug overlay); in release it's a plain
+/// pass-through. The world and world_entity handles are passed explicitly so macro
+/// hygiene does not block the timing code from accessing them.
 #[cfg(any(debug_assertions, feature = "debug-overlay"))]
 macro_rules! tick_system {
-    ($name:expr, $expr:expr) => {
-        $expr
-    };
+    ($name:expr, $world:expr, $world_entity:expr, $expr:expr) => {{
+        let _start = std::time::Instant::now();
+        let _result = $expr;
+        crate::game::debug_stats::record_system_timing(
+            $world,
+            $world_entity,
+            $name,
+            _start.elapsed().as_secs_f64() * 1000.0,
+        );
+        _result
+    }};
 }
 
 #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
 macro_rules! tick_system {
-    ($name:expr, $expr:expr) => {
+    ($name:expr, $world:expr, $world_entity:expr, $expr:expr) => {
         $expr
     };
 }
@@ -44,6 +57,9 @@ macro_rules! tick_system {
 #[derive(Debug, Clone)]
 pub struct GameSettings {
     pub starting_funds: u32,
+    /// Per-player initial manpower pool, seeded at game start. Manpower is always
+    /// required when recruiting (regardless of city-upgrade settings).
+    pub initial_manpower: u32,
     /// Funds generated per city per economy tick (base income before multipliers)
     pub funds_per_city: f32,
     /// Ticks between recruitment actions for a player (0 = unlimited)
@@ -189,6 +205,21 @@ impl Game {
             cities,
         );
 
+        // Seed each player's initial manpower pool. Manpower is always used when
+        // recruiting (independent of city-upgrade settings), so the pool must be
+        // populated from the start — otherwise the first recruitment wave would be
+        // blocked until the economy produces manpower.
+        {
+            let initial_manpower = settings.initial_manpower;
+            if let Some(wb) = world.world_data_mut(world_entity) {
+                for i in 0..num_players {
+                    wb.funds
+                        .manpower
+                        .insert(format!("player_{i}"), initial_manpower);
+                }
+            }
+        }
+
         Self {
             world,
             world_entity,
@@ -221,6 +252,8 @@ impl Game {
         // Build TickContext once per tick
         let ctx = tick_system!(
             "tickcontext",
+            &mut self.world,
+            self.world_entity,
             TickContext::build(&self.world, self.world_entity)
         );
 
@@ -231,6 +264,8 @@ impl Game {
         {
             let earned = tick_system!(
                 "economy",
+                &mut self.world,
+                self.world_entity,
                 systems::economy::run(
                     &mut self.world,
                     self.world_entity,
@@ -255,24 +290,37 @@ impl Game {
 
         tick_system!(
             "water",
+            &mut self.world,
+            self.world_entity,
             systems::water::run(&mut self.world, self.world_entity)
         );
 
         // Build spatial hash once per tick — shared by Movement and Combat
-        let spatial = tick_system!("spatial_hash", self.world.build_spatial_hash());
+        let spatial = tick_system!(
+            "spatial_hash",
+            &mut self.world,
+            self.world_entity,
+            self.world.build_spatial_hash()
+        );
 
         tick_system!(
             "movement",
+            &mut self.world,
+            self.world_entity,
             systems::movement::run(&mut self.world, self.world_entity, &self.settings)
         );
         tick_system!(
             "attrition",
+            &mut self.world,
+            self.world_entity,
             systems::attrition::run(&mut self.world, self.world_entity, &self.settings)
         );
 
         // Combat
         let dead_entities = tick_system!(
             "combat",
+            &mut self.world,
+            self.world_entity,
             systems::combat::run(&mut self.world, self.world_entity, spatial)
         );
 
@@ -287,6 +335,8 @@ impl Game {
         // City capture
         tick_system!(
             "city_capture",
+            &mut self.world,
+            self.world_entity,
             systems::city_capture::run(&mut self.world, self.world_entity, &mut self.player_stats)
         );
 
@@ -298,6 +348,8 @@ impl Game {
             if let Some(ref ctx) = ctx {
                 tick_system!(
                     "influence",
+                    &mut self.world,
+                    self.world_entity,
                     systems::influence::run(&mut self.world, ctx, self.tick)
                 );
             }
@@ -305,13 +357,20 @@ impl Game {
 
         // Healing: uses TickContext for per-player iteration
         if let Some(ref ctx) = ctx {
-            tick_system!("healing", systems::healing::run(&mut self.world, ctx));
+            tick_system!(
+                "healing",
+                &mut self.world,
+                self.world_entity,
+                systems::healing::run(&mut self.world, ctx)
+            );
         }
 
         // Supply: uses TickContext for per-player iteration
         if let Some(ref ctx) = ctx {
             tick_system!(
                 "supply",
+                &mut self.world,
+                self.world_entity,
                 systems::supply::run(
                     &mut self.world,
                     self.world_entity,
@@ -329,6 +388,8 @@ impl Game {
             if let Some(ref ctx) = ctx {
                 tick_system!(
                     "encirclement",
+                    &mut self.world,
+                    self.world_entity,
                     systems::encirclement::run(&mut self.world, ctx, self.tick)
                 );
             }
@@ -338,6 +399,8 @@ impl Game {
         if self.tick - self.last_surrender_check_tick >= 30 {
             let dead = tick_system!(
                 "surrender",
+                &mut self.world,
+                self.world_entity,
                 systems::surrender::run(&mut self.world, self.world_entity)
             );
 
@@ -355,6 +418,8 @@ impl Game {
 
         tick_system!(
             "reinforce",
+            &mut self.world,
+            self.world_entity,
             systems::reinforce::run(&mut self.world, self.world_entity)
         );
 
@@ -389,7 +454,10 @@ impl Game {
             return None;
         }
 
-        // Check manpower (before deducting anything)
+        // Check manpower (before deducting anything). Manpower is a first-class
+        // recruitment resource for every ruleset: the pool is seeded per player at
+        // game start (see `Game::new`) and replenished by the economy system, so
+        // recruitment always draws from it. It is NOT gated behind city upgrades.
         let has_manpower = {
             let wb = self.world.world_data(self.world_entity)?;
             wb.funds.manpower.get(owner).copied().unwrap_or(0) >= unit_type.men
@@ -436,7 +504,11 @@ impl Game {
             .map(|o| o.player_id.clone())
     }
 
-    pub fn move_troops(&mut self, unit_id: &str, path: Vec<(f32, f32)>) {
+    pub fn move_troops(&mut self, unit_id: &str, owner: &str, path: Vec<(f32, f32)>) {
+        // Single ownership enforcement point in the game layer.
+        if self.get_unit_owner(unit_id).as_deref() != Some(owner) {
+            return;
+        }
         if let Some(entity) = self.entity_registry.get(unit_id) {
             let entity = *entity;
             if let Ok((up,)) = self.world.query_one_mut::<(&mut UnitPath,)>(entity) {
@@ -445,7 +517,11 @@ impl Game {
         }
     }
 
-    pub fn toggle_healing(&mut self, unit_id: &str, enabled: bool) {
+    pub fn toggle_healing(&mut self, unit_id: &str, owner: &str, enabled: bool) {
+        // Single ownership enforcement point in the game layer.
+        if self.get_unit_owner(unit_id).as_deref() != Some(owner) {
+            return;
+        }
         if let Some(entity) = self.entity_registry.get(unit_id) {
             let entity = *entity;
             if let Ok((flags,)) = self.world.query_one_mut::<(&mut UnitFlags,)>(entity) {
@@ -454,7 +530,11 @@ impl Game {
         }
     }
 
-    pub fn toggle_resupply(&mut self, unit_id: &str, enabled: bool) {
+    pub fn toggle_resupply(&mut self, unit_id: &str, owner: &str, enabled: bool) {
+        // Single ownership enforcement point in the game layer.
+        if self.get_unit_owner(unit_id).as_deref() != Some(owner) {
+            return;
+        }
         if let Some(entity) = self.entity_registry.get(unit_id) {
             let entity = *entity;
             if let Ok((flags,)) = self.world.query_one_mut::<(&mut UnitFlags,)>(entity) {
@@ -908,7 +988,6 @@ impl Game {
         has_units || has_cities
     }
 
-    #[allow(dead_code)] // Used in integration tests (determine_winner_returns_none_when_game_running)
     pub fn determine_winner(&self) -> Option<String> {
         let mut players_with_power: Vec<(String, u32)> = Vec::new();
         for pid in self.players.keys() {

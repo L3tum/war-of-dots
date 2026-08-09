@@ -1,5 +1,7 @@
 //! Spectator view — manages the spectator panel with player filters and reasoning log.
 
+import { escapeHtml } from './html';
+
 export class Spectator {
   private reasonsContainer: HTMLDivElement;
   private playersContainer: HTMLDivElement;
@@ -88,7 +90,7 @@ export class Spectator {
         for (const entry of [...list].reverse()) {
           const div = document.createElement('div');
           div.className = 'player-reason';
-          div.innerHTML = `<strong>${this.currentFilter}:</strong> ${entry.action}<br><em>${entry.reason}</em>`;
+          div.innerHTML = `<strong>${escapeHtml(this.currentFilter)}:</strong> ${escapeHtml(entry.action)}<br><em>${escapeHtml(entry.reason)}</em>`;
           this.reasonsContainer.appendChild(div);
         }
       }
@@ -104,7 +106,7 @@ export class Spectator {
       for (const entry of allEntries) {
         const div = document.createElement('div');
         div.className = 'player-reason';
-        div.innerHTML = `<strong>${entry.player}:</strong> ${entry.action}<br><em>${entry.reason}</em>`;
+        div.innerHTML = `<strong>${escapeHtml(entry.player)}:</strong> ${escapeHtml(entry.action)}<br><em>${escapeHtml(entry.reason)}</em>`;
         this.reasonsContainer.appendChild(div);
       }
     }

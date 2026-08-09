@@ -170,12 +170,12 @@ pub enum LobbyMessage {
         name: String,
         llm_provider: String,
     },
+    /// Set the LLM model for a slot. The provider, API key, and base URL are resolved
+    /// server-side from the configured LLM providers — no secrets cross the wire
+    /// (see D-1).
     SetSlotLlmConfig {
         slot: u32,
-        provider: String,
         model: String,
-        api_key: Option<String>,
-        base_url: Option<String>,
     },
     StartGame,
 }
@@ -197,77 +197,20 @@ pub struct CustomUnitType {
     pub recruitment_cost: u32,
 }
 
-/// City upgrade and supply system settings (protocol wire format)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CityUpgradeSettings {
-    /// Whether city upgrades and supply system are enabled
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum city level
-    #[serde(default = "default_city_max_level")]
-    pub max_level: u32,
-    /// Base cost for upgrades; actual cost = base_cost * level
-    #[serde(default = "default_city_base_upgrade_cost")]
-    pub base_upgrade_cost: u32,
-    /// Additional income multiplier per level above 1
-    #[serde(default = "default_city_income_growth")]
-    pub income_growth_per_level: f32,
-    /// Base supply range in grid cells at level 1
-    #[serde(default = "default_city_base_supply_range")]
-    pub base_supply_range: f32,
-    /// Additional range per level above 1
-    #[serde(default = "default_city_supply_range_growth")]
-    pub supply_range_growth: f32,
-    /// Decay multiplier for non-closest city contributions
-    #[serde(default = "default_city_secondary_decay")]
-    pub secondary_city_decay: f32,
-    /// Manpower generated per tick per city level
-    #[serde(default = "default_city_manpower_regen")]
-    pub manpower_regen_per_tick: f32,
-}
-
-fn default_city_max_level() -> u32 {
-    100
-}
-fn default_city_base_upgrade_cost() -> u32 {
-    200
-}
-fn default_city_income_growth() -> f32 {
-    0.5
-}
-fn default_city_base_supply_range() -> f32 {
-    5.0
-}
-fn default_city_supply_range_growth() -> f32 {
-    3.0
-}
-fn default_city_secondary_decay() -> f32 {
-    0.5
-}
-fn default_city_manpower_regen() -> f32 {
-    10.0
-}
-
-impl Default for CityUpgradeSettings {
-    fn default() -> Self {
-        CityUpgradeSettings {
-            enabled: false,
-            max_level: default_city_max_level(),
-            base_upgrade_cost: default_city_base_upgrade_cost(),
-            income_growth_per_level: default_city_income_growth(),
-            base_supply_range: default_city_base_supply_range(),
-            supply_range_growth: default_city_supply_range_growth(),
-            secondary_city_decay: default_city_secondary_decay(),
-            manpower_regen_per_tick: default_city_manpower_regen(),
-        }
-    }
-}
+/// City upgrade and supply system settings (single definition lives in
+/// `crate::config` and is shared between the wire protocol and game logic).
+pub use crate::config::CityUpgradeSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LobbySettings {
     pub map: String,
     #[serde(default)]
     pub starting_funds: u32,
+    /// Starting manpower pool per player. Always applies when recruiting —
+    /// not gated behind city upgrades. Used for custom rule sets; the standard
+    /// ruleset takes its value from the server config.
+    #[serde(default)]
+    pub initial_manpower: u32,
     #[serde(default, deserialize_with = "float_deser::deserialize_f32")]
     pub funds_per_city: f32,
     #[serde(default, deserialize_with = "float_deser::deserialize_f32")]
@@ -681,6 +624,7 @@ mod tests {
             settings: LobbySettings {
                 map: "test_map".to_string(),
                 starting_funds: 1000,
+                initial_manpower: 2000,
                 funds_per_city: 1.0,
                 game_speed: 1.0,
                 use_standard_ruleset: true,
@@ -769,6 +713,7 @@ mod tests {
                 map: "small_map".to_string(),
                 use_standard_ruleset: true,
                 starting_funds: 0,
+                initial_manpower: 0,
                 funds_per_city: 0.0,
                 game_speed: 0.0,
                 llm_thinking_delay: 0.0,
@@ -800,6 +745,7 @@ mod tests {
             settings: LobbySettings {
                 map: "medium_map".to_string(),
                 starting_funds: 2000,
+                initial_manpower: 2000,
                 funds_per_city: 2.0,
                 game_speed: 120.0,
                 use_standard_ruleset: false,

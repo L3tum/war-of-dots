@@ -9,6 +9,9 @@ pub struct OpenAiClient {
     api_key: String,
     model: String,
     base_url: String,
+    /// Shared HTTP client (connection-pooled; reused across calls instead of
+    /// constructing a fresh `reqwest::Client` per request).
+    http: reqwest::Client,
 }
 
 /// Request body for OpenAI chat completions
@@ -67,6 +70,7 @@ impl OpenAiClient {
             api_key,
             model,
             base_url,
+            http: reqwest::Client::new(),
         }
     }
 }
@@ -100,7 +104,7 @@ impl OpenAiClient {
             "{}/v1/chat/completions",
             self.base_url.trim_end_matches('/')
         );
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))

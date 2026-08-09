@@ -91,7 +91,9 @@ impl ReplayPlayer {
                                 Some((x.as_f64()? as f32, y.as_f64()? as f32))
                             })
                             .collect();
-                        self.game.move_troops(troop_id, path_coords);
+                        if let Some(owner) = self.game.get_unit_owner(troop_id) {
+                            self.game.move_troops(troop_id, &owner, path_coords);
+                        }
                     }
                 }
                 "recruit_unit" => {
@@ -116,14 +118,18 @@ impl ReplayPlayer {
                 "toggle_healing" => {
                     if let Some(unit_id) = params.get("unit_id").and_then(|v| v.as_str()) {
                         if let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) {
-                            self.game.toggle_healing(unit_id, enabled);
+                            if let Some(owner) = self.game.get_unit_owner(unit_id) {
+                                self.game.toggle_healing(unit_id, &owner, enabled);
+                            }
                         }
                     }
                 }
                 "toggle_resupply" => {
                     if let Some(unit_id) = params.get("unit_id").and_then(|v| v.as_str()) {
                         if let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) {
-                            self.game.toggle_resupply(unit_id, enabled);
+                            if let Some(owner) = self.game.get_unit_owner(unit_id) {
+                                self.game.toggle_resupply(unit_id, &owner, enabled);
+                            }
                         }
                     }
                 }

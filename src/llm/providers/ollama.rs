@@ -8,6 +8,9 @@ use crate::llm::agent::{Action, GameState, Tool, ToolCall};
 pub struct OllamaClient {
     base_url: String,
     model: String,
+    /// Shared HTTP client (connection-pooled; reused across calls instead of
+    /// constructing a fresh `reqwest::Client` per request).
+    http: reqwest::Client,
 }
 
 /// Request body for Ollama /api/chat
@@ -57,7 +60,11 @@ struct OllamaFunctionCall {
 
 impl OllamaClient {
     pub fn new(base_url: String, model: String) -> Self {
-        OllamaClient { base_url, model }
+        OllamaClient {
+            base_url,
+            model,
+            http: reqwest::Client::new(),
+        }
     }
 }
 
@@ -87,7 +94,7 @@ impl OllamaClient {
         };
 
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let response = client
             .post(&url)
             .json(&request)

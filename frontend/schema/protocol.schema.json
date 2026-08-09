@@ -55,6 +55,26 @@
     {
       "type": "object",
       "required": [
+        "LobbyJoined"
+      ],
+      "properties": {
+        "LobbyJoined": {
+          "type": "object",
+          "required": [
+            "lobby_code"
+          ],
+          "properties": {
+            "lobby_code": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
         "LobbyUpdate"
       ],
       "properties": {
@@ -278,6 +298,61 @@
         }
       }
     },
+    "CityUpgradeSettings": {
+      "description": "City upgrade and supply system settings. Shared between game logic and the wire protocol (see protocol.rs re-export).",
+      "type": "object",
+      "properties": {
+        "base_supply_range": {
+          "description": "Base supply range in grid cells at level 1",
+          "default": 5.0,
+          "type": "number",
+          "format": "float"
+        },
+        "base_upgrade_cost": {
+          "description": "Base cost for upgrades; actual cost = base_cost * level",
+          "default": 200,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "enabled": {
+          "description": "Whether city upgrades and supply system are enabled",
+          "default": false,
+          "type": "boolean"
+        },
+        "income_growth_per_level": {
+          "description": "Additional income multiplier per level above 1",
+          "default": 0.5,
+          "type": "number",
+          "format": "float"
+        },
+        "manpower_regen_per_tick": {
+          "description": "Manpower generated per tick per city level. Added to global player manpower pool each economy tick.",
+          "default": 10.0,
+          "type": "number",
+          "format": "float"
+        },
+        "max_level": {
+          "description": "Maximum city level (default: 100)",
+          "default": 100,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "secondary_city_decay": {
+          "description": "Decay multiplier for non-closest city contributions (0.0 = ignored, 1.0 = equal) When a unit is within range of multiple friendly cities, the secondary city contribution = supply_rate * secondary_city_decay",
+          "default": 0.5,
+          "type": "number",
+          "format": "float"
+        },
+        "supply_range_growth": {
+          "description": "Additional range per level above 1",
+          "default": 3.0,
+          "type": "number",
+          "format": "float"
+        }
+      }
+    },
     "CustomUnitType": {
       "description": "Configuration for a custom unit type in lobby settings",
       "type": "object",
@@ -452,6 +527,7 @@
       "required": [
         "cities",
         "player",
+        "terrain",
         "units"
       ],
       "properties": {
@@ -477,6 +553,15 @@
         },
         "player": {
           "$ref": "#/definitions/PlayerState"
+        },
+        "terrain": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         },
         "units": {
           "type": "array",
@@ -557,33 +642,55 @@
     "LobbySettings": {
       "type": "object",
       "required": [
-        "custom_unit_types",
-        "funds_per_city",
-        "game_speed",
-        "llm_thinking_delay",
         "map",
-        "max_players",
-        "spectator_vision",
-        "starting_funds",
         "use_standard_ruleset"
       ],
       "properties": {
+        "city_upgrade_settings": {
+          "description": "City upgrade and supply system settings",
+          "default": {
+            "base_supply_range": 5.0,
+            "base_upgrade_cost": 200,
+            "enabled": false,
+            "income_growth_per_level": 0.5,
+            "manpower_regen_per_tick": 10.0,
+            "max_level": 100,
+            "secondary_city_decay": 0.5,
+            "supply_range_growth": 3.0
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/CityUpgradeSettings"
+            }
+          ]
+        },
         "custom_unit_types": {
           "description": "Custom unit types when use_standard_ruleset is false",
+          "default": [],
           "type": "array",
           "items": {
             "$ref": "#/definitions/CustomUnitType"
           }
         },
         "funds_per_city": {
+          "default": 0.0,
           "type": "number",
           "format": "float"
         },
         "game_speed": {
+          "default": 0.0,
           "type": "number",
           "format": "float"
         },
+        "initial_manpower": {
+          "description": "Starting manpower pool per player. Always applies when recruiting — not gated behind city upgrades. Used for custom rule sets; the standard ruleset takes its value from the server config.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "llm_thinking_delay": {
+          "default": 0.0,
           "type": "number",
           "format": "double"
         },
@@ -591,21 +698,36 @@
           "type": "string"
         },
         "max_players": {
+          "default": 0,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
+        "recruitment_rate": {
+          "description": "Ticks between recruitment actions for a player (0 = unlimited)",
+          "default": 10.0,
+          "type": "number",
+          "format": "float"
+        },
         "spectator_vision": {
           "description": "If true, spectators see union of all players' vision",
+          "default": false,
           "type": "boolean"
         },
         "starting_funds": {
+          "default": 0,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "use_standard_ruleset": {
           "type": "boolean"
+        },
+        "water_speed": {
+          "description": "Speed multiplier for water tiles",
+          "default": 1.2000000476837158,
+          "type": "number",
+          "format": "float"
         }
       }
     },
@@ -613,6 +735,7 @@
       "type": "object",
       "required": [
         "funds",
+        "player_id",
         "units_owned"
       ],
       "properties": {
@@ -620,6 +743,10 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        },
+        "player_id": {
+          "description": "The connected player's own id (e.g. \"player_a3f2b1c0\"). Empty for spectators.",
+          "type": "string"
         },
         "units_owned": {
           "type": "integer",

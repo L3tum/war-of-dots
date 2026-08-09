@@ -46,6 +46,7 @@ describe('LobbyUI', () => {
             <h4>⚙ Economy & Speed</h4>
             <div class="settings-body">
               <input type="number" id="starting-funds" value="1000">
+              <input type="number" id="starting-manpower" value="2000">
               <input type="number" id="funds-per-city" value="1.0">
               <input type="number" id="game-speed" value="60">
               <select id="max-players"><option value="2">2</option></select>
@@ -200,6 +201,7 @@ describe('LobbyUI', () => {
     expect(settings.use_standard_ruleset).toBe(false);
     // Economy & speed
     expect(settings.starting_funds).toBe(1000);
+    expect(settings.initial_manpower).toBe(2000);
     expect(settings.funds_per_city).toBe(1.0);
     expect(settings.game_speed).toBe(60);
     expect(settings.max_players).toBe(2);

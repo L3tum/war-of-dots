@@ -32,9 +32,7 @@ toml = "0.8"
 crossterm = "0.28"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 hecs = "0.10"
-
-[dev-dependencies]
-proptest = "1"
+subtle = "2"
 
 [features]
 default = []

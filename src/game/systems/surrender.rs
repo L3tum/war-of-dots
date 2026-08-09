@@ -1,6 +1,16 @@
 //! SurrenderSystem — check for units below 5% men that should surrender.
 //!
 //! Uses two-phase pattern: query + collect → return dead entities.
+//!
+//! # Deterministic rule (intentional — see D-3)
+//! This system is deliberately **deterministic**, not probabilistic: a unit surrenders
+//! when it is at or below 0 men, OR when its men has fallen below 5% of its max men
+//! (`men / max_men < 0.05`). There is no random chance and no `surrender_chance()`
+//! model here. A unit sitting just above the 5% threshold survives indefinitely
+//! regardless of encirclement; a unit below it is removed unconditionally. The 5%
+//! cutoff doubles as the cleanup sweep for combat/attrition casualties that reached
+//! 0 men outside combat (see `game.rs tick_game`, which despawns the returned
+//! entities). This behavior is covered by the tests below.
 
 use crate::game::components::*;
 use hecs::World;

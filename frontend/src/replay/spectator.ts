@@ -7,6 +7,8 @@ interface ReplayInfo {
   duration: number;
 }
 
+import { escapeHtml } from '../ui/html';
+
 export class SpectatorReplay {
   private canvas: HTMLCanvasElement;
 
@@ -58,9 +60,9 @@ export class SpectatorReplay {
           const durationStr = `${Math.floor(replay.duration / 60)}m ${replay.duration % 60}s`;
 
           item.innerHTML = `
-            <strong>${dateStr}</strong> — Winner: ${winner}<br>
-            Players: ${replay.players.join(', ')}<br>
-            Duration: ${durationStr}
+            <strong>${escapeHtml(dateStr)}</strong> — Winner: ${escapeHtml(winner)}<br>
+            Players: ${escapeHtml(replay.players.join(', '))}<br>
+            Duration: ${escapeHtml(durationStr)}
           `;
 
           item.addEventListener('mouseenter', () => {

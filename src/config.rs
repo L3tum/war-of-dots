@@ -1,7 +1,7 @@
 //! Server configuration
 
-use anyhow::Result;
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -29,8 +29,9 @@ pub struct LlmProvider {
     pub base_url: Option<String>,
 }
 
-/// City upgrade and supply system settings
-#[derive(Debug, Deserialize, Clone)]
+/// City upgrade and supply system settings.
+/// Shared between game logic and the wire protocol (see protocol.rs re-export).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CityUpgradeSettings {
     /// Whether city upgrades and supply system are enabled
     #[serde(default = "default_city_upgrades_enabled")]
@@ -125,9 +126,13 @@ pub struct StandardRuleset {
     pub city_upgrades: Option<CityUpgradeSettings>,
 
     // --- Game-level defaults for standard ruleset ---
-    /// Starting funds for each player (default: 1000)
+    /// Starting funds for each player (default: 2000, ~20 light-infantry units)
     #[serde(default = "default_starting_funds")]
     pub starting_funds: u32,
+    /// Starting manpower pool for each player (default: 2000, ~20 light-infantry units).
+    /// Manpower is always used when recruiting — it is not gated behind city upgrades.
+    #[serde(default = "default_initial_manpower")]
+    pub initial_manpower: u32,
     /// Funds generated per city per economy tick (default: 1.0)
     #[serde(default = "default_funds_per_city")]
     pub funds_per_city: f32,
@@ -143,7 +148,10 @@ pub struct StandardRuleset {
 }
 
 fn default_starting_funds() -> u32 {
-    1000
+    2000
+}
+fn default_initial_manpower() -> u32 {
+    2000
 }
 fn default_funds_per_city() -> f32 {
     1.0
@@ -230,9 +238,15 @@ pub struct StorageConfig {
     pub replay_path: String,
 }
 
-pub fn load(path: &str) -> Result<Config> {
-    let content = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&content)?;
+pub fn load(path: &str) -> Result<Config, crate::errors::ConfigError> {
+    let content =
+        std::fs::read_to_string(path).map_err(|_| crate::errors::ConfigError::NotFound {
+            path: path.to_string(),
+        })?;
+    let config: Config =
+        toml::from_str(&content).map_err(|source| crate::errors::ConfigError::Parse {
+            source: Box::new(source),
+        })?;
     Ok(config.resolve())
 }
 

@@ -4,8 +4,10 @@
 //! Eliminates entity-collect-then-refetch anti-pattern.
 
 use crate::game::components::*;
+use crate::game::economy::UnitType;
 use crate::game::game::GameSettings;
 use hecs::World;
+use std::collections::HashMap;
 
 /// Collected changes to apply in phase 2.
 struct AttritionChanges {
@@ -15,6 +17,14 @@ struct AttritionChanges {
 }
 
 pub fn run(world: &mut World, _world_entity: hecs::Entity, settings: &GameSettings) {
+    // Precompute unit-type lookup (name -> &UnitType) once per tick to avoid a
+    // linear scan over settings.unit_types per unit per tick.
+    let unit_types_by_name: HashMap<&str, &UnitType> = settings
+        .unit_types
+        .iter()
+        .map(|ut| (ut.name.as_str(), ut))
+        .collect();
+
     // Phase 1: query all needed components at once, compute changes
     let changes: Vec<(hecs::Entity, AttritionChanges)> = world
         .query::<(
@@ -26,7 +36,13 @@ pub fn run(world: &mut World, _world_entity: hecs::Entity, settings: &GameSettin
         )>()
         .iter()
         .filter_map(|(entity, (utype, stats, equipment, flags, wt))| {
-            compute_attrition(utype, stats, equipment, flags, wt, settings)
+            // Skip units already at 0 men: they are dead-waiting-for-surrender and should
+            // no longer be mutated by attrition (prevents junk ECS writes on dead units).
+            // Such units are removed by the surrender sweep in tick_game.
+            if stats.men <= 0.0 {
+                return None;
+            }
+            compute_attrition(utype, stats, equipment, flags, wt, &unit_types_by_name)
                 .map(|change| (entity, change))
         })
         .collect();
@@ -56,7 +72,7 @@ fn compute_attrition(
     equipment: &UnitEquipment,
     flags: &UnitFlags,
     wt: &UnitWaterTransition,
-    settings: &GameSettings,
+    unit_types_by_name: &HashMap<&str, &UnitType>,
 ) -> Option<AttritionChanges> {
     let mut new_stats = *stats;
     let mut new_equipment: Option<UnitEquipment> = None;
@@ -87,7 +103,7 @@ fn compute_attrition(
     }
 
     // Equipment attrition + starvation
-    if let Some(unit_type) = settings.unit_types.iter().find(|ut| ut.name == utype.name) {
+    if let Some(unit_type) = unit_types_by_name.get(utype.name.as_str()).copied() {
         let mut attrition_rate = if flags.fighting {
             unit_type.fighting_attrition
         } else {
@@ -170,6 +186,15 @@ fn supply_percent(
 mod tests {
     use super::*;
     use crate::game::unit::Equipment;
+
+    /// Build the unit-type lookup map used by compute_attrition (mirrors run()).
+    fn unit_types_map(settings: &GameSettings) -> HashMap<&str, &UnitType> {
+        settings
+            .unit_types
+            .iter()
+            .map(|ut| (ut.name.as_str(), ut))
+            .collect()
+    }
 
     // ---------------------------------------------------------------------------
     // supply_percent
@@ -286,6 +311,7 @@ mod tests {
     fn test_settings() -> GameSettings {
         GameSettings {
             starting_funds: 1000,
+            initial_manpower: 10_000,
             funds_per_city: 1.0,
             recruitment_rate: 1.0,
             game_speed: 1.0,
@@ -353,7 +379,14 @@ mod tests {
         let wt = UnitWaterTransition::default();
         let settings = test_settings();
 
-        let change = compute_attrition(&utype, &stats, &equipment, &flags, &wt, &settings);
+        let change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags,
+            &wt,
+            &unit_types_map(&settings),
+        );
 
         assert!(change.is_some());
         let change = change.unwrap();
@@ -406,10 +439,24 @@ mod tests {
             ..Default::default()
         };
 
-        let peace_change =
-            compute_attrition(&utype, &stats, &equipment, &flags_peace, &wt, &settings).unwrap();
-        let fight_change =
-            compute_attrition(&utype, &stats, &equipment, &flags_fight, &wt, &settings).unwrap();
+        let peace_change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags_peace,
+            &wt,
+            &unit_types_map(&settings),
+        )
+        .unwrap();
+        let fight_change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags_fight,
+            &wt,
+            &unit_types_map(&settings),
+        )
+        .unwrap();
 
         let peace_eq = peace_change.new_equipment.unwrap().equipment[0].count;
         let fight_eq = fight_change.new_equipment.unwrap().equipment[0].count;
@@ -456,7 +503,14 @@ mod tests {
         let wt = UnitWaterTransition::default();
         let settings = test_settings();
 
-        let change = compute_attrition(&utype, &stats, &equipment, &flags, &wt, &settings);
+        let change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags,
+            &wt,
+            &unit_types_map(&settings),
+        );
 
         assert!(change.is_some());
         let change = change.unwrap();
@@ -499,7 +553,14 @@ mod tests {
         let wt = UnitWaterTransition::default();
         let settings = test_settings();
 
-        let change = compute_attrition(&utype, &stats, &equipment, &flags, &wt, &settings);
+        let change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags,
+            &wt,
+            &unit_types_map(&settings),
+        );
 
         assert!(change.is_some());
         let change = change.unwrap();
@@ -529,7 +590,14 @@ mod tests {
         let wt = UnitWaterTransition::default();
         let settings = test_settings();
 
-        let change = compute_attrition(&utype, &stats, &equipment, &flags, &wt, &settings);
+        let change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags,
+            &wt,
+            &unit_types_map(&settings),
+        );
 
         // No unit type found, so no attrition computed
         assert!(change.is_none());

@@ -1,5 +1,7 @@
 //! Advisor panel — displays advisor suggestions and manages the enable/disable toggle.
 
+import { escapeHtml } from './html';
+
 export class Advisor {
   private panel: HTMLDivElement;
   private statsPanel: HTMLDivElement | null;
@@ -12,7 +14,8 @@ export class Advisor {
   /** Show an advisor suggestion */
   show(text: string) {
     this.panel.classList.remove('hidden');
-    this.panel.innerHTML = `<h4>Advisor</h4><p>${text}</p>`;
+    // The advisor text is LM-generated → escape it before injecting into innerHTML.
+    this.panel.innerHTML = `<h4>Advisor</h4><p>${escapeHtml(text)}</p>`;
   }
 
   /** Hide the advisor panel */

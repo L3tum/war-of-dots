@@ -2,13 +2,7 @@
 
 import { Connection } from '../net/connection';
 import { LeaderboardEntry } from '../generated/protocol';
-
-/** Escape HTML entities to prevent XSS when embedding user data in innerHTML */
-function escapeHtml(text: string): string {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
+import { escapeHtml } from './html';
 
 interface UnitTypeConfig {
   name: string;
@@ -173,6 +167,9 @@ export class LobbyUI {
       // Custom ruleset: send all game settings + custom unit types
       settings.starting_funds = Number(
         (document.getElementById('starting-funds') as HTMLInputElement).value,
+      );
+      settings.initial_manpower = Number(
+        (document.getElementById('starting-manpower') as HTMLInputElement).value,
       );
       settings.funds_per_city = Number(
         (document.getElementById('funds-per-city') as HTMLInputElement).value,

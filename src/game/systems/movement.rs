@@ -7,6 +7,7 @@ use crate::game::game::GameSettings;
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use hecs::World;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Collected movement changes.
@@ -24,6 +25,14 @@ pub fn run(world: &mut World, world_entity: hecs::Entity, settings: &GameSetting
         None => return,
     };
 
+    // Precompute unit-type lookup (name -> speed) once per tick instead of a linear
+    // scan per unit per tick.
+    let unit_type_speeds: HashMap<&str, f32> = settings
+        .unit_types
+        .iter()
+        .map(|ut| (ut.name.as_str(), ut.speed))
+        .collect();
+
     // Phase 1: query all components, compute movement changes
     let changes: Vec<(hecs::Entity, MovementChange)> = world
         .query::<(
@@ -39,8 +48,17 @@ pub fn run(world: &mut World, world_entity: hecs::Entity, settings: &GameSetting
             if path.path.is_empty() || flags.on_water {
                 return None;
             }
-            compute_movement(*pos, path, utype, stats, equipment, &terrain, settings)
-                .map(|change| (entity, change))
+            compute_movement(
+                *pos,
+                path,
+                utype,
+                stats,
+                equipment,
+                &terrain,
+                &unit_type_speeds,
+                settings,
+            )
+            .map(|change| (entity, change))
         })
         .collect();
 
@@ -75,6 +93,7 @@ pub fn run(world: &mut World, world_entity: hecs::Entity, settings: &GameSetting
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Pure per-unit computation: pos/path/components + precomputed lookup/settings
 fn compute_movement(
     pos: UnitPosition,
     path: &UnitPath,
@@ -82,6 +101,7 @@ fn compute_movement(
     stats: &UnitStats,
     equipment: &UnitEquipment,
     terrain: &Arc<Vec<Vec<Terrain>>>,
+    unit_type_speeds: &HashMap<&str, f32>,
     settings: &GameSettings,
 ) -> Option<MovementChange> {
     let (nx, ny) = path.path.first()?;
@@ -89,11 +109,10 @@ fn compute_movement(
     let dy = ny - pos.y;
     let dist = (dx * dx + dy * dy).sqrt();
 
-    let unit_type_speed = settings
-        .unit_types
-        .iter()
-        .find(|ut| ut.name == utype.name)
-        .map(|ut| ut.speed)
+    // O(1) lookup instead of a linear scan over settings.unit_types per unit.
+    let unit_type_speed = unit_type_speeds
+        .get(utype.name.as_str())
+        .copied()
         .unwrap_or(1.0);
 
     let current_terrain = terrain
@@ -158,6 +177,16 @@ fn unit_speed_with_terrain(terrain: &Terrain, water_speed: f32, unit_type_speed:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// Build the name -> speed lookup map passed to compute_movement (mirrors run()).
+    fn speeds_map(settings: &GameSettings) -> HashMap<&str, f32> {
+        settings
+            .unit_types
+            .iter()
+            .map(|ut| (ut.name.as_str(), ut.speed))
+            .collect()
+    }
 
     // ---------------------------------------------------------------------------
     // unit_speed_with_terrain
@@ -220,6 +249,7 @@ mod tests {
     fn test_settings() -> GameSettings {
         GameSettings {
             starting_funds: 1000,
+            initial_manpower: 10_000,
             funds_per_city: 1.0,
             recruitment_rate: 1.0,
             game_speed: 1.0,
@@ -275,7 +305,16 @@ mod tests {
         let terrain = test_terrain(20, 20);
         let settings = test_settings();
 
-        let result = compute_movement(pos, &path, &utype, &stats, &equipment, &terrain, &settings);
+        let result = compute_movement(
+            pos,
+            &path,
+            &utype,
+            &stats,
+            &equipment,
+            &terrain,
+            &speeds_map(&settings),
+            &settings,
+        );
         assert!(result.is_none());
     }
 
@@ -305,7 +344,16 @@ mod tests {
         let terrain = test_terrain(20, 20);
         let settings = test_settings();
 
-        let change = compute_movement(pos, &path, &utype, &stats, &equipment, &terrain, &settings);
+        let change = compute_movement(
+            pos,
+            &path,
+            &utype,
+            &stats,
+            &equipment,
+            &terrain,
+            &speeds_map(&settings),
+            &settings,
+        );
         assert!(change.is_some());
         let change = change.unwrap();
         assert_eq!(change.new_pos.x, 5.05);
@@ -341,7 +389,16 @@ mod tests {
         let terrain = test_terrain(20, 20);
         let settings = test_settings();
 
-        let change = compute_movement(pos, &path, &utype, &stats, &equipment, &terrain, &settings);
+        let change = compute_movement(
+            pos,
+            &path,
+            &utype,
+            &stats,
+            &equipment,
+            &terrain,
+            &speeds_map(&settings),
+            &settings,
+        );
         assert!(change.is_some());
         let change = change.unwrap();
         // Speed is 1.0 / 10.0 = 0.1 on plains
@@ -378,7 +435,16 @@ mod tests {
         let terrain = test_terrain(20, 20);
         let settings = test_settings();
 
-        let change = compute_movement(pos, &path, &utype, &stats, &equipment, &terrain, &settings);
+        let change = compute_movement(
+            pos,
+            &path,
+            &utype,
+            &stats,
+            &equipment,
+            &terrain,
+            &speeds_map(&settings),
+            &settings,
+        );
         assert!(change.is_some());
         let change = change.unwrap();
         assert!(change.new_org.is_some());
@@ -411,7 +477,16 @@ mod tests {
         let terrain = test_terrain(20, 20);
         let settings = test_settings();
 
-        let change = compute_movement(pos, &path, &utype, &stats, &equipment, &terrain, &settings);
+        let change = compute_movement(
+            pos,
+            &path,
+            &utype,
+            &stats,
+            &equipment,
+            &terrain,
+            &speeds_map(&settings),
+            &settings,
+        );
         assert!(change.is_some());
         let change = change.unwrap();
         assert!(change.new_org.is_none());

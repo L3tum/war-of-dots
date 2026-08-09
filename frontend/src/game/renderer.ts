@@ -62,6 +62,15 @@ export class Renderer {
   // Exposed dirty flags for external marking
   public fogDirty: boolean = true;
 
+  // Terrain CPU-mesh cache — skip marchingSquares + buffer upload when the visible
+  // cell range and terrain haven't changed (stationary camera). Terrain is static
+  // during a match, so this is correct as long as the terrain reference and the
+  // computed visible range are unchanged.
+  private terrainMeshKey = '';
+  private cachedTerrainRef: unknown = null;
+  private cachedTerrainPositions: number[] | null = null;
+  private cachedTerrainColors: number[] | null = null;
+
   // Last render/validation error — surfaced via the debug overlay when active
   lastRenderError: string | null = null;
 
@@ -921,14 +930,48 @@ export class Renderer {
 
     try {
       // Update terrain buffers
-      const { positions, colors } = marchingSquares(
-        gameState.terrain,
-        CELL_SIZE,
-        this.camera,
-        this.camera.zoom,
-        this.canvas.width,
-        this.canvas.height,
-      );
+      // Cache the CPU mesh keyed on the visible cell range (mirrors marchingSquares'
+      // own viewport culling math) + the terrain reference. Terrain is static during a
+      // match and the camera only changes the visible subset, so a stationary camera
+      // reuses the already-computed mesh and skips both marchingSquares and the upload.
+      const grid = gameState.terrain;
+      const gHeight = grid.length;
+      const gWidth = grid[0].length;
+      const tZoom = this.camera.zoom;
+      const camWorldX = this.camera.x - this.canvas.width / (2 * tZoom);
+      const camWorldY = this.camera.y - this.canvas.height / (2 * tZoom);
+      const visibleWorldW = this.canvas.width / tZoom;
+      const visibleWorldH = this.canvas.height / tZoom;
+      const tStartCol = Math.max(0, Math.floor(camWorldX / CELL_SIZE) - 1);
+      const tEndCol = Math.min(gWidth, Math.ceil((camWorldX + visibleWorldW) / CELL_SIZE) + 1);
+      const tStartRow = Math.max(0, Math.floor(camWorldY / CELL_SIZE) - 1);
+      const tEndRow = Math.min(gHeight, Math.ceil((camWorldY + visibleWorldH) / CELL_SIZE) + 1);
+      const terrainKey = `${tStartCol},${tEndCol},${tStartRow},${tEndRow},${this.canvas.width}x${this.canvas.height}`;
+      const terrainCached =
+        this.terrainMeshKey === terrainKey &&
+        this.cachedTerrainRef === grid &&
+        this.cachedTerrainPositions !== null;
+      let positions: number[];
+      let colors: number[];
+      if (terrainCached) {
+        positions = this.cachedTerrainPositions!;
+        colors = this.cachedTerrainColors!;
+      } else {
+        const mesh = marchingSquares(
+          grid,
+          CELL_SIZE,
+          this.camera,
+          tZoom,
+          this.canvas.width,
+          this.canvas.height,
+        );
+        positions = mesh.positions;
+        colors = mesh.colors;
+        this.terrainMeshKey = terrainKey;
+        this.cachedTerrainRef = grid;
+        this.cachedTerrainPositions = positions;
+        this.cachedTerrainColors = colors;
+      }
       if (positions.length > 0) {
         this.terrainVertexCount = positions.length / 2;
         const posData = new Float32Array(positions);
