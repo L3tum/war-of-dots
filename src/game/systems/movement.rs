@@ -19,6 +19,12 @@ struct MovementChange {
 }
 
 pub fn run(world: &mut World, world_entity: hecs::Entity, settings: &GameSettings) {
+    // Clear moved flags from the previous tick. Movement owns the full
+    // moved-flag lifecycle: clear at start, set for movers at end.
+    for (_, flags) in world.query::<&mut UnitFlags>().iter() {
+        flags.moved = false;
+    }
+
     // Scoped Arc extraction: drops hecs::Ref borrow immediately, only clones terrain Arc (24 bytes)
     let terrain = match world.world_data(world_entity) {
         Some(wb) => Arc::clone(&wb.terrain.grid),

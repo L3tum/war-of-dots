@@ -96,6 +96,8 @@ pub struct Game {
     entity_registry: HashMap<String, hecs::Entity>,
     /// Reverse lookup: hecs::Entity -> string unit ID — O(1) dead entity cleanup
     entity_reverse: HashMap<hecs::Entity, String>,
+    /// Pre-allocated combat scratch, cleared and reused each tick.
+    combat_scratch: systems::combat::CombatScratch,
 }
 
 /// Pre-grouped data built once per tick, shared across all systems.
@@ -232,6 +234,7 @@ impl Game {
             last_surrender_check_tick: 0,
             entity_registry: HashMap::new(),
             entity_reverse: HashMap::new(),
+            combat_scratch: systems::combat::CombatScratch::new(),
         }
     }
 
@@ -321,7 +324,13 @@ impl Game {
             "combat",
             &mut self.world,
             self.world_entity,
-            systems::combat::run(&mut self.world, self.world_entity, spatial)
+            systems::combat::run(
+                &mut self.world,
+                self.world_entity,
+                spatial,
+                &mut self.combat_scratch,
+                &self.settings
+            )
         );
 
         for entity in &dead_entities {
