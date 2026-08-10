@@ -8,7 +8,6 @@
 use crate::game::components::*;
 use crate::game::economy::UnitType;
 use crate::game::game::GameSettings;
-use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 use std::collections::HashMap;
@@ -25,8 +24,6 @@ pub struct CombatScratch {
     resolved: HashSet<(hecs::Entity, hecs::Entity)>,
     fought: HashSet<hecs::Entity>,
     dead_set: HashSet<hecs::Entity>,
-    had_enemy_nearby: HashSet<hecs::Entity>,
-    nearby: Vec<hecs::Entity>,
     dead: Vec<hecs::Entity>,
 }
 
@@ -36,8 +33,6 @@ impl CombatScratch {
             resolved: HashSet::new(),
             fought: HashSet::new(),
             dead_set: HashSet::new(),
-            had_enemy_nearby: HashSet::new(),
-            nearby: Vec::new(),
             dead: Vec::new(),
         }
     }
@@ -47,8 +42,6 @@ impl CombatScratch {
         self.resolved.clear();
         self.fought.clear();
         self.dead_set.clear();
-        self.had_enemy_nearby.clear();
-        self.nearby.clear();
         self.dead.clear();
     }
 }
@@ -112,7 +105,6 @@ fn terrain_modifier(terrain: &crate::game::unit::Terrain) -> f32 {
 pub fn run(
     world: &mut World,
     world_entity: hecs::Entity,
-    spatial: SpatialHash,
     scratch: &mut CombatScratch,
     settings: &GameSettings,
 ) -> Vec<hecs::Entity> {
@@ -142,11 +134,35 @@ pub fn run(
     // Collect cheap components upfront (Stats, Flags are Copy). Equipment deferred to resolution.
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_ue = crate::game::debug_stats::DetailedTimer::new("combat/unit_enumeration");
-    let candidates: Vec<(hecs::Entity, UnitPosition, String, UnitStats, UnitFlags)> = world
-        .query::<(&UnitPosition, &UnitOwner, &UnitFlags, &UnitStats)>()
+    let candidates: Vec<(
+        hecs::Entity,
+        UnitPosition,
+        String,
+        UnitStats,
+        UnitFlags,
+        NearbyEnemies,
+    )> = world
+        .query::<(
+            &UnitPosition,
+            &UnitOwner,
+            &UnitFlags,
+            &UnitStats,
+            &NearbyEnemies,
+        )>()
         .iter()
-        .filter(|(_, (_, _, flags, stats))| (flags.moved || flags.fighting) && stats.men > 0.0)
-        .map(|(e, (pos, owner, flags, stats))| (e, *pos, owner.player_id.clone(), *stats, *flags))
+        .filter(|(_, (_, _, flags, stats, _))| {
+            (flags.attacking || flags.fighting) && stats.men > 0.0
+        })
+        .map(|(e, (pos, owner, flags, stats, nearby))| {
+            (
+                e,
+                *pos,
+                owner.player_id.clone(),
+                *stats,
+                *flags,
+                nearby.clone(),
+            )
+        })
         .collect();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     _t_ue.finish(world, world_entity);
@@ -158,15 +174,14 @@ pub fn run(
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_stats = crate::game::debug_stats::DetailedTimer::new("combat/stats_update");
 
-    for (entity1, pos1, owner1, _, _) in &candidates {
+    for (entity1, pos1, owner1, _, _, nearby) in &candidates {
         // A unit that died during this tick (as a defender) should not go on to
         // attack other enemies in the same tick.
         if scratch.dead_set.contains(entity1) {
             continue;
         }
 
-        spatial.query_nearby_into(pos1.x, pos1.y, &mut scratch.nearby);
-        for entity2 in scratch.nearby.iter().copied() {
+        for entity2 in nearby.entities.iter().copied() {
             if entity2 == *entity1 {
                 continue;
             }
@@ -206,8 +221,8 @@ pub fn run(
                 continue;
             }
 
-            // Mark that entity1 had a nearby enemy (used for retreat logic)
-            scratch.had_enemy_nearby.insert(*entity1);
+            // Mark that entity1 fought someone this tick (tracked via scratch.fought,
+            // which is already populated below)
 
             // Re-fetch entity1's CURRENT stats/flags before attacking. A unit may
             // have already taken damage this tick (attacked by another unit before
@@ -368,18 +383,18 @@ pub fn run(
     }
 
     // Retreat check: clear fighting for units that found no nearby enemy
-    // Uses had_enemy_nearby set from main loop — NO second spatial hash pass
+    // Reads from NearbyEnemies component directly
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_retreat = crate::game::debug_stats::DetailedTimer::new("combat/retreat_check");
-    for (entity, _, _, _, flags) in &candidates {
+    for (entity, _, _, _, flags, nearby) in &candidates {
         if scratch.fought.contains(entity) {
             continue;
         }
         if !flags.fighting {
             continue;
         }
-        // If entity1 had a nearby enemy during main loop, keep fighting
-        if scratch.had_enemy_nearby.contains(entity) {
+        // If nearby entities exist, the unit has enemies — keep fighting
+        if !nearby.entities.is_empty() {
             continue;
         }
         if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(*entity) {
@@ -429,6 +444,7 @@ mod tests {
             },
             UnitFlags {
                 fighting: true,
+                attacking: true,
                 moved: false,
                 ..Default::default()
             },
@@ -445,6 +461,11 @@ mod tests {
                 supply_buffer_percent: 20,
                 supply: 2000.0,
                 max_supply: 2000.0,
+            },
+            NearbyEnemies {
+                entities: vec![],
+                initialized: true,
+                ..Default::default()
             },
         ))
     }
@@ -467,6 +488,7 @@ mod tests {
             },
             UnitFlags {
                 fighting: true,
+                attacking: true,
                 moved: false,
                 ..Default::default()
             },
@@ -484,19 +506,41 @@ mod tests {
                 supply: 2000.0,
                 max_supply: 2000.0,
             },
+            NearbyEnemies {
+                entities: vec![],
+                initialized: true,
+                ..Default::default()
+            },
         ))
     }
 
-    fn build_spatial(world: &World) -> SpatialHash {
-        let mut spatial = SpatialHash::new();
-        for (entity, pos) in world
-            .query::<(&UnitPosition,)>()
+    /// Populate NearbyEnemies.entities for each unit with enemy entities
+    /// within COMBAT_RANGE. Replaces the old SpatialHash-based approach.
+    fn populate_nearby_enemies(world: &mut World) {
+        let units: Vec<(hecs::Entity, UnitPosition, String)> = world
+            .query::<(&UnitPosition, &UnitOwner)>()
             .iter()
-            .map(|(e, (p,))| (e, *p))
-        {
-            spatial.insert(entity, pos.x, pos.y);
+            .map(|(e, (pos, owner))| (e, *pos, owner.player_id.clone()))
+            .collect();
+        for (entity, pos, owner) in &units {
+            let mut nearby: Vec<hecs::Entity> = Vec::new();
+            for (other, other_pos, other_owner) in &units {
+                if other == entity {
+                    continue;
+                }
+                if other_owner == owner {
+                    continue;
+                }
+                let dx = pos.x - other_pos.x;
+                let dy = pos.y - other_pos.y;
+                if dx * dx + dy * dy < crate::game::constants::COMBAT_RANGE_SQ {
+                    nearby.push(*other);
+                }
+            }
+            if let Ok((ne,)) = world.query_one_mut::<(&mut NearbyEnemies,)>(*entity) {
+                ne.entities = nearby;
+            }
         }
-        spatial
     }
 
     fn test_settings() -> GameSettings {
@@ -534,20 +578,11 @@ mod tests {
     #[test]
     fn combat_skips_dead_attacker() {
         let (mut world, world_entity) = make_world();
-        // A single 0-men, fighting unit with no live enemies nearby. Without the
-        // `men > 0` guard it would be a candidate and get its `fighting` flag cleared
-        // by the retreat pass; with the guard it is excluded from candidates entirely.
         let _a = make_unit(&mut world, "P1", 10.0, 10.0, 0.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let dead = run(&mut world, world_entity, &mut scratch, &test_settings());
         assert!(
             dead.is_empty(),
             "0-men unit must not be processed by combat"
@@ -571,16 +606,10 @@ mod tests {
         let a = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         let b = make_unit(&mut world, "P2", 10.0, 10.0, 1000.0);
         let c = make_unit(&mut world, "P3", 10.0, 10.0, 1000.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let _dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let men_of = |world: &World, e: hecs::Entity| {
             world
@@ -606,22 +635,14 @@ mod tests {
     #[test]
     fn defender_takes_compounding_damage() {
         let (mut world, world_entity) = make_world();
-        // Three attackers from the same player, one defender — all co-located.
-        // Each attacker gets one attack; the defender should be hit at least twice.
         let a1 = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         let _a2 = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         let _a3 = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         let d = make_unit(&mut world, "P2", 10.0, 10.0, 1000.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let _dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let d_men = world.get::<&UnitStats>(d).map(|s| s.men).unwrap();
         // With 2+ hits, defender should be well below 990 (each hit ~5 dmg).
@@ -641,8 +662,6 @@ mod tests {
     #[test]
     fn cumulative_damage_can_kill() {
         let (mut world, world_entity) = make_world();
-        // 10 weak attackers vs a 50-men defender — co-located.
-        // Each attacker deals ~5 dmg; enough should kill the defender.
         let mut attackers = Vec::new();
         for i in 0..10 {
             let x = 10.0 + (i % 3) as f32;
@@ -650,16 +669,10 @@ mod tests {
             attackers.push(make_unit(&mut world, "P1", x, y, 1000.0));
         }
         let defender = make_unit(&mut world, "P2", 10.0, 10.0, 50.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let defender_dead = dead.iter().any(|e| e.id() == defender.id());
         assert!(
@@ -674,7 +687,6 @@ mod tests {
     #[test]
     fn equipment_attrition_compounds() {
         let (mut world, world_entity) = make_world();
-        // Defender with 10 rifles attacked by 2 different enemies.
         let rifles = vec![Equipment {
             name: "rifle".to_string(),
             count: 10,
@@ -685,16 +697,10 @@ mod tests {
             make_unit_with_equipment(&mut world, "P2", 10.0, 10.0, 1000.0, rifles.clone());
         let attacker1 = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         let _attacker2 = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let _dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let defender_eq = world
             .get::<&UnitEquipment>(defender)
@@ -723,18 +729,11 @@ mod tests {
     #[test]
     fn retreat_clears_fighting_flag() {
         let (mut world, world_entity) = make_world();
-        // An isolated fighting unit with no enemies nearby should retreat.
         let unit = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let _dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let flags = world.get::<&UnitFlags>(unit).unwrap();
         assert!(
@@ -771,7 +770,6 @@ mod tests {
     #[test]
     fn terrain_modifier_is_per_unit() {
         let mut world = World::new();
-        // Build a terrain grid with hills at (10, 10) and plains at (10, 11)
         let mut terrain = vec![vec![Terrain::Plains; 20]; 20];
         terrain[10][10] = Terrain::Hills;
         let world_entity = world.spawn((WorldBundle::new(
@@ -782,19 +780,12 @@ mod tests {
             std::collections::HashMap::new(),
         ),));
 
-        // Attacker on hills (10, 10), defender on plains (10, 11)
         let attacker = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         let defender = make_unit(&mut world, "P2", 10.0, 11.0, 1000.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let _dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let a_men = world.get::<&UnitStats>(attacker).map(|s| s.men).unwrap();
         let d_men = world.get::<&UnitStats>(defender).map(|s| s.men).unwrap();
@@ -819,20 +810,12 @@ mod tests {
     #[test]
     fn org_loss_scales_with_men_lost() {
         let (mut world, world_entity) = make_world();
-        // Attacker with 100 men vs defender with 1000 men — defender deals minimal damage
-        // to attacker but attacker takes notable % damage from defender counter
         let attacker = make_unit(&mut world, "P1", 10.0, 10.0, 100.0);
         let defender = make_unit(&mut world, "P2", 10.0, 10.0, 1000.0);
-        let spatial = build_spatial(&world);
+        populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
 
-        let _dead = run(
-            &mut world,
-            world_entity,
-            spatial,
-            &mut scratch,
-            &test_settings(),
-        );
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
 
         let a_stats = world.get::<&UnitStats>(attacker).unwrap();
         let d_stats = world.get::<&UnitStats>(defender).unwrap();

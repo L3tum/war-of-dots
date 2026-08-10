@@ -37,6 +37,7 @@ subtle = "2"
 [features]
 default = []
 debug-overlay = []
+perfect-movement = []
 
 [[bin]]
 name = "console_client"

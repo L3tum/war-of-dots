@@ -7,8 +7,10 @@
 //! No `#[derive(Component)]` needed — it's a marker trait auto-implied.
 
 use crate::game::economy::City;
+use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Equipment;
 use crate::game::unit::Terrain;
+use hecs;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -53,6 +55,21 @@ pub struct UnitPath {
     pub path: Vec<(f32, f32)>,
 }
 
+/// Cached list of enemy entities within ±1 spatial-hash cells.
+/// Maintained by the Spatialty system. Read by combat.
+#[derive(Debug, Clone, Default)]
+pub struct NearbyEnemies {
+    /// Enemy entities found during last spatialty update.
+    pub entities: Vec<hecs::Entity>,
+    /// Whether this list was ever populated by the spatialty system.
+    /// false at spawn, set to true after first Tier 1 initialization.
+    pub initialized: bool,
+    /// World position at which this unit was last inserted into the SpatialHash.
+    /// Used by spatialty to remove the stale hash entry when the unit moves.
+    pub last_x: f32,
+    pub last_y: f32,
+}
+
 /// Dynamic stats modified by combat, attrition, healing.
 #[derive(Debug, Clone, Copy)]
 pub struct UnitStats {
@@ -81,8 +98,9 @@ pub struct UnitEquipment {
 #[derive(Debug, Clone, Default, Copy)]
 pub struct UnitFlags {
     pub healing: bool,
-    pub fighting: bool, // repurposed from `attacking` — true when in combat range
-    pub moved: bool,    // set by movement system when position changes
+    pub fighting: bool,  // repurposed from `attacking` — true when in combat range
+    pub attacking: bool, // true when unit moved into/through enemy territory (set by spatialty)
+    pub moved: bool,     // set by movement system when position changes
     pub encircled: bool,
     pub resupply_enabled: bool,
     pub on_water: bool,
@@ -178,6 +196,9 @@ pub struct WorldBundle {
     pub cities: CityData,
     pub funds: EconomyFunds,
     pub city_upgrades: CityUpgradeData,
+    /// Spatial hash of living unit positions, maintained incrementally by
+    /// spatialty (units removed on death/move, inserted on spawn/move).
+    pub spatial_hash: SpatialHash,
     /// Debug stats (only populated in debug builds)
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub debug_stats: DebugStats,
@@ -211,6 +232,7 @@ impl WorldBundle {
             city_upgrades: CityUpgradeData {
                 settings: city_upgrade_settings,
             },
+            spatial_hash: SpatialHash::new(),
             #[cfg(any(debug_assertions, feature = "debug-overlay"))]
             debug_stats: DebugStats::default(),
         }

@@ -6,12 +6,12 @@ use std::collections::HashMap;
 
 /// A spatial hash grid that maps grid cells to entity IDs.
 /// Cell size matches the combat range (2.0 units).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SpatialHash {
     /// Cell size in world units. Matches combat range.
     cell_size: f32,
     /// Maps (cell_x, cell_y) -> list of entity indices
-    cells: HashMap<(i32, i32), Vec<hecs::Entity>>,
+    pub cells: HashMap<(i32, i32), Vec<hecs::Entity>>,
 }
 
 impl SpatialHash {
@@ -35,23 +35,36 @@ impl SpatialHash {
         self.cells.entry((cx, cy)).or_default().push(entity);
     }
 
-    /// Query all entities within the combat range of (x, y).
-    /// Returns entities from the same cell and all 8 neighboring cells.
-    pub fn query_nearby(&self, x: f32, y: f32) -> Vec<hecs::Entity> {
+    /// Remove an entity from the cell it's in (given its old position).
+    /// Used for incremental updates when a unit moves.
+    pub fn remove(&mut self, entity: hecs::Entity, x: f32, y: f32) {
         let (cx, cy) = self.world_to_cell(x, y);
-        let mut results = Vec::new();
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                if let Some(entities) = self.cells.get(&(cx + dx, cy + dy)) {
-                    results.extend(entities.iter().copied());
-                }
+        if let Some(cell) = self.cells.get_mut(&(cx, cy)) {
+            cell.retain(|&e| e != entity);
+            if cell.is_empty() {
+                self.cells.remove(&(cx, cy));
             }
         }
+    }
+
+    /// Update an entity's position (remove from old cell, insert into new).
+    pub fn update(&mut self, entity: hecs::Entity, old_x: f32, old_y: f32, new_x: f32, new_y: f32) {
+        self.remove(entity, old_x, old_y);
+        self.insert(entity, new_x, new_y);
+    }
+
+    /// Query all entities within the combat range of (x, y).
+    /// Returns entities from the same cell and all 8 neighboring cells.
+    /// Prefer [`Self::query_nearby_into`] to avoid per-call allocations.
+    #[allow(dead_code)] // Used in unit tests
+    pub fn query_nearby(&self, x: f32, y: f32) -> Vec<hecs::Entity> {
+        let mut results = Vec::new();
+        self.query_nearby_into(x, y, &mut results);
         results
     }
 
     /// Like [`Self::query_nearby`] but writes into `out`, clearing it first.
-    /// Reusing one buffer across candidates avoids a Vec allocation per call.
+    /// Reuses the buffer to avoid a Vec allocation per call.
     pub fn query_nearby_into(&self, x: f32, y: f32, out: &mut Vec<hecs::Entity>) {
         let (cx, cy) = self.world_to_cell(x, y);
         out.clear();

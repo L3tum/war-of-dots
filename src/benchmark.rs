@@ -30,6 +30,8 @@ pub struct TickData {
     pub unit_count: u32,
     /// Sum of all system timings for this tick (to compute overhead gap)
     pub system_sum_ms: f64,
+    /// Number of units that moved this tick (movement.rs mover_count)
+    pub movers: u32,
 }
 
 /// Benchmark configuration
@@ -194,9 +196,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         ],
         terrain_data: None,
     };
-    let map = Map::from_config(&map_cfg);
-
-    let settings = GameSettings {
+    let settings_template = GameSettings {
         starting_funds: 2000,
         // Generous initial manpower so the pre-battle army spawns fully (each player
         // fields ~60 units in the default config).
@@ -210,18 +210,43 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         water_speed: 1.2,
     };
 
-    let total_cities = map.cities.len();
-    let mut game = Game::new(map, settings, total_cities);
-    let cities = game.query_cities();
+    let total_cities = map_cfg.cities.len();
+    println!("  Cities: {}, Players created: {}", total_cities, total_cities);
+
+    // Benchmark protocol: one warmup pass per run, then MEASURED_RUNS measured
+    // passes of `config.ticks` ticks each; results are averaged across runs to
+    // smooth out run-to-run variance.
+    const MEASURED_RUNS: u32 = 3;
+    const WARMUP_TICKS: u64 = 50;
+    let mut all_tick_data: Vec<TickData> = Vec::new();
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
+    let mut agg_system: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
+    let mut agg_detailed: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    let mut bench_elapsed_total = std::time::Duration::ZERO;
+    let mut total_units: u32 = 0;
+    let mut remaining_units = 0usize;
+
+    if !config.detailed_systems.is_empty() {
+        println!("  Detailed timing: {}", config.detailed_systems.join(", "));
+    }
     println!(
-        "  Cities: {}, Players created: {}",
-        total_cities, total_cities
+        "  Runs per config: {} measured (each {} ticks, {} warmup)",
+        MEASURED_RUNS, config.ticks, WARMUP_TICKS
     );
 
-    for (i, city) in cities.iter().enumerate() {
-        let player_id = format!("player_{}", i % 4);
-        game.assign_city_owner(&city.id, &player_id);
-    }
+    for run in 0..MEASURED_RUNS {
+        println!("  ── Run {}/{} ──", run + 1, MEASURED_RUNS);
+        let map = Map::from_config(&map_cfg);
+        let settings = settings_template.clone();
+        let mut game = Game::new(map, settings, total_cities);
+        let cities = game.query_cities();
+        for (i, city) in cities.iter().enumerate() {
+            let player_id = format!("player_{}", i % 4);
+            game.assign_city_owner(&city.id, &player_id);
+        }
 
     let settings_ref = game.settings();
     let infantry = settings_ref
@@ -240,7 +265,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let _ = settings_ref;
 
     let cities_with_owners = game.query_cities();
-    let mut total_units = 0u32;
+    total_units = 0;
     for city in &cities_with_owners {
         let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
         for _ in 0..config.units_per_city {
@@ -260,21 +285,20 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
     // Enable detailed sub-part timing if requested
     if !config.detailed_systems.is_empty() {
-        println!("  Detailed timing: {}", config.detailed_systems.join(", "));
         game.set_detailed_systems(config.detailed_systems.clone());
     }
 
     game.start();
 
     // Warmup (with AI to warm up caches & archetypes)
-    for _ in 0..50 {
+    for _ in 0..WARMUP_TICKS {
         sim.tick(&mut game, &config);
         game.tick_game();
     }
 
     // Collect per-tick data
-    let mut tick_data: Vec<TickData> = Vec::with_capacity(config.ticks as usize);
-    let bench_start = Instant::now();
+    let mut run_tick_data: Vec<TickData> = Vec::with_capacity(config.ticks as usize);
+    let run_start = Instant::now();
 
     for _ in 0..config.ticks {
         let tick_start = Instant::now();
@@ -282,6 +306,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         game.tick_game();
         let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
         let unit_count = game.query_all_units().len() as u32;
+        let movers = game.last_mover_count() as u32;
 
         #[cfg(any(debug_assertions, feature = "debug-overlay"))]
         let td = if let Some(ds) = game.get_debug_stats() {
@@ -297,6 +322,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 entity_count,
                 unit_count,
                 system_sum_ms,
+                movers,
             }
         } else {
             TickData {
@@ -304,6 +330,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 entity_count: 0,
                 unit_count,
                 system_sum_ms: 0.0,
+                movers,
             }
         };
 
@@ -313,35 +340,57 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             entity_count: 0,
             unit_count,
             system_sum_ms: 0.0,
+            movers,
         };
 
-        tick_data.push(td);
+        run_tick_data.push(td);
     }
-    let bench_elapsed = bench_start.elapsed();
+    all_tick_data.extend(run_tick_data);
+    bench_elapsed_total += run_start.elapsed();
+    remaining_units = game.query_all_units().len();
 
-    let remaining_units = game.query_all_units().len();
-    let recruit_events = ((config.ticks / 100).max(1) - 1) as u32;
-    let total_recruited =
-        total_units + recruit_events * (config.units_per_city / 2).max(1) * total_cities as u32;
+    // Aggregate this run's system timings for cross-run averaging.
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
+    {
+        let final_debug = game.get_debug_stats().unwrap_or_default();
+        if let Some(arr) = final_debug["system_timings"].as_array() {
+            for s in arr {
+                let name = s["name"].as_str().unwrap_or("?").to_string();
+                agg_system.entry(name).or_default().push(s.clone());
+            }
+        }
+        if let Some(arr) = final_debug["detailed_timings"].as_array() {
+            for s in arr {
+                let name = s["name"].as_str().unwrap_or("?").to_string();
+                agg_detailed.entry(name).or_default().push(s.clone());
+            }
+        }
+    }
+    } // end of measured-run loop
 
-    // Get final system timings from debug stats (has P90/P99 from duration buffer)
+    // Combine per-run timings by averaging the numeric fields across runs.
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-    let final_debug = game.get_debug_stats().unwrap_or_default();
+    let final_system_timings: Vec<serde_json::Value> = agg_system
+        .iter()
+        .map(|(_, vals)| average_timings(vals))
+        .collect();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-    let final_system_timings = final_debug["system_timings"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-    let final_detailed_timings = final_debug["detailed_timings"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let final_detailed_timings: Vec<serde_json::Value> = agg_detailed
+        .iter()
+        .map(|(_, vals)| average_timings(vals))
+        .collect();
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     let final_system_timings: Vec<serde_json::Value> = Vec::new();
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     let final_detailed_timings: Vec<serde_json::Value> = Vec::new();
+
+    // Combined results across all measured runs
+    let bench_elapsed = bench_elapsed_total;
+    let tick_data = all_tick_data;
+    let recruit_events = ((config.ticks / 100).max(1) - 1) as u32;
+    let total_recruited =
+        total_units + recruit_events * (config.units_per_city / 2).max(1) * total_cities as u32;
 
     // Compute overhead gap: tick_ms - sum(system_ms) = archetype/query/spawn overhead
     let overhead_durations: Vec<f64> = tick_data
@@ -362,10 +411,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "  Total wall time: {:.2}ms",
         bench_elapsed.as_secs_f64() * 1000.0
     );
-    println!("  Ticks completed: {}", config.ticks);
+    println!("  Ticks completed: {}", tick_data.len());
     println!(
         "  Avg tick (wall): {:.3}ms",
-        bench_elapsed.as_secs_f64() * 1000.0 / config.ticks as f64
+        bench_elapsed.as_secs_f64() * 1000.0 / tick_data.len() as f64
     );
     println!(
         "  Avg system time: {:.3}ms",
@@ -381,9 +430,17 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     println!("  Units remaining: {}", remaining_units);
     println!(
         "  Move events: {}, Recruit events: {}",
-        config.ticks / 20,
-        recruit_events
+        config.ticks / 20 * MEASURED_RUNS as u64,
+        recruit_events * MEASURED_RUNS
     );
+    let avg_movers = if tick_data.is_empty() {
+        0.0
+    } else {
+        tick_data.iter().map(|td| td.movers as f64).sum::<f64>() / tick_data.len() as f64
+    };
+    let total_movers: u64 = tick_data.iter().map(|td| td.movers as u64).sum();
+    println!("  Avg movers/tick (movement mover_count): {:.1}", avg_movers);
+    println!("  Total mover-tick count: {}", total_movers);
     println!();
 
     // Per-system breakdown from final debug stats (includes P90/P99)
@@ -404,10 +461,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         let avg = s["avg_ms"].as_f64().unwrap_or(0.0);
         let p99 = s["p99_ms"].as_f64().unwrap_or(0.0);
         let pct = if config.ticks > 0 {
-            calls as f64 / (config.ticks + 50) as f64 * 100.0
+            calls as f64 / (config.ticks + WARMUP_TICKS) as f64 * 100.0
         } else {
             0.0
-        }; // +50 warmup
+        };
         println!(
             "    {:<25}  {:>8.1}ms total  {:>6.3}ms avg  P99={:.3}ms  ({} calls, {:.0}%)",
             name, total, avg, p99, calls, pct
@@ -457,6 +514,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let overhead_p95 = percentile(&overhead_durations, 95);
     let overhead_p99 = percentile(&overhead_durations, 99);
 
+    // Mover stats (movement mover_count per tick)
+    let total_mover_ticks: u64 = tick_data.iter().map(|td| td.movers as u64).sum();
+    let avg_movers_per_tick = if tick_data.is_empty() {
+        0.0
+    } else {
+        total_mover_ticks as f64 / tick_data.len() as f64
+    };
+
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
@@ -465,11 +530,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         },
         "results": {
             "wall_time_ms": bench_elapsed.as_secs_f64() * 1000.0,
-            "avg_tick_wall_ms": bench_elapsed.as_secs_f64() * 1000.0 / config.ticks as f64,
+            "avg_tick_wall_ms": bench_elapsed.as_secs_f64() * 1000.0 / tick_data.len() as f64,
             "avg_system_ms": tick_data.iter().map(|td| td.system_sum_ms).sum::<f64>() / tick_data.len() as f64,
             "avg_overhead_ms": overhead_avg,
             "units_remaining": remaining_units,
-            "move_events": config.ticks / 20, "recruit_events": recruit_events,
+            "move_events": config.ticks / 20 * MEASURED_RUNS as u64, "recruit_events": recruit_events * MEASURED_RUNS,
+            "avg_movers_per_tick": avg_movers_per_tick,
+            "total_mover_ticks": total_mover_ticks,
         },
         "latency": {
             "avg_ms": avg_tick, "min_ms": min_tick, "max_ms": max_tick,
@@ -484,6 +551,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "system_timings": final_system_timings,
         "detailed_timings": final_detailed_timings,
         "tick_durations_ms": tick_durations,
+        "movers_per_tick": tick_data.iter().map(|td| td.movers).collect::<Vec<_>>(),
     });
 
     BenchmarkResults {
@@ -565,6 +633,9 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     } else {
         0.0
     };
+    let avg_movers = results.summary["results"]["avg_movers_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
 
     // Parse previous report for comparison (system timings + latency metrics)
     let (prev_timings, prev_json) = prev_html
@@ -634,6 +705,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let tick_durations: Vec<f64> = results.tick_data.iter().map(|td| td.total_ms).collect();
     let entity_counts: Vec<u32> = results.tick_data.iter().map(|td| td.entity_count).collect();
     let unit_counts: Vec<u32> = results.tick_data.iter().map(|td| td.unit_count).collect();
+    let mover_counts: Vec<u32> = results.tick_data.iter().map(|td| td.movers).collect();
     let overhead_durations: Vec<f64> = results
         .tick_data
         .iter()
@@ -643,6 +715,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let tick_durations_json = serde_json::to_string(&tick_durations).unwrap();
     let entity_counts_json = serde_json::to_string(&entity_counts).unwrap();
     let unit_counts_json = serde_json::to_string(&unit_counts).unwrap();
+    let mover_counts_json = serde_json::to_string(&mover_counts).unwrap();
     let overhead_durations_json = serde_json::to_string(&overhead_durations).unwrap();
 
     // System timing table
@@ -865,6 +938,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         <div class="metrics">
             <div class="metric"><div class="value">{avg_system:.3}ms{avg_system_delta}</div><div class="label">Avg System Time</div></div>
             <div class="metric"><div class="value">{avg_spatial_hash:.3}ms</div><div class="label">Avg Spatial Hash</div></div>
+            <div class="metric"><div class="value">{avg_movers:.0}</div><div class="label">Avg Movers/Tick</div></div>
             <div class="metric"><div class="value">{avg_overhead:.3}ms{avg_overhead_delta}</div><div class="label">Avg Overhead</div></div>
             <div class="metric"><div class="value">{overhead_p95:.3}ms</div><div class="label">Overhead P95</div></div>
             <div class="metric"><div class="value">{overhead_p99:.3}ms</div><div class="label">Overhead P99</div></div>
@@ -878,7 +952,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         <div class="chart-container"><canvas id="overheadChart" height="120"></canvas></div>
         <p class="note">Spikes in overhead correlate with entity spawning (recruit events every 100 ticks). ECS archetype rebuild is the primary cost.</p>
 
-        <h3>Entity & Unit Counts Over Time</h3>
+        <h3>Entity, Unit & Mover Counts Over Time</h3>
         <div class="chart-container"><canvas id="entityChart" height="120"></canvas></div>
 
         <h2>System Timing Breakdown</h2>
@@ -967,13 +1041,15 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         // Entity count chart
         const entityCounts = {entity_counts_json};
         const unitCounts = {unit_counts_json};
+        const moverCounts = {mover_counts_json};
         new Chart(document.getElementById('entityChart'), {{
             type: 'line',
             data: {{
                 labels: entityCounts.map((_, i) => i),
                 datasets: [
                     {{ label: 'Entities', data: entityCounts, borderColor: '#66ccff', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }},
-                    {{ label: 'Units', data: unitCounts, borderColor: '#00ff88', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }}
+                    {{ label: 'Units', data: unitCounts, borderColor: '#00ff88', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }},
+                    {{ label: 'Movers', data: moverCounts, borderColor: '#ffcc00', borderWidth: 1.5, pointRadius: 0, tension: 0.3, borderDash: [4, 4] }}
                 ]
             }},
             options: {{
@@ -1052,6 +1128,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         avg_system = avg_system,
         avg_system_delta = avg_system_delta,
         avg_spatial_hash = avg_spatial_hash,
+        avg_movers = avg_movers,
         avg_overhead = avg_overhead,
         avg_overhead_delta = avg_overhead_delta,
         overhead_p95 = overhead_p95,
@@ -1064,10 +1141,28 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         tick_durations_json = tick_durations_json,
         entity_counts_json = entity_counts_json,
         unit_counts_json = unit_counts_json,
+        mover_counts_json = mover_counts_json,
         overhead_durations_json = overhead_durations_json,
         pie_labels_json = pie_labels,
         pie_data_json = pie_data,
     )
+}
+
+/// Average per-system timing entries across multiple measured runs:
+/// numeric fields (total/avg/last/p50/p90/p99) are averaged; `name` and
+/// `call_count` are taken from the first run (identical across runs).
+fn average_timings(entries: &[serde_json::Value]) -> serde_json::Value {
+    let mut out = entries.first().cloned().unwrap_or(serde_json::Value::Null);
+    if out.is_null() || entries.is_empty() {
+        return out;
+    }
+    for f in ["total_ms", "avg_ms", "last_ms", "p50_ms", "p90_ms", "p99_ms"] {
+        if out.get(f).is_some() {
+            let sum: f64 = entries.iter().filter_map(|v| v[f].as_f64()).sum();
+            out[f] = serde_json::json!(sum / entries.len() as f64);
+        }
+    }
+    out
 }
 
 fn make_unit_types() -> Vec<UnitType> {

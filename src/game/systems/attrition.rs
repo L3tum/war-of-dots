@@ -16,7 +16,11 @@ struct AttritionChanges {
     new_water_transition: Option<UnitWaterTransition>,
 }
 
-pub fn run(world: &mut World, _world_entity: hecs::Entity, settings: &GameSettings) {
+pub fn run(
+    world: &mut World,
+    _world_entity: hecs::Entity,
+    settings: &GameSettings,
+) -> Vec<hecs::Entity> {
     // Precompute unit-type lookup (name -> &UnitType) once per tick to avoid a
     // linear scan over settings.unit_types per unit per tick.
     let unit_types_by_name: HashMap<&str, &UnitType> = settings
@@ -47,7 +51,8 @@ pub fn run(world: &mut World, _world_entity: hecs::Entity, settings: &GameSettin
         })
         .collect();
 
-    // Phase 2: apply changes in batch
+    // Phase 2: apply changes in batch, collect dead units
+    let mut dead_units = Vec::new();
     for (entity, change) in changes {
         // Stats always change (at least org drain or men loss)
         if let Ok((ms,)) = world.query_one_mut::<(&mut UnitStats,)>(entity) {
@@ -63,7 +68,12 @@ pub fn run(world: &mut World, _world_entity: hecs::Entity, settings: &GameSettin
                 *mwt = new_wt;
             }
         }
+        // Track units killed by attrition (men reached 0)
+        if change.new_stats.men <= 0.0 {
+            dead_units.push(entity);
+        }
     }
+    dead_units
 }
 
 fn compute_attrition(
@@ -79,6 +89,12 @@ fn compute_attrition(
     let mut new_water_transition: Option<UnitWaterTransition> = None;
     let mut changed = false;
 
+    // Pre-extract base_attrition for use in both water and equipment sections
+    let base_attrition = unit_types_by_name
+        .get(utype.name.as_str())
+        .map(|ut| ut.base_attrition)
+        .unwrap_or(1.0);
+
     // Water bonus: org drain + boat supply consumption
     if flags.on_water && !wt.embarking && !wt.disembarking {
         if stats.organisation > 0.0 {
@@ -87,7 +103,8 @@ fn compute_attrition(
         }
         if !wt.boat_supply.is_empty() {
             let mut new_wt_copy = (*wt).clone();
-            let drain_rate: f32 = if flags.fighting { 2.0 } else { 1.0 };
+            // Boat supply drain is proportional to base_attrition, always 2× (no fighting branch)
+            let drain_rate = (base_attrition * 2.0).max(1.0);
             for boat_eq in new_wt_copy.boat_supply.iter_mut() {
                 if boat_eq.count > 0 {
                     boat_eq.count = boat_eq.count.saturating_sub(drain_rate.ceil() as u32);
@@ -104,11 +121,8 @@ fn compute_attrition(
 
     // Equipment attrition + starvation
     if let Some(unit_type) = unit_types_by_name.get(utype.name.as_str()).copied() {
-        let mut attrition_rate = if flags.fighting {
-            unit_type.fighting_attrition
-        } else {
-            unit_type.base_attrition
-        };
+        // Always use base_attrition — fighting attrition is applied by combat per engagement
+        let mut attrition_rate = unit_type.base_attrition;
 
         let total_weight: u32 = equipment.equipment.iter().map(|e| e.count).sum();
         let capacity = stats.men as u32;
@@ -371,6 +385,7 @@ mod tests {
         let flags = UnitFlags {
             healing: false,
             fighting: false,
+            attacking: false,
             moved: false,
             encircled: false,
             resupply_enabled: true,
@@ -399,7 +414,9 @@ mod tests {
     }
 
     #[test]
-    fn attrition_fighting_has_higher_rate() {
+    fn attrition_always_uses_base_rate() {
+        // After removing fighting branches, both fighting and non-fighting
+        // should produce the same attrition result (base_attrition only).
         let utype = UnitTypeId {
             name: "infantry".to_string(),
         };
@@ -461,11 +478,9 @@ mod tests {
         let peace_eq = peace_change.new_equipment.unwrap().equipment[0].count;
         let fight_eq = fight_change.new_equipment.unwrap().equipment[0].count;
 
-        assert!(
-            fight_eq < peace_eq,
-            "fighting attrition ({}) should reduce more than peace ({})",
-            fight_eq,
-            peace_eq
+        assert_eq!(
+            fight_eq, peace_eq,
+            "attrition should be identical regardless of fighting flag (both use base_attrition)"
         );
     }
 
@@ -565,6 +580,113 @@ mod tests {
         assert!(change.is_some());
         let change = change.unwrap();
         assert!(change.new_stats.men >= 0.0, "men should not be negative");
+    }
+
+    #[test]
+    fn boat_supply_drain_ignores_fighting_flag() {
+        // After removing fighting branches, boat supply drain should always use
+        // (base_attrition * 2.0).max(1.0) regardless of the fighting flag.
+        let utype = UnitTypeId {
+            name: "infantry".to_string(),
+        };
+        let stats = UnitStats {
+            men: 1000.0,
+            max_men: 1000.0,
+            organisation: 100.0,
+            max_organisation: 100.0,
+            reinforcement_rate: 5.0,
+        };
+        let equipment = UnitEquipment {
+            equipment: vec![],
+            max_equipment: vec![],
+            supply_buffer_percent: 20,
+            supply: 2000.0,
+            max_supply: 2000.0,
+        };
+        let settings = test_settings();
+
+        // Boat supply: 100 items of "ration"
+        let boat_ration = Equipment {
+            name: "ration".to_string(),
+            count: 100,
+            max_count: 100,
+            cost_per_item: 1.0,
+        };
+
+        // Peace: on_water but not fighting
+        let wt_peace = UnitWaterTransition {
+            embarking: false,
+            disembarking: false,
+            embarking_ticks_left: 0,
+            disembarking_ticks_left: 0,
+            boat_supply: vec![boat_ration.clone()],
+            max_boat_supply: vec![boat_ration.clone()],
+        };
+        let flags_peace = UnitFlags {
+            fighting: false,
+            on_water: true,
+            ..Default::default()
+        };
+
+        // Fight: on_water and fighting
+        let wt_fight = UnitWaterTransition {
+            embarking: false,
+            disembarking: false,
+            embarking_ticks_left: 0,
+            disembarking_ticks_left: 0,
+            boat_supply: vec![boat_ration.clone()],
+            max_boat_supply: vec![boat_ration.clone()],
+        };
+        let flags_fight = UnitFlags {
+            fighting: true,
+            on_water: true,
+            ..Default::default()
+        };
+
+        let peace_change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags_peace,
+            &wt_peace,
+            &unit_types_map(&settings),
+        )
+        .unwrap();
+        let fight_change = compute_attrition(
+            &utype,
+            &stats,
+            &equipment,
+            &flags_fight,
+            &wt_fight,
+            &unit_types_map(&settings),
+        )
+        .unwrap();
+
+        let peace_boat = peace_change
+            .new_water_transition
+            .unwrap()
+            .boat_supply
+            .iter()
+            .map(|e| e.count)
+            .sum::<u32>();
+        let fight_boat = fight_change
+            .new_water_transition
+            .unwrap()
+            .boat_supply
+            .iter()
+            .map(|e| e.count)
+            .sum::<u32>();
+
+        assert_eq!(
+            fight_boat, peace_boat,
+            "boat supply drain should be identical regardless of fighting flag"
+        );
+        // base_attrition is 1.0, so drain_rate = max(1.0 * 2.0, 1.0) = 2.0
+        // Each item loses ceil(2.0) = 2. Starting from 100, should be 98.
+        assert_eq!(
+            peace_boat, 98,
+            "boat supply should drain by ceil(base_attrition * 2.0) per item"
+        );
     }
 
     #[test]

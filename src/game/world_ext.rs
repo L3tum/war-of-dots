@@ -33,10 +33,6 @@ pub trait WorldExt {
 
     fn player_funds(&self, world_entity: hecs::Entity, player_id: &str) -> u32;
 
-    /// Build a spatial hash of all unit positions for O(1) neighbor lookups.
-    /// Shared between Movement and Combat systems to avoid duplicate builds.
-    fn build_spatial_hash(&self) -> crate::game::systems::spatial_hash::SpatialHash;
-
     /// Record a detailed sub-part timing (only active when system is in detailed mode).
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     fn record_detailed(&mut self, world_entity: hecs::Entity, key: &str, duration_ms: f64);
@@ -97,6 +93,7 @@ impl WorldExt for World {
             },
             UnitFlags::default(),
             UnitWaterTransition::default(),
+            NearbyEnemies::default(),
         ))
     }
 
@@ -129,19 +126,6 @@ impl WorldExt for World {
             .ok()
             .and_then(|wb| wb.funds.funds.get(player_id).copied())
             .unwrap_or(0)
-    }
-
-    fn build_spatial_hash(&self) -> crate::game::systems::spatial_hash::SpatialHash {
-        use crate::game::systems::spatial_hash::SpatialHash;
-        let mut spatial = SpatialHash::new();
-        for (entity, pos) in self
-            .query::<(&UnitPosition,)>()
-            .iter()
-            .map(|(e, (pos,))| (e, *pos))
-        {
-            spatial.insert(entity, pos.x, pos.y);
-        }
-        spatial
     }
 
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]

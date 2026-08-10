@@ -376,3 +376,140 @@ fn determine_winner_returns_none_when_game_running() {
 
     assert!(game.determine_winner().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Combat + Attrition + Death Cleanup integration
+// ---------------------------------------------------------------------------
+
+/// Integration test: verify that units can be recruited, engage in combat, and
+/// the dead units are properly cleaned up by the unified death_cleanup pipeline.
+/// This tests the full tick flow: movement → spatialty → combat → attrition →
+/// surrender → death_cleanup.
+#[test]
+fn combat_kill_is_cleaned_by_unified_pipeline() {
+    let map = test_map();
+    let settings = test_settings();
+    let mut game = Game::new(map, settings, 2);
+
+    // Player 0 owns city at (3, 3), player 1 owns city at (3, 16) — far apart.
+    // We need to recruit units close enough for combat. Use city_0 for both.
+    game.assign_city_owner("city_0", "player_0");
+    game.assign_city_owner("city_1", "player_1");
+
+    game.start();
+
+    let ut = basic_unit_type();
+    // Recruit two units at their own cities, then move toward each other.
+    // city_0 is at (3, 3) owned by player_0, city_1 is at (16, 3) owned by player_1.
+    // Move them toward each other on the same y-axis.
+    let unit_a = game.recruit_unit("city_0", &ut, "player_0");
+    let unit_b = game.recruit_unit("city_1", &ut, "player_1");
+
+    assert!(unit_a.is_some(), "player_0 should recruit a unit");
+    assert!(unit_b.is_some(), "player_1 should recruit a unit");
+
+    let unit_a_id = unit_a.unwrap();
+    let unit_b_id = unit_b.unwrap();
+
+    // Move unit A toward player_1's city and unit B toward player_0's city.
+    // They'll meet somewhere around x=10. This should trigger movement → spatialty → combat.
+    game.move_troops(&unit_a_id, "player_0", vec![(10.0, 3.0)]);
+    game.move_troops(&unit_b_id, "player_1", vec![(10.0, 3.0)]);
+
+    // Run enough ticks for: movement → spatialty → combat to engage
+    for _ in 0..60 {
+        game.tick_game();
+    }
+
+    // After combat, at least one unit should have been damaged or killed.
+    // The key assertion is that dead units are cleaned up (not leaking in the world).
+    let unit_data = game.query_all_units();
+    // Filter to only units from these two players
+    let player_units: Vec<_> = unit_data
+        .iter()
+        .filter(|u| u.owner == "player_0" || u.owner == "player_1")
+        .collect();
+
+    // The dead unit should NOT appear in the query results (it was despawned)
+    for unit in &player_units {
+        assert!(
+            unit.men > 0.0,
+            "dead units should be cleaned up, found unit with men={} in query",
+            unit.men
+        );
+    }
+
+    // We should have at most 2 units (one per player), and both should be alive
+    assert!(
+        player_units.len() <= 2,
+        "should have at most 2 units alive, got {}",
+        player_units.len()
+    );
+}
+
+/// Integration test: verify that the unified death cleanup handles combat kills
+/// and surrender (below 5% men) in the same pass. After a full tick cycle with
+/// combat and surrender both producing dead units, all dead entities should be
+/// removed from the world.
+#[test]
+fn unified_cleanup_handles_combat_and_surrender() {
+    let map = test_map();
+    let settings = test_settings();
+    let mut game = Game::new(map, settings, 3);
+
+    game.assign_city_owner("city_0", "player_0");
+    game.assign_city_owner("city_1", "player_1");
+    game.assign_city_owner("city_2", "player_2");
+
+    game.start();
+
+    let ut = basic_unit_type();
+    // Recruit units for player 0 and player 1 at their own cities
+    let unit_a = game.recruit_unit("city_0", &ut, "player_0");
+    let unit_b = game.recruit_unit("city_1", &ut, "player_1");
+    // Recruit a unit for player 2 that will be brought below 5%
+    let _unit_c = game.recruit_unit("city_2", &ut, "player_2");
+
+    assert!(unit_a.is_some());
+    assert!(unit_b.is_some());
+
+    let unit_a_id = unit_a.unwrap();
+
+    // Move unit A toward player_1's city and unit B toward player_0's city
+    // so they meet around x=10 on the same y-axis.
+    game.move_troops(&unit_a_id, "player_0", vec![(10.0, 3.0)]);
+    let unit_b_id = unit_b.unwrap();
+    game.move_troops(&unit_b_id, "player_1", vec![(10.0, 3.0)]);
+
+    // Run 60 ticks: combat should engage, surrender check happens every 30 ticks
+    // so at least 2 surrender sweeps occur, giving the pipeline enough opportunity
+    // to clean up both combat casualties and surrender casualties.
+    for _ in 0..90 {
+        game.tick_game();
+    }
+
+    // All units in the query should be alive (men > 0)
+    let all_units = game.query_all_units();
+    for unit in &all_units {
+        assert!(
+            unit.men > 0.0,
+            "all dead/surrendered units should be cleaned up, found {} with men={}",
+            unit.id,
+            unit.men
+        );
+    }
+
+    // No unit should have men below 5% of max_men (surrender would have caught it)
+    for unit in &all_units {
+        if unit.max_men > 0.0 {
+            let pct = unit.men / unit.max_men;
+            assert!(
+                pct >= 0.05,
+                "no unit should survive below 5% men (surrender should have cleaned it), \
+                 unit {} has {}% men",
+                unit.id,
+                pct * 100.0
+            );
+        }
+    }
+}

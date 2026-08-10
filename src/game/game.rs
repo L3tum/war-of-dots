@@ -98,6 +98,12 @@ pub struct Game {
     entity_reverse: HashMap<hecs::Entity, String>,
     /// Pre-allocated combat scratch, cleared and reused each tick.
     combat_scratch: systems::combat::CombatScratch,
+    /// Count of units that haven't been spatially initialized yet.
+    /// Incremented on spawn, decremented by spatialty after init.
+    uninitialized_units: u32,
+    /// Number of units that moved in the most recent tick (from movement.rs).
+    /// Used by benchmark/status reporting to gauge spatialty work.
+    last_mover_count: usize,
 }
 
 /// Pre-grouped data built once per tick, shared across all systems.
@@ -235,11 +241,18 @@ impl Game {
             entity_registry: HashMap::new(),
             entity_reverse: HashMap::new(),
             combat_scratch: systems::combat::CombatScratch::new(),
+            uninitialized_units: 0,
+            last_mover_count: 0,
         }
     }
 
     pub fn start(&mut self) {
         self.running = true;
+    }
+
+    /// Number of units that moved in the most recent tick.
+    pub fn last_mover_count(&self) -> usize {
+        self.last_mover_count
     }
 
     /// Main game tick.
@@ -298,48 +311,48 @@ impl Game {
             systems::water::run(&mut self.world, self.world_entity)
         );
 
-        // Build spatial hash once per tick — shared by Movement and Combat
-        let spatial = tick_system!(
-            "spatial_hash",
-            &mut self.world,
-            self.world_entity,
-            self.world.build_spatial_hash()
-        );
-
-        tick_system!(
+        // Movement returns count of units that moved this tick.
+        let mover_count = tick_system!(
             "movement",
             &mut self.world,
             self.world_entity,
             systems::movement::run(&mut self.world, self.world_entity, &self.settings)
         );
-        tick_system!(
-            "attrition",
-            &mut self.world,
-            self.world_entity,
-            systems::attrition::run(&mut self.world, self.world_entity, &self.settings)
-        );
+        self.last_mover_count = mover_count;
 
-        // Combat
-        let dead_entities = tick_system!(
+        // Spatialty: maintains NearbyEnemies (runs after movement, before combat)
+        // Skip entirely when there's nothing to do — most ticks have no movers
+        // and all units are already initialized.
+        if mover_count > 0 || self.uninitialized_units > 0 {
+            let new_init_count = tick_system!(
+                "spatialty",
+                &mut self.world,
+                self.world_entity,
+                systems::spatialty::run(&mut self.world, self.world_entity, mover_count > 0, self.uninitialized_units > 0)
+            );
+            self.uninitialized_units = self.uninitialized_units.saturating_sub(new_init_count);
+        }
+
+        // Combat (no longer needs SpatialHash — reads NearbyEnemies)
+        let combat_dead = tick_system!(
             "combat",
             &mut self.world,
             self.world_entity,
             systems::combat::run(
                 &mut self.world,
                 self.world_entity,
-                spatial,
                 &mut self.combat_scratch,
                 &self.settings
             )
         );
 
-        for entity in &dead_entities {
-            // O(1) removal via reverse lookup instead of O(N) linear scan
-            if let Some(id) = self.entity_reverse.remove(entity) {
-                self.entity_registry.remove(&id);
-            }
-            self.world.despawn(*entity).ok();
-        }
+        // Attrition (after combat so it sees post-combat men values)
+        let attrition_dead = tick_system!(
+            "attrition",
+            &mut self.world,
+            self.world_entity,
+            systems::attrition::run(&mut self.world, self.world_entity, &self.settings)
+        );
 
         // City capture
         tick_system!(
@@ -405,23 +418,37 @@ impl Game {
         }
 
         // Surrender: only every 30 ticks
-        if self.tick - self.last_surrender_check_tick >= 30 {
+        let surrender_dead = if self.tick - self.last_surrender_check_tick >= 30 {
             let dead = tick_system!(
                 "surrender",
                 &mut self.world,
                 self.world_entity,
                 systems::surrender::run(&mut self.world, self.world_entity)
             );
-
-            for entity in &dead {
-                // O(1) removal via reverse lookup
-                if let Some(id) = self.entity_reverse.remove(entity) {
-                    self.entity_registry.remove(&id);
-                }
-                self.world.despawn(*entity).ok();
-            }
             self.last_surrender_check_tick = self.tick;
-        }
+            dead
+        } else {
+            Vec::new()
+        };
+
+        // Unified death cleanup: chain all dead entities from combat, attrition, and surrender
+        let all_dead: Vec<hecs::Entity> = combat_dead
+            .into_iter()
+            .chain(attrition_dead)
+            .chain(surrender_dead)
+            .collect();
+
+        tick_system!(
+            "death_cleanup",
+            &mut self.world,
+            self.world_entity,
+            systems::death_cleanup::run(
+                &mut self.world,
+                self.world_entity,
+                all_dead,
+                &mut self.entity_reverse,
+            )
+        );
 
         self.track_unit_losses();
 
@@ -487,6 +514,7 @@ impl Game {
         }
 
         let entity = self.world.spawn_unit(unit_type, owner, city_pos);
+        self.uninitialized_units += 1;
         let unit_id = format!("unit_{}", entity.id());
         self.entity_registry.insert(unit_id.clone(), entity);
         self.entity_reverse.insert(entity, unit_id.clone());
