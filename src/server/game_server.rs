@@ -2455,7 +2455,7 @@ fn convert_unit_types(unit_types: &[ConfigUnitType]) -> Vec<UnitType> {
                 fighting_attrition: ut.fighting_attrition,
                 recruitment_cost,
                 supply_buffer_percent: ut.supply_buffer_percent,
-                supply_rate: 1,
+                supply_rate: 5,
                 max_supply: crate::config::derive_max_supply(ut.men),
             }
         })
@@ -2491,7 +2491,7 @@ fn convert_custom_unit_types(unit_types: &[super::protocol::CustomUnitType]) -> 
             fighting_attrition: 1.0,
             recruitment_cost: ut.recruitment_cost,
             supply_buffer_percent: 10, // Default
-            supply_rate: 1,
+            supply_rate: 5,
             max_supply: ut.men * 2, // men * CARRY_WEIGHT
         })
         .collect()

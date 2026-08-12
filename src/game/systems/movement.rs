@@ -441,7 +441,7 @@ mod tests {
                 base_attrition: 0.5,
                 fighting_attrition: 1.0,
                 supply_buffer_percent: 10,
-                supply_rate: 1,
+                supply_rate: 5,
                 max_supply: 2000,
             }],
             city_upgrade_settings: crate::config::CityUpgradeSettings::default(),
@@ -471,7 +471,7 @@ mod tests {
             equipment: vec![],
             max_equipment: vec![],
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -511,7 +511,7 @@ mod tests {
             equipment: vec![],
             max_equipment: vec![],
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -557,7 +557,7 @@ mod tests {
             equipment: vec![],
             max_equipment: vec![],
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -604,7 +604,7 @@ mod tests {
             equipment: vec![],
             max_equipment: vec![],
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -647,7 +647,7 @@ mod tests {
             equipment: vec![],
             max_equipment: vec![],
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             supply: 2000.0,
             max_supply: 2000.0,
         };

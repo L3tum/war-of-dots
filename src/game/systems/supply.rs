@@ -269,11 +269,13 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::config::CityUpgradeSettings;
+    use crate::game::components::{UnitTypeId, UnitWaterTransition};
     use crate::game::economy::City;
+    use crate::game::game::GameSettings;
     use crate::game::unit::Equipment;
     use crate::game::unit::Terrain;
 
-    fn make_world(funds: u32) -> (World, hecs::Entity) {
+    fn make_world(funds: u32) -> (World, hecs::Entity, GameSettings) {
         let mut world = World::new();
         let mut wb = WorldBundle::new(
             vec![vec![Terrain::Plains; 10]; 10],
@@ -290,8 +292,38 @@ mod tests {
             supply_range: 5.0,
         }];
         wb.funds.funds.insert("P1".to_string(), funds);
+        wb.funds.manpower.insert("P1".to_string(), 10_000);
         let world_entity = world.spawn((wb,));
-        (world, world_entity)
+        let settings = GameSettings {
+            starting_funds: 1000,
+            initial_manpower: 10_000,
+            funds_per_city: 1.0,
+            recruitment_rate: 1.0,
+            game_speed: 1.0,
+            use_standard_ruleset: true,
+            unit_types: vec![crate::game::economy::UnitType {
+                name: "infantry".to_string(),
+                symbol: "I".to_string(),
+                men: 1000,
+                equipment: vec![],
+                soft_attack: 5.0,
+                soft_defense: 4.0,
+                hard_attack: 3.0,
+                hard_defense: 2.0,
+                recruitment_cost: 200,
+                max_organisation: 100.0,
+                reinforcement_rate: 5.0,
+                speed: 1.0,
+                base_attrition: 0.5,
+                fighting_attrition: 1.0,
+                supply_buffer_percent: 10,
+                supply_rate: 5,
+                max_supply: 2000,
+            }],
+            city_upgrade_settings: CityUpgradeSettings::default(),
+            water_speed: 0.5,
+        };
+        (world, world_entity, settings)
     }
 
     fn spawn_unit_with_equipment(
@@ -311,6 +343,9 @@ mod tests {
             UnitOwner {
                 player_id: "P1".to_string(),
             },
+            UnitTypeId {
+                name: "infantry".to_string(),
+            },
             flags,
             UnitStats {
                 men: 1000.0,
@@ -323,26 +358,29 @@ mod tests {
                 equipment: equipment.to_vec(),
                 max_equipment: equipment.to_vec(),
                 supply_buffer_percent: buffer_percent,
-                supply_rate: 1,
+                supply_rate: 5,
                 supply: 2000.0,
                 max_supply: 2000.0,
             },
+            UnitWaterTransition::default(),
         ))
     }
 
-    /// A unit with missing equipment is resupplied up to `supply_rate` items per
-    /// tick toward its buffer (rate capped — one tick delivers at most 1 item).
+    /// Supply delivers up to supply_rate items per tick. Starting at 4 rifles,
+    /// attrition wears 1 and supply replaces up to 5, so the unit visibly gains.
     #[test]
     fn supply_refills_equipment_at_rate_charged_to_funds() {
-        let (mut world, world_entity) = make_world(100_000);
-        // 5/10 rifles, buffer 10% (target 11), supply_rate 1 → +1 rifle this tick.
-        let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 5, 10);
+        let (mut world, world_entity, settings) = make_world(100_000);
+        // 4/10 rifles, buffer 10% (target 11), supply_rate 5.
+        // Attrition: 4 → 3 (1 item worn).
+        // Supply: gap to target is 8, capped by supply_rate=5 → delivers 5 → 8.
+        let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 4, 10);
 
-        run(&mut world, world_entity, 1.0);
+        run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 6, "delivered 1 rifle at supply_rate");
-        // cost = 1 rifle × 0.5 = 0.5 → rounded up to 1 fund.
+        assert_eq!(eq.equipment[0].count, 8, "supply delivered 5 items, net gain visible");
+        // cost = 5 rifles × 0.5 = 2.5 → rounded up to 3 funds.
         let funds = world
             .world_data(world_entity)
             .unwrap()
@@ -351,19 +389,22 @@ mod tests {
             .get("P1")
             .copied()
             .unwrap();
-        assert_eq!(funds, 100_000 - 1, "funds deducted for equipment");
+        assert_eq!(funds, 100_000 - 3, "3 funds deducted for 5 items");
     }
 
-    /// A fully-buffered unit costs nothing and is untouched.
+    /// From a fully-buffered unit, attrition wears 1 item and supply replaces 1,
+    /// so the buffer is maintained each tick at the cost of funds.
     #[test]
-    fn supply_skips_fully_kitted_unit() {
-        let (mut world, world_entity) = make_world(100_000);
+    fn supply_maintains_buffered_unit() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        // 11/10 rifles (at buffer target with 10% buffer).
+        // Attrition: 11 → 10. Supply: refills 1 → 11.
         let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 11, 10);
 
-        run(&mut world, world_entity, 1.0);
+        run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 11);
+        assert_eq!(eq.equipment[0].count, 11, "supply maintained buffer after attrition");
         let funds = world
             .world_data(world_entity)
             .unwrap()
@@ -372,23 +413,26 @@ mod tests {
             .get("P1")
             .copied()
             .unwrap();
-        assert_eq!(funds, 100_000);
+        assert_eq!(funds, 100_000 - 1, "1 fund spent to replace attrited item");
     }
 
-    /// Encircled units are not re-equipped: cut supply lines.
+    /// Encircled units are blocked from supply: they get 0 resupply even when
+    /// fully out of equipment, while a non-encircled unit at the same state would
+    /// receive items.
     #[test]
     fn supply_skips_encircled() {
-        let (mut world, world_entity) = make_world(100_000);
+        let (mut world, world_entity, settings) = make_world(100_000);
         let flags = UnitFlags {
             encircled: true,
             ..Default::default()
         };
-        let unit = spawn_unit_with_equipment(&mut world, flags, 5, 10);
+        // 0 equipment — if supply worked, it would deliver 1 item.
+        let unit = spawn_unit_with_equipment(&mut world, flags, 0, 10);
 
-        run(&mut world, world_entity, 1.0);
+        run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 5, "encircled unit not re-equipped");
+        assert_eq!(eq.equipment[0].count, 0, "encircled unit receives no supply");
         let funds = world
             .world_data(world_entity)
             .unwrap()
@@ -397,19 +441,21 @@ mod tests {
             .get("P1")
             .copied()
             .unwrap();
-        assert_eq!(funds, 100_000);
+        assert_eq!(funds, 100_000, "funds untouched — no supply delivered");
     }
 
-    /// A player without enough funds does not get free equipment.
+    /// A player without enough funds does not get free equipment, but attrition
+    /// still wears equipment down.
     #[test]
     fn supply_skips_when_funds_short() {
-        let (mut world, world_entity) = make_world(0); // no funds to deliver anything
+        let (mut world, world_entity, settings) = make_world(0); // no funds to deliver anything
+        // 5/10 rifles. Attrition: 5 → 4. Supply blocked (no funds).
         let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 5, 10);
 
-        run(&mut world, world_entity, 1.0);
+        run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 5);
+        assert_eq!(eq.equipment[0].count, 4, "attrition wore 1, supply blocked by 0 funds");
         let funds = world
             .world_data(world_entity)
             .unwrap()

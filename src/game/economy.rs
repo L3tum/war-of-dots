@@ -99,7 +99,7 @@ pub fn default_unit_types() -> Vec<UnitType> {
             base_attrition: 0.5,
             fighting_attrition: 1.0,
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             max_supply: 2000, // men(1000) * CARRY_WEIGHT(2)
         },
         UnitType {
@@ -118,7 +118,7 @@ pub fn default_unit_types() -> Vec<UnitType> {
             base_attrition: 1.0,
             fighting_attrition: 2.0,
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             max_supply: 1000, // men(500) * CARRY_WEIGHT(2)
         },
         UnitType {
@@ -137,7 +137,7 @@ pub fn default_unit_types() -> Vec<UnitType> {
             base_attrition: 0.15,
             fighting_attrition: 0.6,
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             max_supply: 160, // men(80) * CARRY_WEIGHT(2)
         },
     ]
@@ -343,7 +343,7 @@ mod tests {
             base_attrition: 0.5,
             fighting_attrition: 1.0,
             supply_buffer_percent: 10,
-            supply_rate: 1,
+            supply_rate: 5,
             max_supply: 2000,
         }
     }
