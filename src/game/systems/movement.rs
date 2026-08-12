@@ -11,13 +11,27 @@ use crate::game::world_ext::WorldExt;
 use hecs::World;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Collected movement changes.
 struct MovementChange {
+    old_pos: UnitPosition,
     new_pos: UnitPosition,
     new_path: Option<UnitPath>,
     new_org: Option<f32>,
     moved: bool,
+}
+
+/// Pre-allocated mover record for spatialty — `.clear()`'d each tick, capacity
+/// preserved. Owned by `Game` and passed by mutable reference into `run()`.
+///
+/// Movement writes `(entity, pre-move pos, post-move pos)` for every unit that
+/// actually moved. Spatialty consumes this directly — no marker component, no
+/// ECS writes, no marker lifecycle.
+#[derive(Default)]
+pub struct MovementScratch {
+    /// Units that moved this tick: (entity, pre-move pos, post-move pos).
+    pub movers: Vec<(hecs::Entity, UnitPosition, UnitPosition)>,
 }
 
 /// Returns the number of units that moved this tick.
@@ -25,7 +39,16 @@ pub fn run(
     world: &mut World,
     world_entity: hecs::Entity,
     settings: &GameSettings,
+    scratch: &mut MovementScratch,
 ) -> usize {
+    // Scratch is filled by the apply loop below; clear the previous tick's
+    // records up front so a fresh population happens every tick.
+    scratch.movers.clear();
+
+    // Per-phase timing (recorded into WorldBundle debug stats; no-op without
+    // the debug-overlay feature). Surface with `--bench-detailed movement`.
+    let t0 = Instant::now();
+
     // Clear moved flags from the previous tick. Movement owns the full
     // moved-flag lifecycle: clear at start, set for movers at end.
     for (_, flags) in world.query::<&mut UnitFlags>().iter() {
@@ -45,6 +68,7 @@ pub fn run(
         .iter()
         .map(|ut| (ut.name.as_str(), ut.speed))
         .collect();
+    let t1 = Instant::now();
 
     // Phase 1: query all components, compute movement changes
     let changes: Vec<(hecs::Entity, MovementChange)> = world
@@ -78,6 +102,7 @@ pub fn run(
     // Phase 2: apply changes
     // Only units that actually moved count as movers (drives spatialty).
     let mover_count = changes.iter().filter(|(_, c)| c.moved).count();
+    let t2 = Instant::now();
     // Get map bounds for clamping
     let (map_w, map_h) = match world.world_data(world_entity) {
         Some(wb) => (wb.terrain.width as f32, wb.terrain.height as f32),
@@ -101,6 +126,9 @@ pub fn run(
         let map: HashMap<hecs::Entity, UnitPosition> = positions.into_iter().collect();
         (sh, map)
     };
+
+    // (No marker lifecycle here anymore: movers are recorded into
+    // `scratch.movers` inside the apply loop below and consumed by spatialty.)
 
     for (entity, change) in changes {
         // perfect-movement: interception check before applying
@@ -127,6 +155,14 @@ pub fn run(
             (change.new_pos, false)
         };
 
+        if change.moved {
+            // Record this mover for spatialty: (entity, pre-move pos, post-move
+            // pos). Spatialty uses these directly for hash remove/insert, so no
+            // marker component is written to the ECS.
+            scratch
+                .movers
+                .push((entity, change.old_pos, change.new_pos));
+        }
         if let Ok((mpos,)) = world.query_one_mut::<(&mut UnitPosition,)>(entity) {
             #[cfg(feature = "perfect-movement")]
             {
@@ -161,6 +197,14 @@ pub fn run(
             }
         }
     }
+    let t4 = Instant::now();
+
+    // Record per-phase timings (keyed under "movement/..."; no-op if not
+    // enabled or without the debug-overlay feature).
+    let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    world.record_detailed(world_entity, "movement/p1_setup", to_ms(t1 - t0));
+    world.record_detailed(world_entity, "movement/p2_query", to_ms(t2 - t1));
+    world.record_detailed(world_entity, "movement/p3_apply", to_ms(t4 - t2));
 
     mover_count
 }
@@ -231,10 +275,11 @@ fn compute_movement(
     // A unit is only a "mover" (drives spatialty re-computation) if its position
     // actually changed this tick. Reaching a waypoint the unit is already at
     // produces new_pos == pos and must NOT be flagged as movement.
-    let actually_moved = (new_pos.x - pos.x).abs() > f32::EPSILON
-        || (new_pos.y - pos.y).abs() > f32::EPSILON;
+    let actually_moved =
+        (new_pos.x - pos.x).abs() > f32::EPSILON || (new_pos.y - pos.y).abs() > f32::EPSILON;
 
     Some(MovementChange {
+        old_pos: pos,
         new_pos,
         new_path,
         new_org,
@@ -395,7 +440,8 @@ mod tests {
                 speed: 1.0,
                 base_attrition: 0.5,
                 fighting_attrition: 1.0,
-                supply_buffer_percent: 20,
+                supply_buffer_percent: 10,
+                supply_rate: 1,
                 max_supply: 2000,
             }],
             city_upgrade_settings: crate::config::CityUpgradeSettings::default(),
@@ -424,7 +470,8 @@ mod tests {
         let equipment = UnitEquipment {
             equipment: vec![],
             max_equipment: vec![],
-            supply_buffer_percent: 20,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -463,7 +510,8 @@ mod tests {
         let equipment = UnitEquipment {
             equipment: vec![],
             max_equipment: vec![],
-            supply_buffer_percent: 20,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -508,7 +556,8 @@ mod tests {
         let equipment = UnitEquipment {
             equipment: vec![],
             max_equipment: vec![],
-            supply_buffer_percent: 20,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -554,7 +603,8 @@ mod tests {
         let equipment = UnitEquipment {
             equipment: vec![],
             max_equipment: vec![],
-            supply_buffer_percent: 20,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
             supply: 2000.0,
             max_supply: 2000.0,
         };
@@ -596,7 +646,8 @@ mod tests {
         let equipment = UnitEquipment {
             equipment: vec![],
             max_equipment: vec![],
-            supply_buffer_percent: 20,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
             supply: 2000.0,
             max_supply: 2000.0,
         };

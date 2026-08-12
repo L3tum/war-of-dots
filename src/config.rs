@@ -154,7 +154,7 @@ fn default_initial_manpower() -> u32 {
     2000
 }
 fn default_funds_per_city() -> f32 {
-    1.0
+    20.0
 }
 fn default_game_speed() -> f32 {
     60.0

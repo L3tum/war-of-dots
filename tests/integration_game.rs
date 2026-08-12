@@ -29,7 +29,8 @@ fn basic_unit_type() -> UnitType {
         speed: 1.0,
         base_attrition: 0.5,
         fighting_attrition: 1.0,
-        supply_buffer_percent: 20,
+        supply_buffer_percent: 10,
+        supply_rate: 1,
         max_supply: 2000, // men(1000) * CARRY_WEIGHT(2)
     }
 }

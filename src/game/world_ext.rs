@@ -88,12 +88,14 @@ impl WorldExt for World {
                 equipment: unit_type.equipment.clone(),
                 max_equipment: unit_type.equipment.clone(),
                 supply_buffer_percent: unit_type.supply_buffer_percent,
+                supply_rate: unit_type.supply_rate,
                 supply: unit_type.max_supply as f32,
                 max_supply: unit_type.max_supply as f32,
             },
             UnitFlags::default(),
             UnitWaterTransition::default(),
-            NearbyEnemies::default(),
+            // NOTE: no NearbyEnemies at spawn — its ABSENCE marks the unit as
+            // "uninitialized"; Spatialty creates it on the first pass.
         ))
     }
 

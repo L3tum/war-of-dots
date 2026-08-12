@@ -61,8 +61,86 @@ pub struct UnitType {
     pub fighting_attrition: f32,
     /// Percentage of extra equipment carried above "needed" baseline
     pub supply_buffer_percent: u32,
+    /// Max equipment items delivered to a unit per tick by the supply system.
+    pub supply_rate: u32,
     /// Derived from men + equipment + buffer
     pub max_supply: u32,
+}
+
+/// Build a single equipment item (shared constructor so field additions don't
+/// fan out to every literal).
+pub fn make_equipment(name: &str, count: u32, cost_per_item: f32) -> crate::game::unit::Equipment {
+    crate::game::unit::Equipment {
+        name: name.to_string(),
+        count,
+        max_count: count,
+        cost_per_item,
+    }
+}
+
+/// Canonical default unit roster, shared by the standard ruleset, the
+/// benchmark, and tests. One source of truth — adding a field here no longer
+/// requires sweeping dozens of literals.
+pub fn default_unit_types() -> Vec<UnitType> {
+    vec![
+        UnitType {
+            name: "infantry".to_string(),
+            symbol: "i".to_string(),
+            men: 1000,
+            equipment: vec![make_equipment("rifles", 1000, 0.5)],
+            soft_attack: 5.0,
+            soft_defense: 5.0,
+            hard_attack: 1.0,
+            hard_defense: 1.0,
+            recruitment_cost: 20,
+            max_organisation: 100.0,
+            reinforcement_rate: 1.0,
+            speed: 1.0,
+            base_attrition: 0.5,
+            fighting_attrition: 1.0,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
+            max_supply: 2000, // men(1000) * CARRY_WEIGHT(2)
+        },
+        UnitType {
+            name: "armor".to_string(),
+            symbol: "a".to_string(),
+            men: 500,
+            equipment: vec![make_equipment("tanks", 20, 5.0)],
+            soft_attack: 8.0,
+            soft_defense: 8.0,
+            hard_attack: 8.0,
+            hard_defense: 8.0,
+            recruitment_cost: 50,
+            max_organisation: 100.0,
+            reinforcement_rate: 2.0,
+            speed: 2.0,
+            base_attrition: 1.0,
+            fighting_attrition: 2.0,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
+            max_supply: 1000, // men(500) * CARRY_WEIGHT(2)
+        },
+        UnitType {
+            name: "cavalry".to_string(),
+            symbol: "C".to_string(),
+            men: 80,
+            equipment: vec![],
+            soft_attack: 7.0,
+            soft_defense: 4.0,
+            hard_attack: 3.0,
+            hard_defense: 2.0,
+            recruitment_cost: 15,
+            max_organisation: 100.0,
+            reinforcement_rate: 1.0,
+            speed: 1.5,
+            base_attrition: 0.15,
+            fighting_attrition: 0.6,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
+            max_supply: 160, // men(80) * CARRY_WEIGHT(2)
+        },
+    ]
 }
 
 /// [LEGACY — NOT USED AT RUNTIME] Economy struct was the pre-ECS game state manager.
@@ -264,7 +342,8 @@ mod tests {
             speed: 1.0,
             base_attrition: 0.5,
             fighting_attrition: 1.0,
-            supply_buffer_percent: 20,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
             max_supply: 2000,
         }
     }

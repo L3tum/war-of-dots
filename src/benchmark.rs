@@ -19,7 +19,6 @@ use rand::{Rng, SeedableRng};
 use crate::config::CityUpgradeSettings;
 use crate::game::economy::UnitType;
 use crate::game::game::{Game, GameSettings};
-use crate::game::unit::Equipment;
 use crate::map::map::{Map, MapConfig};
 
 /// Per-tick benchmark data point
@@ -32,6 +31,8 @@ pub struct TickData {
     pub system_sum_ms: f64,
     /// Number of units that moved this tick (movement.rs mover_count)
     pub movers: u32,
+    /// Number of engaged combat pairs this tick (combat.rs engaged_pairs)
+    pub combats: u32,
 }
 
 /// Benchmark configuration
@@ -69,12 +70,20 @@ struct BattleSimulator {
     rng: StdRng,
     unit_types: Vec<UnitType>,
     city_info: Vec<(String, String)>,
-    city_positions: Vec<(f32, f32)>,
+    /// Convergence point for all units (map centre) — creates dense fronts so
+    /// the combat/spatialty pipeline is actually exercised by the benchmark.
+    center: (f32, f32),
     tick: u64,
 }
 
 impl BattleSimulator {
-    fn new(unit_types: Vec<UnitType>, cities: Vec<crate::game::economy::City>, seed: u64) -> Self {
+    fn new(
+        unit_types: Vec<UnitType>,
+        cities: Vec<crate::game::economy::City>,
+        seed: u64,
+        map_w: f32,
+        map_h: f32,
+    ) -> Self {
         let rng = if seed == 0 {
             StdRng::from_entropy()
         } else {
@@ -84,12 +93,11 @@ impl BattleSimulator {
             .iter()
             .filter_map(|c| c.owner.as_ref().map(|o| (c.id.clone(), o.clone())))
             .collect();
-        let city_positions: Vec<(f32, f32)> = cities.iter().map(|c| c.position).collect();
         Self {
             rng,
             unit_types,
             city_info,
-            city_positions,
+            center: (map_w / 2.0, map_h / 2.0),
             tick: 0,
         }
     }
@@ -106,29 +114,18 @@ impl BattleSimulator {
 
     fn tick(&mut self, game: &mut Game, config: &BenchmarkConfig) {
         self.tick += 1;
-        let city_count = self.city_positions.len();
-        let cities_empty = city_count == 0;
         let utype_count = self.unit_types.len();
 
-        // Movement events: every 20 ticks, move random units
+        // Movement events: every 20 ticks, move 30% of units toward the map
+        // centre. Units are sorted by id and the RNG draw order is fixed, so
+        // the whole simulation is deterministic for a given seed.
         if self.tick.is_multiple_of(20) {
-            let units = game.query_all_units();
-            let players: Vec<String> = game.players().keys().cloned().collect();
-            let player_count = players.len();
+            let mut units = game.query_all_units();
+            units.sort_by(|a, b| a.id.cmp(&b.id));
             let mut moves: Vec<(String, String, (f32, f32))> = Vec::new();
             for unit in &units {
                 if self.rand_f32() < 0.3 {
-                    let enemy_idx = self.rand_idx(player_count);
-                    let enemy_id = &players[enemy_idx];
-                    if unit.owner.clone() != *enemy_id {
-                        let target = if cities_empty {
-                            (100.0, 100.0)
-                        } else {
-                            let ci = self.rand_idx(city_count);
-                            self.city_positions[ci]
-                        };
-                        moves.push((unit.id.clone(), unit.owner.clone(), target));
-                    }
+                    moves.push((unit.id.clone(), unit.owner.clone(), self.center));
                 }
             }
             for (unit_id, owner, target) in moves {
@@ -201,8 +198,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         // Generous initial manpower so the pre-battle army spawns fully (each player
         // fields ~60 units in the default config).
         initial_manpower: 100_000,
-        funds_per_city: 5.0,
-        recruitment_rate: 10.0,
+        funds_per_city: 20.0,
+        recruitment_rate: 1.0,
         game_speed: 1.0,
         use_standard_ruleset: true,
         unit_types: make_unit_types(),
@@ -211,7 +208,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     };
 
     let total_cities = map_cfg.cities.len();
-    println!("  Cities: {}, Players created: {}", total_cities, total_cities);
+    println!(
+        "  Cities: {}, Players created: {}",
+        total_cities, total_cities
+    );
 
     // Benchmark protocol: one warmup pass per run, then MEASURED_RUNS measured
     // passes of `config.ticks` ticks each; results are averaged across runs to
@@ -228,6 +228,18 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let mut bench_elapsed_total = std::time::Duration::ZERO;
     let mut total_units: u32 = 0;
     let mut remaining_units = 0usize;
+
+    // Combat diagnostics accumulators (per-tick, averaged across all runs).
+    let mut diag_candidates = 0usize;
+    let mut diag_attackers = 0usize;
+    let mut diag_scanned = 0usize;
+    let mut diag_same_owner = 0usize;
+    let mut diag_out_of_range = 0usize;
+    let mut diag_already_resolved = 0usize;
+    let mut health_units = 0usize;
+    let mut health_attacking = 0usize;
+    let mut health_enemies = 0usize;
+    let mut health_entries = 0usize;
 
     if !config.detailed_systems.is_empty() {
         println!("  Detailed timing: {}", config.detailed_systems.join(", "));
@@ -248,136 +260,160 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             game.assign_city_owner(&city.id, &player_id);
         }
 
-    let settings_ref = game.settings();
-    let infantry = settings_ref
-        .unit_types
-        .iter()
-        .find(|u| u.name == "infantry")
-        .cloned()
-        .unwrap();
-    let cavalry = settings_ref
-        .unit_types
-        .iter()
-        .find(|u| u.name == "cavalry")
-        .cloned()
-        .unwrap();
-    let unit_types_clone = settings_ref.unit_types.clone();
-    let _ = settings_ref;
+        let settings_ref = game.settings();
+        let infantry = settings_ref
+            .unit_types
+            .iter()
+            .find(|u| u.name == "infantry")
+            .cloned()
+            .unwrap();
+        let cavalry = settings_ref
+            .unit_types
+            .iter()
+            .find(|u| u.name == "cavalry")
+            .cloned()
+            .unwrap();
+        let unit_types_clone = settings_ref.unit_types.clone();
+        let _ = settings_ref;
 
-    let cities_with_owners = game.query_cities();
-    total_units = 0;
-    for city in &cities_with_owners {
-        let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
-        for _ in 0..config.units_per_city {
-            let utype = if total_units.is_multiple_of(2) {
-                &infantry
-            } else {
-                &cavalry
-            };
-            if game.recruit_unit(&city.id, utype, &owner).is_some() {
-                total_units += 1;
-            }
-        }
-    }
-    println!("  Recruited {} units", total_units);
-
-    let mut sim = BattleSimulator::new(unit_types_clone, cities_with_owners, config.seed);
-
-    // Enable detailed sub-part timing if requested
-    if !config.detailed_systems.is_empty() {
-        game.set_detailed_systems(config.detailed_systems.clone());
-    }
-
-    game.start();
-
-    // Warmup (with AI to warm up caches & archetypes)
-    for _ in 0..WARMUP_TICKS {
-        sim.tick(&mut game, &config);
-        game.tick_game();
-    }
-
-    // Collect per-tick data
-    let mut run_tick_data: Vec<TickData> = Vec::with_capacity(config.ticks as usize);
-    let run_start = Instant::now();
-
-    for _ in 0..config.ticks {
-        let tick_start = Instant::now();
-        sim.tick(&mut game, &config);
-        game.tick_game();
-        let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
-        let unit_count = game.query_all_units().len() as u32;
-        let movers = game.last_mover_count() as u32;
-
-        #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-        let td = if let Some(ds) = game.get_debug_stats() {
-            let entity_count = ds["entity_count"].as_u64().unwrap_or(0) as u32;
-            let mut system_sum_ms = 0.0f64;
-            if let Some(st) = ds["system_timings"].as_array() {
-                for s in st {
-                    system_sum_ms += s["last_ms"].as_f64().unwrap_or(0.0);
+        let cities_with_owners = game.query_cities();
+        total_units = 0;
+        for city in &cities_with_owners {
+            let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
+            for _ in 0..config.units_per_city {
+                let utype = if total_units.is_multiple_of(2) {
+                    &infantry
+                } else {
+                    &cavalry
+                };
+                if game.recruit_unit(&city.id, utype, &owner).is_some() {
+                    total_units += 1;
                 }
             }
-            TickData {
-                total_ms: tick_ms,
-                entity_count,
-                unit_count,
-                system_sum_ms,
-                movers,
-            }
-        } else {
-            TickData {
+        }
+        println!("  Recruited {} units", total_units);
+
+        let mut sim = BattleSimulator::new(
+            unit_types_clone,
+            cities_with_owners,
+            config.seed,
+            map_cfg.width as f32,
+            map_cfg.height as f32,
+        );
+
+        // Enable detailed sub-part timing if requested
+        if !config.detailed_systems.is_empty() {
+            game.set_detailed_systems(config.detailed_systems.clone());
+        }
+
+        game.start();
+
+        // Warmup (with AI to warm up caches & archetypes)
+        for _ in 0..WARMUP_TICKS {
+            sim.tick(&mut game, &config);
+            game.tick_game();
+        }
+
+        // Collect per-tick data
+        let mut run_tick_data: Vec<TickData> = Vec::with_capacity(config.ticks as usize);
+        let run_start = Instant::now();
+
+        for _ in 0..config.ticks {
+            let tick_start = Instant::now();
+            sim.tick(&mut game, &config);
+            game.tick_game();
+            let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+            let unit_count = game.query_all_units().len() as u32;
+            let movers = game.last_mover_count() as u32;
+            let combats = game.last_engaged_pairs() as u32;
+
+            // Accumulate combat diagnostics (averaged at the end).
+            let diag = game.combat_diag();
+            diag_candidates += diag.candidates;
+            diag_attackers += diag.attackers;
+            diag_scanned += diag.pairs_scanned;
+            diag_same_owner += diag.pairs_same_owner;
+            diag_out_of_range += diag.pairs_out_of_range;
+            diag_already_resolved += diag.pairs_already_resolved;
+            let health = game.combat_health();
+            health_units += health.units;
+            health_attacking += health.units_with_attacking;
+            health_enemies += health.units_with_enemies;
+            health_entries += health.total_nearby_entries;
+
+            #[cfg(any(debug_assertions, feature = "debug-overlay"))]
+            let td = if let Some(ds) = game.get_debug_stats() {
+                let entity_count = ds["entity_count"].as_u64().unwrap_or(0) as u32;
+                let mut system_sum_ms = 0.0f64;
+                if let Some(st) = ds["system_timings"].as_array() {
+                    for s in st {
+                        system_sum_ms += s["last_ms"].as_f64().unwrap_or(0.0);
+                    }
+                }
+                TickData {
+                    total_ms: tick_ms,
+                    entity_count,
+                    unit_count,
+                    system_sum_ms,
+                    movers,
+                    combats,
+                }
+            } else {
+                TickData {
+                    total_ms: tick_ms,
+                    entity_count: 0,
+                    unit_count,
+                    system_sum_ms: 0.0,
+                    movers,
+                    combats,
+                }
+            };
+
+            #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
+            let td = TickData {
                 total_ms: tick_ms,
                 entity_count: 0,
                 unit_count,
                 system_sum_ms: 0.0,
                 movers,
+                combats,
+            };
+
+            run_tick_data.push(td);
+        }
+        all_tick_data.extend(run_tick_data);
+        bench_elapsed_total += run_start.elapsed();
+        remaining_units = game.query_all_units().len();
+
+        // Aggregate this run's system timings for cross-run averaging.
+        #[cfg(any(debug_assertions, feature = "debug-overlay"))]
+        {
+            let final_debug = game.get_debug_stats().unwrap_or_default();
+            if let Some(arr) = final_debug["system_timings"].as_array() {
+                for s in arr {
+                    let name = s["name"].as_str().unwrap_or("?").to_string();
+                    agg_system.entry(name).or_default().push(s.clone());
+                }
             }
-        };
-
-        #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
-        let td = TickData {
-            total_ms: tick_ms,
-            entity_count: 0,
-            unit_count,
-            system_sum_ms: 0.0,
-            movers,
-        };
-
-        run_tick_data.push(td);
-    }
-    all_tick_data.extend(run_tick_data);
-    bench_elapsed_total += run_start.elapsed();
-    remaining_units = game.query_all_units().len();
-
-    // Aggregate this run's system timings for cross-run averaging.
-    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-    {
-        let final_debug = game.get_debug_stats().unwrap_or_default();
-        if let Some(arr) = final_debug["system_timings"].as_array() {
-            for s in arr {
-                let name = s["name"].as_str().unwrap_or("?").to_string();
-                agg_system.entry(name).or_default().push(s.clone());
+            if let Some(arr) = final_debug["detailed_timings"].as_array() {
+                for s in arr {
+                    let name = s["name"].as_str().unwrap_or("?").to_string();
+                    agg_detailed.entry(name).or_default().push(s.clone());
+                }
             }
         }
-        if let Some(arr) = final_debug["detailed_timings"].as_array() {
-            for s in arr {
-                let name = s["name"].as_str().unwrap_or("?").to_string();
-                agg_detailed.entry(name).or_default().push(s.clone());
-            }
-        }
-    }
     } // end of measured-run loop
 
     // Combine per-run timings by averaging the numeric fields across runs.
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let final_system_timings: Vec<serde_json::Value> = agg_system
-        .iter()
-        .map(|(_, vals)| average_timings(vals))
+        .values()
+        .map(|vals| average_timings(vals))
         .collect();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let final_detailed_timings: Vec<serde_json::Value> = agg_detailed
-        .iter()
-        .map(|(_, vals)| average_timings(vals))
+        .values()
+        .map(|vals| average_timings(vals))
         .collect();
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
@@ -439,8 +475,42 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         tick_data.iter().map(|td| td.movers as f64).sum::<f64>() / tick_data.len() as f64
     };
     let total_movers: u64 = tick_data.iter().map(|td| td.movers as u64).sum();
-    println!("  Avg movers/tick (movement mover_count): {:.1}", avg_movers);
+    println!(
+        "  Avg movers/tick (movement mover_count): {:.1}",
+        avg_movers
+    );
     println!("  Total mover-tick count: {}", total_movers);
+    let avg_combats = if tick_data.is_empty() {
+        0.0
+    } else {
+        tick_data.iter().map(|td| td.combats as f64).sum::<f64>() / tick_data.len() as f64
+    };
+    let total_combats: u64 = tick_data.iter().map(|td| td.combats as u64).sum();
+    println!(
+        "  Avg combats/tick (combat engaged pairs): {:.1}",
+        avg_combats
+    );
+    println!("  Total combat-tick count: {}", total_combats);
+    let ticks_f = tick_data.len() as f64;
+    println!(
+        "  Combat diagnostics (avg/tick): candidates {:.1}, attackers {:.1}, pairs scanned {:.1}",
+        diag_candidates as f64 / ticks_f,
+        diag_attackers as f64 / ticks_f,
+        diag_scanned as f64 / ticks_f,
+    );
+    println!(
+        "    skipped: same-owner {:.1}, out-of-range {:.1}, already-resolved {:.1}",
+        diag_same_owner as f64 / ticks_f,
+        diag_out_of_range as f64 / ticks_f,
+        diag_already_resolved as f64 / ticks_f,
+    );
+    println!(
+        "    health: units {:.1}, with-attacking {:.1}, with-enemies {:.1}, total-nearby-entries {:.1}",
+        health_units as f64 / ticks_f,
+        health_attacking as f64 / ticks_f,
+        health_enemies as f64 / ticks_f,
+        health_entries as f64 / ticks_f,
+    );
     println!();
 
     // Per-system breakdown from final debug stats (includes P90/P99)
@@ -522,6 +592,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         total_mover_ticks as f64 / tick_data.len() as f64
     };
 
+    // Combat stats (engaged pairs per tick)
+    let total_combat_ticks: u64 = tick_data.iter().map(|td| td.combats as u64).sum();
+    let avg_combats_per_tick = if tick_data.is_empty() {
+        0.0
+    } else {
+        total_combat_ticks as f64 / tick_data.len() as f64
+    };
+
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
@@ -537,6 +615,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "move_events": config.ticks / 20 * MEASURED_RUNS as u64, "recruit_events": recruit_events * MEASURED_RUNS,
             "avg_movers_per_tick": avg_movers_per_tick,
             "total_mover_ticks": total_mover_ticks,
+            "avg_combats_per_tick": avg_combats_per_tick,
+            "total_combat_ticks": total_combat_ticks,
         },
         "latency": {
             "avg_ms": avg_tick, "min_ms": min_tick, "max_ms": max_tick,
@@ -552,6 +632,19 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "detailed_timings": final_detailed_timings,
         "tick_durations_ms": tick_durations,
         "movers_per_tick": tick_data.iter().map(|td| td.movers).collect::<Vec<_>>(),
+        "combats_per_tick": tick_data.iter().map(|td| td.combats).collect::<Vec<_>>(),
+        "combat_diag": {
+            "avg_candidates_per_tick": diag_candidates as f64 / tick_data.len() as f64,
+            "avg_attackers_per_tick": diag_attackers as f64 / tick_data.len() as f64,
+            "avg_pairs_scanned_per_tick": diag_scanned as f64 / tick_data.len() as f64,
+            "avg_pairs_same_owner_per_tick": diag_same_owner as f64 / tick_data.len() as f64,
+            "avg_pairs_out_of_range_per_tick": diag_out_of_range as f64 / tick_data.len() as f64,
+            "avg_pairs_already_resolved_per_tick": diag_already_resolved as f64 / tick_data.len() as f64,
+            "health_avg_units": health_units as f64 / tick_data.len() as f64,
+            "health_avg_units_with_attacking": health_attacking as f64 / tick_data.len() as f64,
+            "health_avg_units_with_enemies": health_enemies as f64 / tick_data.len() as f64,
+            "health_avg_total_nearby_entries": health_entries as f64 / tick_data.len() as f64,
+        },
     });
 
     BenchmarkResults {
@@ -636,6 +729,9 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let avg_movers = results.summary["results"]["avg_movers_per_tick"]
         .as_f64()
         .unwrap_or(0.0);
+    let avg_combats = results.summary["results"]["avg_combats_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
 
     // Parse previous report for comparison (system timings + latency metrics)
     let (prev_timings, prev_json) = prev_html
@@ -706,6 +802,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let entity_counts: Vec<u32> = results.tick_data.iter().map(|td| td.entity_count).collect();
     let unit_counts: Vec<u32> = results.tick_data.iter().map(|td| td.unit_count).collect();
     let mover_counts: Vec<u32> = results.tick_data.iter().map(|td| td.movers).collect();
+    let combat_counts: Vec<u32> = results.tick_data.iter().map(|td| td.combats).collect();
     let overhead_durations: Vec<f64> = results
         .tick_data
         .iter()
@@ -716,6 +813,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let entity_counts_json = serde_json::to_string(&entity_counts).unwrap();
     let unit_counts_json = serde_json::to_string(&unit_counts).unwrap();
     let mover_counts_json = serde_json::to_string(&mover_counts).unwrap();
+    let combat_counts_json = serde_json::to_string(&combat_counts).unwrap();
     let overhead_durations_json = serde_json::to_string(&overhead_durations).unwrap();
 
     // System timing table
@@ -939,6 +1037,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             <div class="metric"><div class="value">{avg_system:.3}ms{avg_system_delta}</div><div class="label">Avg System Time</div></div>
             <div class="metric"><div class="value">{avg_spatial_hash:.3}ms</div><div class="label">Avg Spatial Hash</div></div>
             <div class="metric"><div class="value">{avg_movers:.0}</div><div class="label">Avg Movers/Tick</div></div>
+            <div class="metric"><div class="value">{avg_combats:.0}</div><div class="label">Avg Combats/Tick</div></div>
             <div class="metric"><div class="value">{avg_overhead:.3}ms{avg_overhead_delta}</div><div class="label">Avg Overhead</div></div>
             <div class="metric"><div class="value">{overhead_p95:.3}ms</div><div class="label">Overhead P95</div></div>
             <div class="metric"><div class="value">{overhead_p99:.3}ms</div><div class="label">Overhead P99</div></div>
@@ -952,7 +1051,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         <div class="chart-container"><canvas id="overheadChart" height="120"></canvas></div>
         <p class="note">Spikes in overhead correlate with entity spawning (recruit events every 100 ticks). ECS archetype rebuild is the primary cost.</p>
 
-        <h3>Entity, Unit & Mover Counts Over Time</h3>
+        <h3>Entity, Unit, Mover & Combat Counts Over Time</h3>
         <div class="chart-container"><canvas id="entityChart" height="120"></canvas></div>
 
         <h2>System Timing Breakdown</h2>
@@ -1042,6 +1141,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         const entityCounts = {entity_counts_json};
         const unitCounts = {unit_counts_json};
         const moverCounts = {mover_counts_json};
+        const combatCounts = {combat_counts_json};
         new Chart(document.getElementById('entityChart'), {{
             type: 'line',
             data: {{
@@ -1049,7 +1149,8 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
                 datasets: [
                     {{ label: 'Entities', data: entityCounts, borderColor: '#66ccff', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }},
                     {{ label: 'Units', data: unitCounts, borderColor: '#00ff88', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }},
-                    {{ label: 'Movers', data: moverCounts, borderColor: '#ffcc00', borderWidth: 1.5, pointRadius: 0, tension: 0.3, borderDash: [4, 4] }}
+                    {{ label: 'Movers', data: moverCounts, borderColor: '#ffcc00', borderWidth: 1.5, pointRadius: 0, tension: 0.3, borderDash: [4, 4] }},
+                    {{ label: 'Combats', data: combatCounts, borderColor: '#ff6699', borderWidth: 1.5, pointRadius: 0, tension: 0.3, borderDash: [2, 2] }}
                 ]
             }},
             options: {{
@@ -1129,6 +1230,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         avg_system_delta = avg_system_delta,
         avg_spatial_hash = avg_spatial_hash,
         avg_movers = avg_movers,
+        avg_combats = avg_combats,
         avg_overhead = avg_overhead,
         avg_overhead_delta = avg_overhead_delta,
         overhead_p95 = overhead_p95,
@@ -1142,6 +1244,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         entity_counts_json = entity_counts_json,
         unit_counts_json = unit_counts_json,
         mover_counts_json = mover_counts_json,
+        combat_counts_json = combat_counts_json,
         overhead_durations_json = overhead_durations_json,
         pie_labels_json = pie_labels,
         pie_data_json = pie_data,
@@ -1156,7 +1259,9 @@ fn average_timings(entries: &[serde_json::Value]) -> serde_json::Value {
     if out.is_null() || entries.is_empty() {
         return out;
     }
-    for f in ["total_ms", "avg_ms", "last_ms", "p50_ms", "p90_ms", "p99_ms"] {
+    for f in [
+        "total_ms", "avg_ms", "last_ms", "p50_ms", "p90_ms", "p99_ms",
+    ] {
         if out.get(f).is_some() {
             let sum: f64 = entries.iter().filter_map(|v| v[f].as_f64()).sum();
             out[f] = serde_json::json!(sum / entries.len() as f64);
@@ -1166,49 +1271,7 @@ fn average_timings(entries: &[serde_json::Value]) -> serde_json::Value {
 }
 
 fn make_unit_types() -> Vec<UnitType> {
-    vec![
-        UnitType {
-            name: "infantry".to_string(),
-            symbol: "I".to_string(),
-            men: 100,
-            max_organisation: 100.0,
-            reinforcement_rate: 1.0,
-            speed: 1.0,
-            equipment: vec![Equipment {
-                name: "rifles".to_string(),
-                count: 10,
-                max_count: 10,
-                cost_per_item: 0.5,
-            }],
-            recruitment_cost: 10,
-            supply_buffer_percent: 20,
-            max_supply: 200, // men(100) * CARRY_WEIGHT(2)
-            soft_attack: 5.0,
-            soft_defense: 5.0,
-            hard_attack: 2.0,
-            hard_defense: 3.0,
-            base_attrition: 0.1,
-            fighting_attrition: 0.5,
-        },
-        UnitType {
-            name: "cavalry".to_string(),
-            symbol: "C".to_string(),
-            men: 80,
-            max_organisation: 100.0,
-            reinforcement_rate: 1.0,
-            speed: 1.5,
-            equipment: vec![],
-            recruitment_cost: 15,
-            supply_buffer_percent: 15,
-            max_supply: 160, // men(80) * CARRY_WEIGHT(2)
-            soft_attack: 7.0,
-            soft_defense: 4.0,
-            hard_attack: 3.0,
-            hard_defense: 2.0,
-            base_attrition: 0.15,
-            fighting_attrition: 0.6,
-        },
-    ]
+    crate::game::economy::default_unit_types()
 }
 
 /// Parse a previous HTML benchmark report to extract system timings for comparison.

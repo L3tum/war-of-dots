@@ -2455,6 +2455,7 @@ fn convert_unit_types(unit_types: &[ConfigUnitType]) -> Vec<UnitType> {
                 fighting_attrition: ut.fighting_attrition,
                 recruitment_cost,
                 supply_buffer_percent: ut.supply_buffer_percent,
+                supply_rate: 1,
                 max_supply: crate::config::derive_max_supply(ut.men),
             }
         })
@@ -2490,60 +2491,14 @@ fn convert_custom_unit_types(unit_types: &[super::protocol::CustomUnitType]) -> 
             fighting_attrition: 1.0,
             recruitment_cost: ut.recruitment_cost,
             supply_buffer_percent: 10, // Default
-            max_supply: ut.men * 2,    // men * CARRY_WEIGHT
+            supply_rate: 1,
+            max_supply: ut.men * 2, // men * CARRY_WEIGHT
         })
         .collect()
 }
 
 fn build_default_unit_types() -> Vec<UnitType> {
-    vec![
-        UnitType {
-            name: "infantry".to_string(),
-            symbol: "i".to_string(),
-            men: 1000u32,
-            equipment: vec![crate::game::unit::Equipment {
-                name: "rifles".to_string(),
-                count: 100,
-                max_count: 100,
-                cost_per_item: 0.5,
-            }],
-            soft_attack: 5.0,
-            soft_defense: 5.0,
-            hard_attack: 1.0,
-            hard_defense: 1.0,
-            speed: 1.0,
-            max_organisation: 100.0,
-            reinforcement_rate: 1.0,
-            base_attrition: 0.5,
-            fighting_attrition: 1.0,
-            recruitment_cost: 20,
-            supply_buffer_percent: 10,
-            max_supply: 200, // men(100) * CARRY_WEIGHT(2)
-        },
-        UnitType {
-            name: "armor".to_string(),
-            symbol: "a".to_string(),
-            men: 500u32,
-            equipment: vec![crate::game::unit::Equipment {
-                name: "tanks".to_string(),
-                count: 20,
-                max_count: 20,
-                cost_per_item: 5.0,
-            }],
-            soft_attack: 8.0,
-            soft_defense: 8.0,
-            hard_attack: 8.0,
-            hard_defense: 8.0,
-            speed: 2.0,
-            max_organisation: 100.0,
-            reinforcement_rate: 2.0,
-            base_attrition: 1.0,
-            fighting_attrition: 2.0,
-            recruitment_cost: 50,
-            supply_buffer_percent: 10,
-            max_supply: 1000, // men(500) * CARRY_WEIGHT(2)
-        },
-    ]
+    crate::game::economy::default_unit_types()
 }
 
 /// G-3: Validate custom ruleset settings to prevent unreasonable values.

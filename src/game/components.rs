@@ -7,7 +7,6 @@
 //! No `#[derive(Component)]` needed — it's a marker trait auto-implied.
 
 use crate::game::economy::City;
-use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Equipment;
 use crate::game::unit::Terrain;
 use hecs;
@@ -64,10 +63,6 @@ pub struct NearbyEnemies {
     /// Whether this list was ever populated by the spatialty system.
     /// false at spawn, set to true after first Tier 1 initialization.
     pub initialized: bool,
-    /// World position at which this unit was last inserted into the SpatialHash.
-    /// Used by spatialty to remove the stale hash entry when the unit moves.
-    pub last_x: f32,
-    pub last_y: f32,
 }
 
 /// Dynamic stats modified by combat, attrition, healing.
@@ -86,6 +81,8 @@ pub struct UnitEquipment {
     pub equipment: Vec<Equipment>,
     pub max_equipment: Vec<Equipment>,
     pub supply_buffer_percent: u32,
+    /// Max equipment items delivered to this unit per tick by the supply system.
+    pub supply_rate: u32,
     /// Current supply load (physical burden). Consumed by attrition/combat,
     /// replenished by supply system. Capped at max_supply.
     pub supply: f32,
@@ -196,9 +193,6 @@ pub struct WorldBundle {
     pub cities: CityData,
     pub funds: EconomyFunds,
     pub city_upgrades: CityUpgradeData,
-    /// Spatial hash of living unit positions, maintained incrementally by
-    /// spatialty (units removed on death/move, inserted on spawn/move).
-    pub spatial_hash: SpatialHash,
     /// Debug stats (only populated in debug builds)
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub debug_stats: DebugStats,
@@ -232,7 +226,6 @@ impl WorldBundle {
             city_upgrades: CityUpgradeData {
                 settings: city_upgrade_settings,
             },
-            spatial_hash: SpatialHash::new(),
             #[cfg(any(debug_assertions, feature = "debug-overlay"))]
             debug_stats: DebugStats::default(),
         }

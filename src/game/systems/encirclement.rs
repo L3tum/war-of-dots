@@ -29,8 +29,11 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
     let wusize = w as usize;
     let grid_size = wusize * (h as usize);
 
-    // Map player IDs to indices 0..N for dominant player grid
-    let players: Vec<_> = ctx.units_by_player.keys().collect();
+    // Map player IDs to indices 0..N for dominant player grid.
+    // Sort for deterministic index assignment + tie-breaking (the underlying
+    // units_by_player HashMap has process-random iteration order).
+    let mut players: Vec<&String> = ctx.units_by_player.keys().collect();
+    players.sort();
     let nplayers = players.len();
     let player_to_idx: HashMap<&str, u8> = players
         .iter()
@@ -88,15 +91,16 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
     }
 
     // Now mark unit encirclement flags: dominated but not safe
-    for (player_id, entities) in &ctx.units_by_player {
+    for player_id in &players {
         let player_idx = *player_to_idx.get(player_id.as_str()).unwrap();
-        for (entity, (x, y)) in entities {
-            let xi = *x as i32;
-            let yi = *y as i32;
+        let entities = &ctx.units_by_player[*player_id];
+        for handle in entities {
+            let xi = handle.pos.0 as i32;
+            let yi = handle.pos.1 as i32;
             let idx = (yi as usize) * wusize + (xi as usize);
             let encircled =
                 idx < grid_size && dominant[idx] == player_idx && safe[idx] != player_idx;
-            if let Ok((flags,)) = world.query_one_mut::<(&mut UnitFlags,)>(*entity) {
+            if let Ok((flags,)) = world.query_one_mut::<(&mut UnitFlags,)>(handle.entity) {
                 flags.encircled = encircled;
             }
         }
@@ -114,8 +118,13 @@ fn build_dominant_player_grid(
     let mut dominant = vec![NONE; grid_size];
     let mut max_inf = vec![0u32; grid_size];
 
-    for (player_id, &idx) in player_to_idx {
-        if let Some(grid) = border_grids.get(*player_id) {
+    // Iterate players in sorted order so equal-influence ties break the same
+    // way every run (strict `>` keeps the first player encountered).
+    let mut players: Vec<&str> = player_to_idx.keys().copied().collect();
+    players.sort();
+    for player_id in players {
+        let idx = *player_to_idx.get(player_id).unwrap();
+        if let Some(grid) = border_grids.get(player_id) {
             for i in 0..grid_size {
                 if grid[i] > max_inf[i] {
                     max_inf[i] = grid[i];

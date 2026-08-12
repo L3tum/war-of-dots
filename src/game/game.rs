@@ -4,6 +4,7 @@ use crate::config::CityUpgradeSettings;
 use crate::game::components::*;
 use crate::game::economy::{City, UnitType};
 use crate::game::player::Player;
+use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use crate::map::map::Map;
@@ -62,7 +63,7 @@ pub struct GameSettings {
     pub initial_manpower: u32,
     /// Funds generated per city per economy tick (base income before multipliers)
     pub funds_per_city: f32,
-    /// Ticks between recruitment actions for a player (0 = unlimited)
+    /// Men restored to each supplied unit per tick from the global manpower pool.
     pub recruitment_rate: f32,
     pub game_speed: f32,
     pub use_standard_ruleset: bool,
@@ -98,20 +99,66 @@ pub struct Game {
     entity_reverse: HashMap<hecs::Entity, String>,
     /// Pre-allocated combat scratch, cleared and reused each tick.
     combat_scratch: systems::combat::CombatScratch,
+    /// Pre-allocated movement scratch, cleared and reused each tick. Holds the
+    /// mover records that spatialty consumes (replaces the old marker component).
+    movement_scratch: systems::movement::MovementScratch,
+    /// Spatial hash of living unit positions, maintained incrementally by
+    /// spatialty. Kept OUTSIDE the ECS so spatialty can query it while also
+    /// reading/mutating unit components.
+    spatial_hash: SpatialHash,
     /// Count of units that haven't been spatially initialized yet.
     /// Incremented on spawn, decremented by spatialty after init.
     uninitialized_units: u32,
     /// Number of units that moved in the most recent tick (from movement.rs).
     /// Used by benchmark/status reporting to gauge spatialty work.
     last_mover_count: usize,
+    /// Number of engaged pairs in the most recent tick (from combat.rs).
+    /// Used by benchmark/status reporting to gauge combat activity.
+    last_engaged_pairs: usize,
+}
+
+/// Neighbour-graph snapshot: how spatialty left the world this tick.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CombatHealth {
+    /// Living units with UnitFlags + NearbyEnemies.
+    pub units: usize,
+    /// Units with `attacking == true` (movers that found enemies nearby).
+    pub units_with_attacking: usize,
+    /// Units whose NearbyEnemies list is non-empty.
+    pub units_with_enemies: usize,
+    /// Sum of NearbyEnemies list lengths across all units.
+    pub total_nearby_entries: usize,
+}
+
+/// Combat resolution-stage counters from one tick's `combat::run`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CombatDiag {
+    /// Candidate units entering the combat loop (attacking || fighting).
+    pub candidates: usize,
+    /// Candidates with `attacking == true`.
+    pub attackers: usize,
+    /// Neighbour-list iterations across all candidates.
+    pub pairs_scanned: usize,
+    /// Pairs skipped because they share an owner.
+    pub pairs_same_owner: usize,
+    /// Pairs skipped because they are out of combat range.
+    pub pairs_out_of_range: usize,
+    /// Pairs skipped because they already resolved this tick.
+    pub pairs_already_resolved: usize,
 }
 
 /// Pre-grouped data built once per tick, shared across all systems.
 /// Eliminates redundant player enumeration and unit filtering.
 /// Only holds small data (cities ~20 entries, funds ~12 entries).
 /// Grids are accessed via scoped Arc extraction in systems that need them.
-/// Entity+position handle for unit grouping
-type UnitHandle = (hecs::Entity, (f32, f32));
+/// Entity+position handle for unit grouping. Snapshot taken at tick start;
+/// systems that need fresh component data (e.g. supply, which runs after
+/// combat) do their own bulk query instead of per-entity world lookups.
+#[derive(Debug, Clone, Copy)]
+pub struct UnitHandle {
+    pub entity: hecs::Entity,
+    pub pos: (f32, f32),
+}
 
 #[derive(Debug)]
 pub struct TickContext {
@@ -148,11 +195,13 @@ impl TickContext {
         // Single pass: group entities+positions by player
         let mut units_by_player: HashMap<String, Vec<UnitHandle>> = HashMap::new();
         for (entity, (owner, pos)) in world.query::<(&UnitOwner, &UnitPosition)>().iter() {
-            let pos_tuple = (*pos).as_tuple();
             units_by_player
                 .entry(owner.player_id.clone())
                 .or_default()
-                .push((entity, pos_tuple));
+                .push(UnitHandle {
+                    entity,
+                    pos: (*pos).as_tuple(),
+                });
         }
 
         Some(Self {
@@ -241,8 +290,11 @@ impl Game {
             entity_registry: HashMap::new(),
             entity_reverse: HashMap::new(),
             combat_scratch: systems::combat::CombatScratch::new(),
+            movement_scratch: systems::movement::MovementScratch::default(),
+            spatial_hash: SpatialHash::new(),
             uninitialized_units: 0,
             last_mover_count: 0,
+            last_engaged_pairs: 0,
         }
     }
 
@@ -253,6 +305,49 @@ impl Game {
     /// Number of units that moved in the most recent tick.
     pub fn last_mover_count(&self) -> usize {
         self.last_mover_count
+    }
+
+    /// Number of engaged combat pairs in the most recent tick (combat.rs).
+    pub fn last_engaged_pairs(&self) -> usize {
+        self.last_engaged_pairs
+    }
+
+    /// Snapshot of the neighbour graph as spatialty left it this tick.
+    /// `attacking`/`NearbyEnemies` are spatialty-owned, so post-combat reads
+    /// reflect the current tick's spatialty output. Used by benchmark/status.
+    pub fn combat_health(&self) -> CombatHealth {
+        let mut units = 0usize;
+        let mut units_with_attacking = 0usize;
+        let mut units_with_enemies = 0usize;
+        let mut total_nearby_entries = 0usize;
+        for (_, (flags, nearby)) in self.world.query::<(&UnitFlags, &NearbyEnemies)>().iter() {
+            units += 1;
+            if flags.attacking {
+                units_with_attacking += 1;
+            }
+            if !nearby.entities.is_empty() {
+                units_with_enemies += 1;
+            }
+            total_nearby_entries += nearby.entities.len();
+        }
+        CombatHealth {
+            units,
+            units_with_attacking,
+            units_with_enemies,
+            total_nearby_entries,
+        }
+    }
+
+    /// Combat resolution-stage counters from the most recent tick's run.
+    pub fn combat_diag(&self) -> CombatDiag {
+        CombatDiag {
+            candidates: self.combat_scratch.candidates,
+            attackers: self.combat_scratch.attackers,
+            pairs_scanned: self.combat_scratch.pairs_scanned,
+            pairs_same_owner: self.combat_scratch.pairs_same_owner,
+            pairs_out_of_range: self.combat_scratch.pairs_out_of_range,
+            pairs_already_resolved: self.combat_scratch.pairs_already_resolved,
+        }
     }
 
     /// Main game tick.
@@ -316,7 +411,12 @@ impl Game {
             "movement",
             &mut self.world,
             self.world_entity,
-            systems::movement::run(&mut self.world, self.world_entity, &self.settings)
+            systems::movement::run(
+                &mut self.world,
+                self.world_entity,
+                &self.settings,
+                &mut self.movement_scratch,
+            )
         );
         self.last_mover_count = mover_count;
 
@@ -328,7 +428,14 @@ impl Game {
                 "spatialty",
                 &mut self.world,
                 self.world_entity,
-                systems::spatialty::run(&mut self.world, self.world_entity, mover_count > 0, self.uninitialized_units > 0)
+                systems::spatialty::run(
+                    &mut self.world,
+                    self.world_entity,
+                    &mut self.spatial_hash,
+                    &self.movement_scratch.movers,
+                    mover_count > 0,
+                    self.uninitialized_units > 0,
+                )
             );
             self.uninitialized_units = self.uninitialized_units.saturating_sub(new_init_count);
         }
@@ -345,13 +452,16 @@ impl Game {
                 &self.settings
             )
         );
+        // Expose engaged-pair count for benchmark/status reporting.
+        self.last_engaged_pairs = self.combat_scratch.engaged_pairs();
 
-        // Attrition (after combat so it sees post-combat men values)
-        let attrition_dead = tick_system!(
-            "attrition",
+        // Supply + Attrition (merged): runs after combat so it sees post-combat
+        // men/equipment; returns units that reached 0 men for death cleanup.
+        let supply_dead = tick_system!(
+            "supply",
             &mut self.world,
             self.world_entity,
-            systems::attrition::run(&mut self.world, self.world_entity, &self.settings)
+            systems::supply::run(&mut self.world, self.world_entity, &self.settings)
         );
 
         // City capture
@@ -375,31 +485,6 @@ impl Game {
                     systems::influence::run(&mut self.world, ctx, self.tick)
                 );
             }
-        }
-
-        // Healing: uses TickContext for per-player iteration
-        if let Some(ref ctx) = ctx {
-            tick_system!(
-                "healing",
-                &mut self.world,
-                self.world_entity,
-                systems::healing::run(&mut self.world, ctx)
-            );
-        }
-
-        // Supply: uses TickContext for per-player iteration
-        if let Some(ref ctx) = ctx {
-            tick_system!(
-                "supply",
-                &mut self.world,
-                self.world_entity,
-                systems::supply::run(
-                    &mut self.world,
-                    self.world_entity,
-                    ctx,
-                    self.settings.recruitment_rate,
-                )
-            );
         }
 
         // Encirclement: only every CITY_CAPTURE_TICK_INTERVAL ticks (strategic, not tactical)
@@ -434,7 +519,7 @@ impl Game {
         // Unified death cleanup: chain all dead entities from combat, attrition, and surrender
         let all_dead: Vec<hecs::Entity> = combat_dead
             .into_iter()
-            .chain(attrition_dead)
+            .chain(supply_dead)
             .chain(surrender_dead)
             .collect();
 
@@ -444,7 +529,7 @@ impl Game {
             self.world_entity,
             systems::death_cleanup::run(
                 &mut self.world,
-                self.world_entity,
+                &mut self.spatial_hash,
                 all_dead,
                 &mut self.entity_reverse,
             )

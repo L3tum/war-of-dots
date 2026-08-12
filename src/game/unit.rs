@@ -294,6 +294,7 @@ mod tests {
             base_attrition: 0.5,
             fighting_attrition: 1.0,
             supply_buffer_percent: 20,
+            supply_rate: 1,
             max_supply: 2000,
         }
     }

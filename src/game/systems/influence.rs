@@ -190,7 +190,7 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
         .units_by_player
         .iter()
         .map(|(player_id, entities)| {
-            let unit_positions: Vec<(f32, f32)> = entities.iter().map(|(_, pos)| *pos).collect();
+            let unit_positions: Vec<(f32, f32)> = entities.iter().map(|h| h.pos).collect();
             let city_positions: Vec<(f32, f32)> = ctx
                 .cities
                 .iter()

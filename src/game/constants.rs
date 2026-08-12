@@ -4,7 +4,7 @@
 //! Adjusting these values changes game balance.
 
 /// Economy tick interval: funds generated every N ticks.
-pub const ECONOMY_TICK_INTERVAL: u64 = 10;
+pub const ECONOMY_TICK_INTERVAL: u64 = 1;
 
 /// Influence tick interval: border influence calculated every N ticks.
 pub const INFLUENCE_TICK_INTERVAL: u64 = 3;

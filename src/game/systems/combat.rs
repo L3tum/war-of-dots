@@ -25,6 +25,13 @@ pub struct CombatScratch {
     fought: HashSet<hecs::Entity>,
     dead_set: HashSet<hecs::Entity>,
     dead: Vec<hecs::Entity>,
+    // Diagnostic counters (benchmark/status): reset each tick alongside clear().
+    pub candidates: usize,
+    pub attackers: usize,
+    pub pairs_scanned: usize,
+    pub pairs_same_owner: usize,
+    pub pairs_out_of_range: usize,
+    pub pairs_already_resolved: usize,
 }
 
 impl CombatScratch {
@@ -34,6 +41,12 @@ impl CombatScratch {
             fought: HashSet::new(),
             dead_set: HashSet::new(),
             dead: Vec::new(),
+            candidates: 0,
+            attackers: 0,
+            pairs_scanned: 0,
+            pairs_same_owner: 0,
+            pairs_out_of_range: 0,
+            pairs_already_resolved: 0,
         }
     }
 
@@ -43,6 +56,19 @@ impl CombatScratch {
         self.fought.clear();
         self.dead_set.clear();
         self.dead.clear();
+        self.candidates = 0;
+        self.attackers = 0;
+        self.pairs_scanned = 0;
+        self.pairs_same_owner = 0;
+        self.pairs_out_of_range = 0;
+        self.pairs_already_resolved = 0;
+    }
+
+    /// Number of (normalized) pairs resolved into actual combat this tick.
+    /// Read after `run()` returns; mirror of the `resolved` set so the Game
+    /// layer (and benchmark) can report engaged-pairs-per-tick.
+    pub fn engaged_pairs(&self) -> usize {
+        self.resolved.len()
     }
 }
 
@@ -86,6 +112,18 @@ fn attrition_from(
 // ============================================================================
 // Terrain Modifier Helper
 // ============================================================================
+
+/// Combat strength multiplier from equipment stock, linear in the equipment
+/// ratio (carried / required): 100% equipment → 1.0, 60% → 0.6, 0% → 0.
+/// Under-supplied units hit proportionally softer.
+fn equipment_effectiveness(eq: &UnitEquipment) -> f32 {
+    let needed: f32 = eq.max_equipment.iter().map(|e| e.max_count as f32).sum();
+    if needed <= 0.0 {
+        return 1.0;
+    }
+    let carried: f32 = eq.equipment.iter().map(|e| e.count as f32).sum();
+    (carried / needed).clamp(0.0, 1.0)
+}
 
 /// Convert terrain type to combat multiplier. Hills boost (1.5×), forest (0.75×),
 /// water weakens (0.5×), all others neutral (1.0×).
@@ -134,6 +172,10 @@ pub fn run(
     // Collect cheap components upfront (Stats, Flags are Copy). Equipment deferred to resolution.
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_ue = crate::game::debug_stats::DetailedTimer::new("combat/unit_enumeration");
+    // Candidates are position-driven, not just movement-driven: a unit fights while
+    // it has any enemy in its NearbyEnemies list (`attacking`/`fighting` add
+    // movers + previously-engaged units). This is what keeps two adjacent units
+    // fighting every tick even when neither moved.
     let candidates: Vec<(
         hecs::Entity,
         UnitPosition,
@@ -150,8 +192,8 @@ pub fn run(
             &NearbyEnemies,
         )>()
         .iter()
-        .filter(|(_, (_, _, flags, stats, _))| {
-            (flags.attacking || flags.fighting) && stats.men > 0.0
+        .filter(|(_, (_, _, flags, stats, nearby))| {
+            stats.men > 0.0 && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
         })
         .map(|(e, (pos, owner, flags, stats, nearby))| {
             (
@@ -164,6 +206,11 @@ pub fn run(
             )
         })
         .collect();
+    scratch.candidates = candidates.len();
+    scratch.attackers = candidates
+        .iter()
+        .filter(|(_, _, _, _, flags, _)| flags.attacking)
+        .count();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     _t_ue.finish(world, world_entity);
 
@@ -182,6 +229,7 @@ pub fn run(
         }
 
         for entity2 in nearby.entities.iter().copied() {
+            scratch.pairs_scanned += 1;
             if entity2 == *entity1 {
                 continue;
             }
@@ -197,6 +245,7 @@ pub fn run(
                 (entity2, *entity1)
             };
             if scratch.resolved.contains(&pair) {
+                scratch.pairs_already_resolved += 1;
                 continue;
             }
 
@@ -206,6 +255,7 @@ pub fn run(
                 Err(_) => continue,
             };
             if same_owner {
+                scratch.pairs_same_owner += 1;
                 continue;
             }
 
@@ -218,6 +268,7 @@ pub fn run(
             let dy = pos1.y - pos2.y;
             let dist_sq = dx * dx + dy * dy;
             if dist_sq >= crate::game::constants::COMBAT_RANGE_SQ {
+                scratch.pairs_out_of_range += 1;
                 continue;
             }
 
@@ -269,6 +320,21 @@ pub fn run(
             // Higher d_eff means attacker takes more damage from counter-attack
             let d_eff = d_soft / (a_soft + 0.1);
 
+            // Under-supplied units fight less effectively: strength scales with
+            // equipment carried vs required (0% equipment → 40% strength; 100%+
+            // → full). This punishes armies whose supply lines can't keep them
+            // equipped.
+            let (a_eff_malus, d_eff_malus) = {
+                let (eq1, eq2) = match (
+                    world.get::<&UnitEquipment>(*entity1),
+                    world.get::<&UnitEquipment>(entity2),
+                ) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => continue,
+                };
+                (equipment_effectiveness(&eq1), equipment_effectiveness(&eq2))
+            };
+
             // Each unit uses the terrain it stands on — fixes asymmetry where both
             // sides would get the attacker's terrain modifier.
             let a_terrain = terrain
@@ -285,9 +351,9 @@ pub fn run(
             let d_terrain_mod = terrain_modifier(&d_terrain);
 
             // dmg_to_defender: damage applied TO the defender (based on attacker effectiveness)
-            let dmg_to_defender = a_eff * a_terrain_mod * 5.0;
+            let dmg_to_defender = a_eff * a_terrain_mod * 5.0 * a_eff_malus;
             // dmg_to_attacker: damage applied TO the attacker (based on defender's counter-attack)
-            let dmg_to_attacker = d_eff * d_terrain_mod * 5.0;
+            let dmg_to_attacker = d_eff * d_terrain_mod * 5.0 * d_eff_malus;
 
             let a_men = (s1.men - dmg_to_attacker).max(0.0);
             let d_men = (s2.men - dmg_to_defender).max(0.0);
@@ -458,14 +524,14 @@ mod tests {
             UnitEquipment {
                 equipment: vec![],
                 max_equipment: vec![],
-                supply_buffer_percent: 20,
+                supply_buffer_percent: 10,
+                supply_rate: 1,
                 supply: 2000.0,
                 max_supply: 2000.0,
             },
             NearbyEnemies {
                 entities: vec![],
                 initialized: true,
-                ..Default::default()
             },
         ))
     }
@@ -478,6 +544,9 @@ mod tests {
         men: f32,
         equipment: Vec<Equipment>,
     ) -> hecs::Entity {
+        // max_equipment mirrors the same loadout so supply/effectiveness maths
+        // see a real "required" amount.
+        let max_equipment = equipment.clone();
         world.spawn((
             UnitPosition { x, y },
             UnitOwner {
@@ -501,15 +570,15 @@ mod tests {
             },
             UnitEquipment {
                 equipment,
-                max_equipment: vec![],
-                supply_buffer_percent: 20,
+                max_equipment,
+                supply_buffer_percent: 10,
+                supply_rate: 1,
                 supply: 2000.0,
                 max_supply: 2000.0,
             },
             NearbyEnemies {
                 entities: vec![],
                 initialized: true,
-                ..Default::default()
             },
         ))
     }
@@ -566,12 +635,42 @@ mod tests {
                 speed: 1.0,
                 base_attrition: 0.5,
                 fighting_attrition: 1.0,
-                supply_buffer_percent: 20,
+                supply_buffer_percent: 10,
+                supply_rate: 1,
                 max_supply: 2000,
             }],
             city_upgrade_settings: CityUpgradeSettings::default(),
             water_speed: 0.5,
         }
+    }
+
+    /// Two stationary adjacent enemy units with NO attacking/fighting flags must
+    /// still engage: non-empty NearbyEnemies makes them combat candidates. This is
+    /// the "if you're within combat range, you fight" contract — previously two
+    /// parked enemies could sit adjacent forever unless one of them moved.
+    #[test]
+    fn stationary_adjacent_enemies_keep_fighting() {
+        let (mut world, world_entity) = make_world();
+        let a = make_unit(&mut world, "P1", 10.0, 10.0, 100.0);
+        let b = make_unit(&mut world, "P2", 10.5, 10.5, 100.0);
+        // Strip movement/engagement flags: pure stationary adjacency.
+        for e in [a, b] {
+            let (flags,) = world.query_one_mut::<(&mut UnitFlags,)>(e).unwrap();
+            flags.attacking = false;
+            flags.fighting = false;
+        }
+        populate_nearby_enemies(&mut world);
+        let mut scratch = CombatScratch::new();
+
+        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings());
+
+        assert_eq!(
+            scratch.engaged_pairs(),
+            1,
+            "adjacent stationary enemies should fight"
+        );
+        assert!(scratch.fought.contains(&a), "A should fight");
+        assert!(scratch.fought.contains(&b), "B should fight");
     }
 
     /// A 0-men unit must not be processed as an attacker (candidate filter requires men > 0).
@@ -723,6 +822,45 @@ mod tests {
         // Attacker1 should still be alive (it fought first)
         let a1_men = world.get::<&UnitStats>(attacker1).map(|s| s.men).unwrap();
         assert!(a1_men > 0.0, "attacker1 should be alive");
+    }
+
+    /// Under-supplied units deal less damage: a fully-equipped attacker should
+    /// hurt its target more than an identical attacker with no equipment.
+    #[test]
+    fn under_supplied_attacker_deals_less_damage() {
+        let rifles = |count: u32| {
+            vec![Equipment {
+                name: "rifle".to_string(),
+                count,
+                max_count: 10,
+                cost_per_item: 0.5,
+            }]
+        };
+
+        // Scenario A: attacker fully equipped (10/10).
+        let (mut world, world_entity) = make_world();
+        let _a_full = make_unit_with_equipment(&mut world, "P1", 10.0, 10.0, 100.0, rifles(10));
+        let d_full = make_unit_with_equipment(&mut world, "P2", 10.5, 10.5, 100.0, rifles(10));
+        populate_nearby_enemies(&mut world);
+        let mut scratch = CombatScratch::new();
+        let _ = run(&mut world, world_entity, &mut scratch, &test_settings());
+        let dmg_full = 100.0 - world.get::<&UnitStats>(d_full).unwrap().men;
+
+        // Scenario B: attacker under-supplied (0/10), identical defender.
+        let (mut world2, world_entity2) = make_world();
+        let _a_deprived = make_unit_with_equipment(&mut world2, "P1", 10.0, 10.0, 100.0, rifles(0));
+        let d_deprived = make_unit_with_equipment(&mut world2, "P2", 10.5, 10.5, 100.0, rifles(10));
+        populate_nearby_enemies(&mut world2);
+        let mut scratch2 = CombatScratch::new();
+        let _ = run(&mut world2, world_entity2, &mut scratch2, &test_settings());
+        let dmg_deprived = 100.0 - world2.get::<&UnitStats>(d_deprived).unwrap().men;
+
+        assert!(
+            dmg_full > dmg_deprived,
+            "fully-supplied attacker should out-damage an under-supplied one ({} vs {})",
+            dmg_full,
+            dmg_deprived
+        );
     }
 
     /// Regression test: retreat clears the fighting flag.

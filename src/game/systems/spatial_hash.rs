@@ -47,12 +47,6 @@ impl SpatialHash {
         }
     }
 
-    /// Update an entity's position (remove from old cell, insert into new).
-    pub fn update(&mut self, entity: hecs::Entity, old_x: f32, old_y: f32, new_x: f32, new_y: f32) {
-        self.remove(entity, old_x, old_y);
-        self.insert(entity, new_x, new_y);
-    }
-
     /// Query all entities within the combat range of (x, y).
     /// Returns entities from the same cell and all 8 neighboring cells.
     /// Prefer [`Self::query_nearby_into`] to avoid per-call allocations.
