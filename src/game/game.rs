@@ -537,13 +537,6 @@ impl Game {
 
         self.track_unit_losses();
 
-        tick_system!(
-            "reinforce",
-            &mut self.world,
-            self.world_entity,
-            systems::reinforce::run(&mut self.world, self.world_entity)
-        );
-
         #[cfg(any(debug_assertions, feature = "debug-overlay"))]
         guard.finish(&mut self.world);
     }

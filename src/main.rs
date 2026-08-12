@@ -72,6 +72,27 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Detect bench args provided without --benchmark to prevent silent hangs.
+    if !cli.benchmark {
+        let has_bench_args = cli.bench_units != 20
+            || cli.bench_players != 4
+            || cli.bench_ticks != 500
+            || cli.bench_seed != 0
+            || !cli.bench_detailed.is_empty()
+            || cli.bench_html.is_some()
+            || cli.bench_prev.is_some();
+
+        if has_bench_args {
+            eprintln!("error: bench arguments provided without --benchmark flag");
+            eprintln!();
+            eprintln!("  Bench arguments like --bench-ticks, --bench-seed, --bench-html");
+            eprintln!("  are only used when --benchmark is also provided.");
+            eprintln!();
+            eprintln!("  Did you forget to pass --benchmark?");
+            std::process::exit(1);
+        }
+    }
+
     // Run benchmark if requested (no config needed)
     if cli.benchmark {
         let detailed_systems: Vec<String> = if cli.bench_detailed.is_empty() {

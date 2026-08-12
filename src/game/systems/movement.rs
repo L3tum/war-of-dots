@@ -465,7 +465,6 @@ mod tests {
             max_men: 1000.0,
             organisation: 100.0,
             max_organisation: 100.0,
-            reinforcement_rate: 5.0,
         };
         let equipment = UnitEquipment {
             equipment: vec![],
@@ -505,7 +504,6 @@ mod tests {
             max_men: 1000.0,
             organisation: 100.0,
             max_organisation: 100.0,
-            reinforcement_rate: 5.0,
         };
         let equipment = UnitEquipment {
             equipment: vec![],
@@ -551,7 +549,6 @@ mod tests {
             max_men: 1000.0,
             organisation: 100.0,
             max_organisation: 100.0,
-            reinforcement_rate: 5.0,
         };
         let equipment = UnitEquipment {
             equipment: vec![],
@@ -598,7 +595,6 @@ mod tests {
             max_men: 1000.0,
             organisation: 50.0,
             max_organisation: 100.0,
-            reinforcement_rate: 5.0,
         };
         let equipment = UnitEquipment {
             equipment: vec![],
@@ -641,7 +637,6 @@ mod tests {
             max_men: 1000.0,
             organisation: 0.0,
             max_organisation: 100.0,
-            reinforcement_rate: 5.0,
         };
         let equipment = UnitEquipment {
             equipment: vec![],

@@ -24,7 +24,6 @@ pub struct Unit {
     pub max_equipment: Vec<Equipment>,
     pub organisation: f32,
     pub max_organisation: f32,
-    pub reinforcement_rate: f32,
     pub supply: f32,
     pub max_supply: f32,
     pub healing: bool,
@@ -105,7 +104,6 @@ impl Unit {
             max_equipment: unit_type.equipment.clone(),
             organisation: 0.0,
             max_organisation: unit_type.max_organisation,
-            reinforcement_rate: unit_type.reinforcement_rate,
             supply: max_supply,
             max_supply,
             healing: true,
@@ -312,7 +310,6 @@ mod tests {
         assert_eq!(unit.max_men, 1000.0);
         assert_eq!(unit.organisation, 0.0);
         assert_eq!(unit.max_organisation, 100.0);
-        assert_eq!(unit.reinforcement_rate, 5.0);
         assert_eq!(unit.supply, 2000.0);
         assert_eq!(unit.max_supply, 2000.0);
         assert!(unit.healing);

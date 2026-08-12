@@ -82,7 +82,6 @@ impl WorldExt for World {
                 max_men: unit_type.men as f32,
                 organisation: unit_type.max_organisation,
                 max_organisation: unit_type.max_organisation,
-                reinforcement_rate: unit_type.reinforcement_rate,
             },
             UnitEquipment {
                 equipment: unit_type.equipment.clone(),

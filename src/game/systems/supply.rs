@@ -219,6 +219,27 @@ pub fn run(
             changed = true;
         }
 
+        // Organisation recovery (merged from reinforce.rs)
+        // Units in combat (fighting or attacking) do NOT recover org.
+        if !flags.fighting && !flags.attacking {
+            let supply_pct = ratio * 100.0;
+            let malus = if supply_pct > 50.0 {
+                1.0
+            } else {
+                supply_pct / 50.0
+            };
+            let unit_reinforce_rate = unit_types_by_name
+                .get(utype.name.as_str())
+                .map(|u| u.reinforcement_rate)
+                .unwrap_or(5.0);
+            let reinforce = unit_reinforce_rate * malus;
+            let new_org = (new_stats.organisation + reinforce).min(new_stats.max_organisation);
+            if (new_org - new_stats.organisation).abs() > f32::EPSILON {
+                new_stats.organisation = new_org;
+                changed = true;
+            }
+        }
+
         if changed {
             changes.push((entity, new_stats, new_equipment, new_wt));
         }
@@ -332,6 +353,16 @@ mod tests {
         count: u32,
         buffer_percent: u32,
     ) -> hecs::Entity {
+        spawn_unit_with_equipment_and_org(world, flags, count, buffer_percent, 100.0)
+    }
+
+    fn spawn_unit_with_equipment_and_org(
+        world: &mut World,
+        flags: UnitFlags,
+        count: u32,
+        buffer_percent: u32,
+        organisation: f32,
+    ) -> hecs::Entity {
         let equipment = [Equipment {
             name: "rifle".to_string(),
             count,
@@ -350,9 +381,8 @@ mod tests {
             UnitStats {
                 men: 1000.0,
                 max_men: 1000.0,
-                organisation: 100.0,
+                organisation,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitEquipment {
                 equipment: equipment.to_vec(),
@@ -379,7 +409,10 @@ mod tests {
         run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 8, "supply delivered 5 items, net gain visible");
+        assert_eq!(
+            eq.equipment[0].count, 8,
+            "supply delivered 5 items, net gain visible"
+        );
         // cost = 5 rifles × 0.5 = 2.5 → rounded up to 3 funds.
         let funds = world
             .world_data(world_entity)
@@ -404,7 +437,10 @@ mod tests {
         run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 11, "supply maintained buffer after attrition");
+        assert_eq!(
+            eq.equipment[0].count, 11,
+            "supply maintained buffer after attrition"
+        );
         let funds = world
             .world_data(world_entity)
             .unwrap()
@@ -432,7 +468,10 @@ mod tests {
         run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 0, "encircled unit receives no supply");
+        assert_eq!(
+            eq.equipment[0].count, 0,
+            "encircled unit receives no supply"
+        );
         let funds = world
             .world_data(world_entity)
             .unwrap()
@@ -449,13 +488,16 @@ mod tests {
     #[test]
     fn supply_skips_when_funds_short() {
         let (mut world, world_entity, settings) = make_world(0); // no funds to deliver anything
-        // 5/10 rifles. Attrition: 5 → 4. Supply blocked (no funds).
+                                                                 // 5/10 rifles. Attrition: 5 → 4. Supply blocked (no funds).
         let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 5, 10);
 
         run(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
-        assert_eq!(eq.equipment[0].count, 4, "attrition wore 1, supply blocked by 0 funds");
+        assert_eq!(
+            eq.equipment[0].count, 4,
+            "attrition wore 1, supply blocked by 0 funds"
+        );
         let funds = world
             .world_data(world_entity)
             .unwrap()
@@ -465,5 +507,127 @@ mod tests {
             .copied()
             .unwrap();
         assert_eq!(funds, 0, "funds untouched when refill skipped");
+    }
+
+    /// Organisation recovery: a non-fighting, fully supplied unit recovers org.
+    /// reinforcement_rate=5, supply_pct >= 50 => malus=1.0 => +5 org.
+    #[test]
+    fn org_recoveries_when_fully_supplied() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        // 10/10 rifles = 100% supply => malus=1.0
+        let unit =
+            spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 10, 10, 50.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 55.0).abs() < 0.01,
+            "org recovered by 5 (rate*malus)"
+        );
+    }
+
+    /// Organisation recovery: under-supplied unit gets reduced recovery.
+    /// 5/10 rifles = 50% supply => malus=1.0 (exactly at threshold)
+    #[test]
+    fn org_recoveries_at_supply_threshold() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        // 5/10 rifles = 50% supply => malus=1.0
+        let unit = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 5, 10, 50.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 55.0).abs() < 0.01,
+            "org recovered by 5 at threshold"
+        );
+    }
+
+    /// Organisation recovery: severely under-supplied unit gets reduced recovery.
+    /// 3/10 rifles = 30% supply => malus=30/50=0.6 => +3.0 org
+    #[test]
+    fn org_recoveries_reduced_when_under_supplied() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        // 3/10 rifles = 30% supply => malus=0.6 => 5*0.6=3.0
+        let unit = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 3, 10, 50.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 53.0).abs() < 0.01,
+            "org recovered by 3 (5*0.6)"
+        );
+    }
+
+    /// Organisation recovery: unit at max org stays at max.
+    #[test]
+    fn org_capped_at_max() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        let unit =
+            spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 10, 10, 100.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 100.0).abs() < 0.01,
+            "org capped at max"
+        );
+    }
+
+    /// Organisation recovery: fighting units do NOT recover org.
+    #[test]
+    fn org_no_recovery_when_fighting() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        let flags = UnitFlags {
+            fighting: true,
+            ..Default::default()
+        };
+        let unit = spawn_unit_with_equipment_and_org(&mut world, flags, 10, 10, 50.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 50.0).abs() < 0.01,
+            "fighting unit does not recover org"
+        );
+    }
+
+    /// Organisation recovery: attacking units do NOT recover org.
+    #[test]
+    fn org_no_recovery_when_attacking() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        let flags = UnitFlags {
+            attacking: true,
+            ..Default::default()
+        };
+        let unit = spawn_unit_with_equipment_and_org(&mut world, flags, 10, 10, 50.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 50.0).abs() < 0.01,
+            "attacking unit does not recover org"
+        );
+    }
+
+    /// Organisation recovery: zero-supply unit gets zero recovery.
+    /// 0/10 rifles = 0% supply => malus=0.0 => +0 org
+    #[test]
+    fn org_no_recovery_when_no_supply() {
+        let (mut world, world_entity, settings) = make_world(100_000);
+        let unit = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 0, 10, 50.0);
+
+        run(&mut world, world_entity, &settings);
+
+        let stats = world.get::<&UnitStats>(unit).unwrap();
+        assert!(
+            (stats.organisation - 50.0).abs() < 0.01,
+            "zero supply gives zero org recovery"
+        );
     }
 }

@@ -45,7 +45,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 50.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags::default(),
         ));
@@ -65,7 +64,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 50.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags {
                 encircled: false,
@@ -87,7 +85,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 50.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags {
                 encircled: true,
@@ -110,7 +107,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 50.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags::default(),
         ));
@@ -129,7 +125,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 50.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags::default(),
         ));
@@ -157,7 +152,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 0.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags::default(),
         ));
@@ -168,7 +162,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 10.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags {
                 encircled: false,
@@ -182,7 +175,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 80.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags::default(),
         ));
@@ -195,7 +187,6 @@ mod tests {
                 max_men: 1000.0,
                 organisation: 10.0,
                 max_organisation: 100.0,
-                reinforcement_rate: 5.0,
             },
             UnitFlags {
                 encircled: true,

@@ -72,7 +72,6 @@ pub struct UnitStats {
     pub max_men: f32,
     pub organisation: f32,
     pub max_organisation: f32,
-    pub reinforcement_rate: f32,
 }
 
 /// Equipment carried by this unit (current and max).

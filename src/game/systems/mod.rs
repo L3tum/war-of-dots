@@ -7,7 +7,6 @@ pub mod economy;
 pub mod encirclement;
 pub mod influence;
 pub mod movement;
-pub mod reinforce;
 pub mod spatial_hash;
 pub mod spatialty;
 pub mod supply;
