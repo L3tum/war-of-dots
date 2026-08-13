@@ -118,6 +118,9 @@ pub struct Game {
 }
 
 /// Neighbour-graph snapshot: how spatialty left the world this tick.
+/// `attacking`/`NearbyEnemies` are spatialty-owned, so post-combat reads
+/// reflect the current tick's spatialty output. Used by benchmark/status.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CombatHealth {
     /// Living units with UnitFlags + NearbyEnemies.
@@ -132,6 +135,7 @@ pub struct CombatHealth {
 
 /// Combat resolution-stage counters from one tick's `combat::run`.
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub struct CombatDiag {
     /// Candidate units entering the combat loop (attacking || fighting).
     pub candidates: usize,
@@ -303,11 +307,13 @@ impl Game {
     }
 
     /// Number of units that moved in the most recent tick.
+    #[allow(dead_code)]
     pub fn last_mover_count(&self) -> usize {
         self.last_mover_count
     }
 
     /// Number of engaged combat pairs in the most recent tick (combat.rs).
+    #[allow(dead_code)]
     pub fn last_engaged_pairs(&self) -> usize {
         self.last_engaged_pairs
     }
@@ -315,6 +321,7 @@ impl Game {
     /// Snapshot of the neighbour graph as spatialty left it this tick.
     /// `attacking`/`NearbyEnemies` are spatialty-owned, so post-combat reads
     /// reflect the current tick's spatialty output. Used by benchmark/status.
+    #[allow(dead_code)]
     pub fn combat_health(&self) -> CombatHealth {
         let mut units = 0usize;
         let mut units_with_attacking = 0usize;
@@ -339,6 +346,7 @@ impl Game {
     }
 
     /// Combat resolution-stage counters from the most recent tick's run.
+    #[allow(dead_code)]
     pub fn combat_diag(&self) -> CombatDiag {
         CombatDiag {
             candidates: self.combat_scratch.candidates,
@@ -1034,12 +1042,14 @@ impl Game {
     }
 
     /// Get debug stats as JSON (only available in debug builds).
+    #[allow(dead_code)]
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub fn get_debug_stats(&self) -> Option<serde_json::Value> {
         super::debug_stats::get_debug_stats(&self.world, self.world_entity)
     }
 
     /// Set which systems should record detailed sub-part timings (benchmark mode).
+    #[allow(dead_code)]
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub fn set_detailed_systems(&mut self, systems: Vec<String>) {
         use std::collections::HashSet;

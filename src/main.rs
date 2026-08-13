@@ -4,7 +4,7 @@
 //! build armies, and expand territory. Serves a WebGPU-powered HTML frontend
 //! and supports LLM agents.
 
-mod benchmark;
+use war_of_dots::benchmark;
 mod config;
 mod debug;
 mod errors;

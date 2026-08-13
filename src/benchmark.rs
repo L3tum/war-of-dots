@@ -20,6 +20,8 @@ use crate::config::CityUpgradeSettings;
 use crate::game::economy::UnitType;
 use crate::game::game::{Game, GameSettings};
 use crate::map::map::{Map, MapConfig};
+#[cfg(feature = "microbenchmarks")]
+use crate::microbenchmarks;
 
 /// Per-tick benchmark data point
 #[derive(Default)]
@@ -173,6 +175,19 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "  Units/city: {}, Ticks: {}, Seed: {}",
         config.units_per_city, config.ticks, config.seed
     );
+
+    // Run microbenchmarks first (feature-gated)
+    let microbench_json = {
+        #[cfg(feature = "microbenchmarks")]
+        {
+            let microbench_results = microbenchmarks::run_microbenchmarks();
+            microbenchmarks::results_to_json(&microbench_results)
+        }
+        #[cfg(not(feature = "microbenchmarks"))]
+        {
+            serde_json::json!(null)
+        }
+    };
 
     let map_cfg = MapConfig {
         width: 200,
@@ -645,6 +660,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "health_avg_units_with_enemies": health_enemies as f64 / tick_data.len() as f64,
             "health_avg_total_nearby_entries": health_entries as f64 / tick_data.len() as f64,
         },
+        "microbenchmarks": microbench_json,
     });
 
     BenchmarkResults {
@@ -938,6 +954,79 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         }
     };
 
+    // Microbenchmark table rows
+    let prev_micro_timings: std::collections::HashMap<String, f64> = prev_json
+        .get("microbenchmarks")
+        .and_then(|mb| mb.get("benchmarks"))
+        .and_then(|b| b.as_array())
+        .map(|arr| {
+            let mut map = std::collections::HashMap::new();
+            for b in arr {
+                if let (Some(id), Some(mean)) = (
+                    b.get("id").and_then(|v| v.as_str()),
+                    b.get("mean_ns").and_then(|v| v.as_f64()),
+                ) {
+                    map.insert(id.to_string(), mean);
+                }
+            }
+            map
+        })
+        .unwrap_or_default();
+
+    let microbench_rows = {
+        let mb = &results.summary["microbenchmarks"];
+        if let Some(benchmarks) = mb.get("benchmarks").and_then(|b| b.as_array()) {
+            if benchmarks.is_empty() {
+                "<tr><td colspan='6'>No microbenchmark data</td></tr>".to_string()
+            } else {
+                benchmarks.iter().map(|b| {
+                    let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let mean_ns = b.get("mean_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let mean_ms = mean_ns / 1_000_000.0;
+                    let std_dev_ns = b.get("std_dev_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let std_ms = std_dev_ns / 1_000_000.0;
+                    let n = b.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let group = b.get("group").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Comparison delta
+                    let delta = if let Some(prev_ns) = prev_micro_timings.get(id) {
+                        let change = mean_ns - prev_ns;
+                        let pct = if *prev_ns > 0.0 { change / prev_ns * 100.0 } else { 0.0 };
+                        let emoji = if change < -0.01 { "🟢" } else if change > 0.01 { "🔴" } else { "⚪" };
+                        let change_ms = change / 1_000_000.0;
+                        format!("<td style='color:{}'>{:.2}ms ({}){:+.1}%</td>",
+                            if change < 0.0 { "#0f0" } else if change > 0.0 { "#f44" } else { "#aaa" },
+                            change_ms, emoji, pct)
+                    } else {
+                        "<td style='color:#888'>new</td>".to_string()
+                    };
+
+                    let group_color = match group {
+                        "spatial_hash" => "rgba(255,165,0,0.2)",
+                        "ecs" => "rgba(0,255,136,0.2)",
+                        "systems" => "rgba(255,102,0,0.2)",
+                        "map" => "rgba(102,204,255,0.2)",
+                        "settings" => "rgba(204,204,204,0.2)",
+                        "economy" => "rgba(204,153,255,0.2)",
+                        _ => "rgba(255,255,255,0.05)",
+                    };
+
+                    format!("<tr style='background:{}'><td>{}</td><td>{:.3}ms</td><td>±{:.3}ms</td><td>{}</td><td>{}</td>{}</tr>",
+                        group_color, id, mean_ms, std_ms, n, group, delta)
+                }).collect::<Vec<_>>().join("\n      ")
+            }
+        } else {
+            "<tr><td colspan='6'>No microbenchmark data</td></tr>".to_string()
+        }
+    };
+
+    let microbench_count = results
+        .summary
+        .get("microbenchmarks")
+        .and_then(|mb| mb.get("count"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+
     // Pie chart data: top systems by total_ms
     let (pie_labels, pie_data) = if let Some(systems) = system_timings.as_array() {
         let mut sorted: Vec<&serde_json::Value> = systems.iter().collect();
@@ -1081,6 +1170,18 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             <thead><tr><th>Sub-part</th><th>Total (ms)</th><th>Avg/Call</th><th>Calls</th><th>P99</th></tr></thead>
             <tbody>
       {detailed_rows}
+            </tbody>
+        </table>
+
+        <h2>Microbenchmarks</h2>
+        <p class="note">{microbench_count} isolated benchmarks measuring specific operations and systems</p>
+        <table>
+            <thead><tr>
+                <th>Benchmark</th><th>Mean</th><th>Std Dev</th><th>Iterations</th>
+                <th>Group</th><th>Delta (prev)</th>
+            </tr></thead>
+            <tbody>
+      {microbench_rows}
             </tbody>
         </table>
 
@@ -1239,6 +1340,8 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         system_bars = system_bars,
         svg_height = svg_height_val,
         detailed_rows = detailed_rows,
+        microbench_rows = microbench_rows,
+        microbench_count = microbench_count,
         json = serde_json::to_string_pretty(&results.summary).unwrap_or_default(),
         tick_durations_json = tick_durations_json,
         entity_counts_json = entity_counts_json,

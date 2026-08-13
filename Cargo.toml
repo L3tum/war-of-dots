@@ -38,6 +38,7 @@ subtle = "2"
 default = []
 debug-overlay = []
 perfect-movement = []
+microbenchmarks = []
 
 [[bin]]
 name = "console_client"

@@ -29,4 +29,6 @@ frontend/schema/node_modules
 # Benchmark reports (moved to reports/ for local reference)
 reports/
 *.html
+
+# Benchmark dbs
 war_of_dots.db*

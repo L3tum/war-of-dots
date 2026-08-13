@@ -8,6 +8,8 @@ pub mod frontend;
 pub mod game;
 pub mod llm;
 pub mod map;
+#[cfg(feature = "microbenchmarks")]
+pub mod microbenchmarks;
 pub mod replay;
 pub mod server;
 pub mod storage;
