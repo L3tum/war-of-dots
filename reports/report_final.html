@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>War of Dots — Benchmark Report</title>
+    <style>
+        body { font-family: 'Segoe UI', monospace; background: #1a1a2e; color: #e0e0e0; margin: 0; padding: 40px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #ff6600; border-bottom: 2px solid #ff6600; padding-bottom: 10px; }
+        h2 { color: #0f0; margin-top: 30px; }
+        .metric { display: inline-block; background: rgba(255,255,255,0.05); border-radius: 8px; padding: 15px 25px; margin: 8px; min-width: 180px; text-align: center; }
+        .metric .value { font-size: 28px; font-weight: bold; color: #0f0; }
+        .metric .label { font-size: 12px; color: #888; margin-top: 4px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th { text-align: left; color: #ff6600; border-bottom: 1px solid #444; padding: 8px; }
+        td { padding: 6px 8px; border-bottom: 1px solid #222; }
+        tr:hover { background: rgba(255,255,255,0.03); }
+        .config { color: #888; font-size: 13px; }
+        .footer { margin-top: 40px; color: #555; font-size: 12px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚡ War of Dots Benchmark</h1>
+        <p class="config">Seed: 0 | Generated: 2026-07-25 00:27:41 UTC</p>
+
+        <h2>Summary</h2>
+        <div class="metric"><div class="value">0.615ms</div><div class="label">Avg Tick Time</div></div>
+        <div class="metric"><div class="value">307.4ms</div><div class="label">Total Wall Time</div></div>
+        <div class="metric"><div class="value">500</div><div class="label">Ticks Run</div></div>
+        <div class="metric"><div class="value">342</div><div class="label">Units Remaining</div></div>
+        <div class="metric"><div class="value">540</div><div class="label">Total Recruited</div></div>
+
+        <h2>Per-System Breakdown</h2>
+        <table>
+            <thead><tr><th>System</th><th>Avg (ms)</th><th>Total (ms)</th><th>Calls</th></tr></thead>
+            <tbody>
+      <tr><td>combat</td><td>0.145</td><td>79.6</td><td>550</td></tr>
+      <tr><td>border</td><td>0.100</td><td>55.3</td><td>550</td></tr>
+      <tr><td>encirclement</td><td>0.064</td><td>35.2</td><td>550</td></tr>
+      <tr><td>vision</td><td>0.060</td><td>32.9</td><td>550</td></tr>
+      <tr><td>movement</td><td>0.039</td><td>21.6</td><td>550</td></tr>
+      <tr><td>attrition</td><td>0.037</td><td>20.3</td><td>550</td></tr>
+      <tr><td>water</td><td>0.023</td><td>12.7</td><td>550</td></tr>
+      <tr><td>reinforce</td><td>0.021</td><td>11.5</td><td>550</td></tr>
+      <tr><td>healing</td><td>0.021</td><td>11.4</td><td>550</td></tr>
+      <tr><td>city_capture</td><td>0.016</td><td>8.8</td><td>550</td></tr>
+      <tr><td>supply</td><td>0.016</td><td>8.8</td><td>550</td></tr>
+      <tr><td>surrender</td><td>0.012</td><td>0.2</td><td>18</td></tr>
+      <tr><td>world_data_clone</td><td>0.001</td><td>0.4</td><td>550</td></tr>
+      <tr><td>economy</td><td>0.001</td><td>0.0</td><td>55</td></tr>
+            </tbody>
+        </table>
+
+        <h2>Raw JSON</h2>
+        <pre style="background:#111;padding:15px;border-radius:8px;overflow:auto;font-size:12px;max-height:400px;">{
+  "config": {
+    "cities": 12,
+    "seed": 0,
+    "ticks": 500,
+    "total_units_initial": 60,
+    "total_units_recruited": 540,
+    "units_per_city": 20
+  },
+  "debug_stats": {
+    "archetype_count": 3,
+    "avg_tick_ms": 0.8023306138613857,
+    "entity_count": 343,
+    "last_tick_ms": 0.6206999999999999,
+    "system_timings": [
+      {
+        "avg_ms": 0.020916541818181828,
+        "call_count": 550,
+        "last_ms": 0.0263,
+        "name": "reinforce",
+        "total_ms": 11.504098000000006
+      },
+      {
+        "avg_ms": 0.015924727272727267,
+        "call_count": 550,
+        "last_ms": 0.0171,
+        "name": "city_capture",
+        "total_ms": 8.758599999999998
+      },
+      {
+        "avg_ms": 0.039226361818181864,
+        "call_count": 550,
+        "last_ms": 0.0579,
+        "name": "movement",
+        "total_ms": 21.574499000000024
+      },
+      {
+        "avg_ms": 0.03693345090909092,
+        "call_count": 550,
+        "last_ms": 0.0484,
+        "name": "attrition",
+        "total_ms": 20.313398000000007
+      },
+      {
+        "avg_ms": 0.02316163454545451,
+        "call_count": 550,
+        "last_ms": 0.0323,
+        "name": "water",
+        "total_ms": 12.738898999999979
+      },
+      {
+        "avg_ms": 0.015910545454545462,
+        "call_count": 550,
+        "last_ms": 0.0216,
+        "name": "supply",
+        "total_ms": 8.750800000000003
+      },
+      {
+        "avg_ms": 0.0007890909090909058,
+        "call_count": 550,
+        "last_ms": 0.0007999999999999999,
+        "name": "world_data_clone",
+        "total_ms": 0.4339999999999982
+      },
+      {
+        "avg_ms": 0.05979162909090905,
+        "call_count": 550,
+        "last_ms": 0.0785,
+        "name": "vision",
+        "total_ms": 32.88539599999998
+      },
+      {
+        "avg_ms": 0.14481016909090919,
+        "call_count": 550,
+        "last_ms": 0.1542,
+        "name": "combat",
+        "total_ms": 79.64559300000005
+      },
+      {
+        "avg_ms": 0.10046562181818193,
+        "call_count": 550,
+        "last_ms": 0.1384,
+        "name": "border",
+        "total_ms": 55.25609200000006
+      },
+      {
+        "avg_ms": 0.02081399636363636,
+        "call_count": 550,
+        "last_ms": 0.0304,
+        "name": "healing",
+        "total_ms": 11.447697999999997
+      },
+      {
+        "avg_ms": 0.06404708363636362,
+        "call_count": 550,
+        "last_ms": 0.0,
+        "name": "encirclement",
+        "total_ms": 35.22589599999999
+      },
+      {
+        "avg_ms": 0.0005290909090909092,
+        "call_count": 55,
+        "last_ms": 0.0006,
+        "name": "economy",
+        "total_ms": 0.029100000000000004
+      },
+      {
+        "avg_ms": 0.01246111111111111,
+        "call_count": 18,
+        "last_ms": 0.016399999999999998,
+        "name": "surrender",
+        "total_ms": 0.2243
+      }
+    ],
+    "tick_count": 550,
+    "tick_durations_ms": [
+      2.4656000000000002,
+      0.6745,
+      0.7046,
+      0.6475,
+      0.6547999999999999,
+      0.6589,
+      0.6199,
+      0.6028,
+      0.5996,
+      0.604199,
+      0.6098,
+      0.6506,
+      0.632,
+      0.6249,
+      0.6135999999999999,
+      2.5691,
+      0.5992000000000001,
+      0.6197,
+      0.5877,
+      0.5939,
+      0.6072,
+      0.587599,
+      0.6162,
+      0.5931000000000001,
+      0.588,
+      0.5989,
+      0.5825,
+      0.5812999999999999,
+      0.5695,
+      0.6106,
+      2.9161,
+      0.6269,
+      0.6193000000000001,
+      0.584599,
+      0.5907,
+      0.6001,
+      0.6213,
+      0.5857,
+      0.5726,
+      0.5691999999999999,
+      0.5699000000000001,
+      0.5825,
+      0.6203,
+      0.6198,
+      0.5869,
+      2.909499,
+      0.6143000000000001,
+      0.6073,
+      0.5901,
+      0.5828,
+      0.8034,
+      0.8254999999999999,
+      0.7943,
+      0.7988,
+      0.7726999999999999,
+      0.7812,
+      0.7818,
+      0.7684000000000001,
+      0.7691990000000001,
+      0.7805000000000001,
+      3.2726,
+      0.6851,
+      0.6876,
+      0.6917,
+      0.6746,
+      0.675,
+      0.6636,
+      0.6631,
+      0.649999,
+      0.6486999999999999,
+      0.6582,
+      0.6618,
+      0.6621,
+      0.6606,
+      0.6518999999999999,
+      3.1380000000000003,
+      0.6618,
+      0.6745,
+      0.6445,
+      0.648299,
+      0.6451,
+      0.6428999999999999,
+      0.6406,
+      0.6291,
+      0.6304000000000001,
+      0.6514,
+      0.6484000000000001,
+      0.6246,
+      0.6246,
+      0.632,
+      3.244199,
+      0.6502,
+      0.6151000000000001,
+      0.637,
+      0.6019000000000001,
+      0.6227,
+      0.641,
+      0.6859000000000001,
+      0.6436999999999999,
+      0.6167,
+      0.6206999999999999
+    ],
+    "total_ticks_ms": 303.985669
+  },
+  "results": {
+    "avg_tick_wall_ms": 0.614842138,
+    "move_events": 25,
+    "recruit_events": 4,
+    "units_remaining": 342,
+    "wall_time_ms": 307.421069
+  }
+}</pre>
+
+        <p class="footer">War of Dots ECS Benchmark — ECS architecture with hecs crate</p>
+    </div>
+</body>
+</html>
