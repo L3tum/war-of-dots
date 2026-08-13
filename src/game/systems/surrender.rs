@@ -18,9 +18,9 @@ use hecs::World;
 pub fn run(world: &mut World, _world_entity: hecs::Entity) -> Vec<hecs::Entity> {
     // Direct query — no entity-collect-then-refetch
     world
-        .query::<(&UnitStats, &UnitFlags)>()
+        .query::<(hecs::Entity, &UnitStats, &UnitFlags)>()
         .iter()
-        .filter_map(|(entity, (stats, _flags))| {
+        .filter_map(|(entity, stats, _flags)| {
             if stats.men <= 0.0 {
                 return Some(entity);
             }

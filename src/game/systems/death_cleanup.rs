@@ -40,7 +40,7 @@ pub fn run(
     }
 
     // Clean NearbyEnemies references (single pass, O(total entries) amortized)
-    for (_entity, nearby) in world.query::<&mut NearbyEnemies>().iter() {
+    for (_entity, nearby) in world.query::<(hecs::Entity, &mut NearbyEnemies)>().iter() {
         nearby.entities.retain(|e| !dead_set.contains(e));
     }
 

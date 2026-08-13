@@ -8,6 +8,7 @@ use crate::game::game::GameSettings;
 use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
+use hecs::Entity;
 use hecs::World;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ pub fn run(
 
     // Clear moved flags from the previous tick. Movement owns the full
     // moved-flag lifecycle: clear at start, set for movers at end.
-    for (_, flags) in world.query::<&mut UnitFlags>().iter() {
+    for (_, flags) in world.query::<(Entity, &mut UnitFlags)>().iter() {
         flags.moved = false;
     }
 
@@ -73,6 +74,7 @@ pub fn run(
     // Phase 1: query all components, compute movement changes
     let changes: Vec<(hecs::Entity, MovementChange)> = world
         .query::<(
+            Entity,
             &UnitPosition,
             &UnitPath,
             &UnitFlags,
@@ -81,7 +83,7 @@ pub fn run(
             &UnitEquipment,
         )>()
         .iter()
-        .filter_map(|(entity, (pos, path, flags, utype, stats, equipment))| {
+        .filter_map(|(entity, pos, path, flags, utype, stats, equipment)| {
             if path.path.is_empty() || flags.on_water {
                 return None;
             }
@@ -115,9 +117,9 @@ pub fn run(
     #[cfg(feature = "perfect-movement")]
     let (spatial, positions_map): (SpatialHash, HashMap<hecs::Entity, UnitPosition>) = {
         let positions: Vec<(hecs::Entity, UnitPosition)> = world
-            .query::<(&UnitPosition,)>()
+            .query::<(Entity, &UnitPosition)>()
             .iter()
-            .map(|(e, (pos,))| (e, *pos))
+            .map(|(e, pos)| (e, *pos))
             .collect();
         let mut sh = SpatialHash::new();
         for (e, pos) in &positions {

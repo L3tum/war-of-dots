@@ -74,7 +74,10 @@ pub fn run(
     if has_uninitialized {
         let mover_set: std::collections::HashSet<hecs::Entity> =
             pending.iter().map(|p| p.e).collect();
-        for (e, nearby) in world.query::<Option<&NearbyEnemies>>().iter() {
+        for (e, nearby) in world
+            .query::<(hecs::Entity, Option<&NearbyEnemies>)>()
+            .iter()
+        {
             if nearby.is_none() && !mover_set.contains(&e) {
                 let Ok(pos) = world.get::<&UnitPosition>(e) else {
                     continue;

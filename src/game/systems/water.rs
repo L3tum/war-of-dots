@@ -23,9 +23,14 @@ enum WaterChange {
 pub fn run(world: &mut World, world_entity: hecs::Entity) {
     // Phase 1: query all components, compute changes
     let changes: Vec<(hecs::Entity, WaterChange)> = world
-        .query::<(&UnitWaterTransition, &UnitFlags, &UnitPosition)>()
+        .query::<(
+            hecs::Entity,
+            &UnitWaterTransition,
+            &UnitFlags,
+            &UnitPosition,
+        )>()
         .iter()
-        .filter_map(|(entity, (wt, flags, pos))| compute_water_change(entity, wt, flags, pos))
+        .filter_map(|(entity, wt, flags, pos)| compute_water_change(entity, wt, flags, pos))
         .collect();
 
     // Phase 2: apply changes

@@ -908,7 +908,7 @@ fn bench_ecs() -> Vec<MicrobenchmarkResult> {
             (world, we)
         },
         |f: &mut (World, hecs::Entity)| {
-            let count = f.0.query::<&UnitPosition>().iter().count();
+            let count = f.0.query::<(hecs::Entity, &UnitPosition)>().iter().count();
             black_box(count);
         },
     );
@@ -928,7 +928,7 @@ fn bench_ecs() -> Vec<MicrobenchmarkResult> {
             (world, we)
         },
         |f: &mut (World, hecs::Entity)| {
-            let count = f.0.query::<&UnitPosition>().iter().count();
+            let count = f.0.query::<(hecs::Entity, &UnitPosition)>().iter().count();
             black_box(count);
         },
     );

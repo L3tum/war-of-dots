@@ -3,7 +3,7 @@
 //! Each component is a pure data struct — no methods, just fields.
 //! Systems query these components from the hecs::World and apply game rules.
 //!
-//! In hecs 0.10, components must be `Send + Sync + 'static` (auto-implemented).
+//! In hecs 0.11, components must be `Send + Sync + 'static` (auto-implemented).
 //! No `#[derive(Component)]` needed — it's a marker trait auto-implied.
 
 use crate::game::economy::City;

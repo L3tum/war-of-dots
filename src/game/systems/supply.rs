@@ -110,8 +110,9 @@ pub fn run(
     let mut fund_cost: HashMap<String, u32> = HashMap::new();
 
     // SINGLE PASS over every unit.
-    for (entity, (utype, owner, stats, equipment, flags, wt)) in world
+    for (entity, utype, owner, stats, equipment, flags, wt) in world
         .query::<(
+            hecs::Entity,
             &UnitTypeId,
             &UnitOwner,
             &UnitStats,

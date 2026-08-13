@@ -8,6 +8,7 @@ use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use crate::map::map::Map;
+use hecs::Entity;
 use hecs::World;
 use std::collections::HashMap;
 
@@ -198,7 +199,7 @@ impl TickContext {
 
         // Single pass: group entities+positions by player
         let mut units_by_player: HashMap<String, Vec<UnitHandle>> = HashMap::new();
-        for (entity, (owner, pos)) in world.query::<(&UnitOwner, &UnitPosition)>().iter() {
+        for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
             units_by_player
                 .entry(owner.player_id.clone())
                 .or_default()
@@ -327,7 +328,11 @@ impl Game {
         let mut units_with_attacking = 0usize;
         let mut units_with_enemies = 0usize;
         let mut total_nearby_entries = 0usize;
-        for (_, (flags, nearby)) in self.world.query::<(&UnitFlags, &NearbyEnemies)>().iter() {
+        for (_, flags, nearby) in self
+            .world
+            .query::<(Entity, &UnitFlags, &NearbyEnemies)>()
+            .iter()
+        {
             units += 1;
             if flags.attacking {
                 units_with_attacking += 1;
@@ -861,9 +866,10 @@ impl Game {
 
     pub fn query_all_units(&self) -> Vec<UnitQueryData> {
         let mut results = Vec::new();
-        for (entity, (owner, utype, display, pos, path, stats, equipment, flags, wt)) in self
+        for (entity, owner, utype, display, pos, path, stats, equipment, flags, wt) in self
             .world
             .query::<(
+                Entity,
                 &UnitOwner,
                 &UnitTypeId,
                 &UnitDisplay,
@@ -1097,9 +1103,9 @@ impl Game {
     pub fn is_player_active(&self, player_id: &str) -> bool {
         let has_units = self
             .world
-            .query::<(&UnitOwner,)>()
+            .query::<(Entity, &UnitOwner)>()
             .iter()
-            .any(|(_, (owner,))| owner.player_id == player_id);
+            .any(|(_, owner)| owner.player_id == player_id);
         let has_cities = self
             .world
             .world_data(self.world_entity)
@@ -1118,9 +1124,9 @@ impl Game {
         for pid in self.players.keys() {
             let unit_count = self
                 .world
-                .query::<(&UnitOwner,)>()
+                .query::<(Entity, &UnitOwner)>()
                 .iter()
-                .filter(|(_, (owner,))| &owner.player_id == pid)
+                .filter(|(_, owner)| &owner.player_id == pid)
                 .count() as u32;
             let city_count = self
                 .world
@@ -1145,9 +1151,9 @@ impl Game {
     fn track_unit_losses(&mut self) {
         let current_counts: HashMap<String, usize> = self
             .world
-            .query::<(&UnitOwner,)>()
+            .query::<(Entity, &UnitOwner)>()
             .iter()
-            .fold(HashMap::new(), |mut acc, (_, (owner,))| {
+            .fold(HashMap::new(), |mut acc, (_, owner)| {
                 *acc.entry(owner.player_id.clone()).or_insert(0) += 1;
                 acc
             });

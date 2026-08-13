@@ -21,9 +21,9 @@ pub fn run(
     };
 
     let units: Vec<(String, UnitPosition)> = world
-        .query::<(&UnitOwner, &UnitPosition)>()
+        .query::<(hecs::Entity, &UnitOwner, &UnitPosition)>()
         .iter()
-        .map(|(_, (owner, pos))| (owner.player_id.clone(), *pos))
+        .map(|(_, owner, pos)| (owner.player_id.clone(), *pos))
         .collect();
 
     // Collect all capture candidates, then pick one winner per city deterministically

@@ -9,6 +9,7 @@ use crate::game::components::*;
 use crate::game::economy::UnitType;
 use crate::game::game::GameSettings;
 use crate::game::world_ext::WorldExt;
+use hecs::Entity;
 use hecs::World;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -185,6 +186,7 @@ pub fn run(
         NearbyEnemies,
     )> = world
         .query::<(
+            Entity,
             &UnitPosition,
             &UnitOwner,
             &UnitFlags,
@@ -192,10 +194,10 @@ pub fn run(
             &NearbyEnemies,
         )>()
         .iter()
-        .filter(|(_, (_, _, flags, stats, nearby))| {
+        .filter(|(_, _, _, flags, stats, nearby)| {
             stats.men > 0.0 && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
         })
-        .map(|(e, (pos, owner, flags, stats, nearby))| {
+        .map(|(e, pos, owner, flags, stats, nearby)| {
             (
                 e,
                 *pos,
@@ -585,9 +587,9 @@ mod tests {
     /// within COMBAT_RANGE. Replaces the old SpatialHash-based approach.
     fn populate_nearby_enemies(world: &mut World) {
         let units: Vec<(hecs::Entity, UnitPosition, String)> = world
-            .query::<(&UnitPosition, &UnitOwner)>()
+            .query::<(Entity, &UnitPosition, &UnitOwner)>()
             .iter()
-            .map(|(e, (pos, owner))| (e, *pos, owner.player_id.clone()))
+            .map(|(e, pos, owner)| (e, *pos, owner.player_id.clone()))
             .collect();
         for (entity, pos, owner) in &units {
             let mut nearby: Vec<hecs::Entity> = Vec::new();
