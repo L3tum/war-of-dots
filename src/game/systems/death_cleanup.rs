@@ -1,18 +1,15 @@
 //! DeathCleanupSystem — unified cleanup of dead units from combat, attrition, and surrender.
 //!
 //! Runs after all death-producing systems have finished. Performs:
-//! 1. Remove dead units from the SpatialHash (using their current position)
-//! 2. Clean NearbyEnemies references (single pass, O(total entries) amortized)
-//! 3. Despawn dead entities and clean entity registry
+//! 1. Clean NearbyEnemies references (single pass, O(total entries) amortized)
+//! 2. Despawn dead entities and clean entity registry
 
 use std::collections::HashMap;
 
 use crate::game::components::NearbyEnemies;
-use crate::game::systems::spatial_hash::SpatialHash;
 
 pub fn run(
     world: &mut hecs::World,
-    spatial: &mut SpatialHash,
     all_dead: Vec<hecs::Entity>,
     entity_reverse: &mut HashMap<hecs::Entity, String>,
 ) {
@@ -21,23 +18,6 @@ pub fn run(
     }
 
     let dead_set: std::collections::HashSet<hecs::Entity> = all_dead.iter().copied().collect();
-
-    // Capture each dead unit's current position so its SpatialHash entry can be
-    // removed (read-only borrows, dropped per iteration). Read BEFORE despawn.
-    let dead_positions: Vec<(hecs::Entity, f32, f32)> = all_dead
-        .iter()
-        .filter_map(|&e| {
-            world
-                .get::<&crate::game::components::UnitPosition>(e)
-                .ok()
-                .map(|p| (e, p.x, p.y))
-        })
-        .collect();
-
-    // Remove stale SpatialHash entries for the dead units.
-    for (e, x, y) in &dead_positions {
-        spatial.remove(*e, *x, *y);
-    }
 
     // Clean NearbyEnemies references (single pass, O(total entries) amortized)
     for (_entity, nearby) in world.query::<(hecs::Entity, &mut NearbyEnemies)>().iter() {
@@ -66,7 +46,6 @@ mod tests {
     #[test]
     fn cleanup_removes_dead_from_nearby_enemies() {
         let mut world = hecs::World::new();
-        let mut spatial = SpatialHash::new();
         let alive = world.spawn((NearbyEnemies {
             entities: vec![],
             initialized: true,
@@ -90,7 +69,6 @@ mod tests {
         let mut entity_reverse = HashMap::new();
         run(
             &mut world,
-            &mut spatial,
             vec![dead1, dead2],
             &mut entity_reverse,
         );
@@ -116,7 +94,6 @@ mod tests {
     #[test]
     fn cleanup_empty_input_returns_early() {
         let mut world = hecs::World::new();
-        let mut spatial = SpatialHash::new();
         let entity = world.spawn((NearbyEnemies {
             entities: vec![],
             initialized: true,
@@ -124,7 +101,7 @@ mod tests {
 
         let mut entity_reverse = HashMap::new();
         // Empty input should not affect anything
-        run(&mut world, &mut spatial, vec![], &mut entity_reverse);
+        run(&mut world, vec![], &mut entity_reverse);
 
         // Entity should still exist
         assert!(
@@ -136,7 +113,6 @@ mod tests {
     #[test]
     fn cleanup_removes_from_entity_reverse() {
         let mut world = hecs::World::new();
-        let mut spatial = SpatialHash::new();
         let dead = world.spawn((NearbyEnemies {
             entities: vec![],
             initialized: true,
@@ -145,7 +121,7 @@ mod tests {
         let mut entity_reverse: HashMap<hecs::Entity, String> = HashMap::new();
         entity_reverse.insert(dead, "unit_123".to_string());
 
-        run(&mut world, &mut spatial, vec![dead], &mut entity_reverse);
+        run(&mut world, vec![dead], &mut entity_reverse);
 
         assert!(
             entity_reverse.is_empty(),

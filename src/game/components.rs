@@ -54,8 +54,8 @@ pub struct UnitPath {
     pub path: Vec<(f32, f32)>,
 }
 
-/// Cached list of enemy entities within ±1 spatial-hash cells.
-/// Maintained by the Spatialty system. Read by combat.
+/// Cached list of enemy entities within COMBAT_RANGE.
+/// Maintained by the nearby_enemies system. Read by combat.
 #[derive(Debug, Clone, Default)]
 pub struct NearbyEnemies {
     /// Enemy entities found during last spatialty update.

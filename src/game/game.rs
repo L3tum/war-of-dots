@@ -4,7 +4,6 @@ use crate::config::CityUpgradeSettings;
 use crate::game::components::*;
 use crate::game::economy::{City, UnitType};
 use crate::game::player::Player;
-use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use crate::map::map::Map;
@@ -101,15 +100,8 @@ pub struct Game {
     /// Pre-allocated combat scratch, cleared and reused each tick.
     combat_scratch: systems::combat::CombatScratch,
     /// Pre-allocated movement scratch, cleared and reused each tick. Holds the
-    /// mover records that spatialty consumes (replaces the old marker component).
+    /// mover records that movement system uses.
     movement_scratch: systems::movement::MovementScratch,
-    /// Spatial hash of living unit positions, maintained incrementally by
-    /// spatialty. Kept OUTSIDE the ECS so spatialty can query it while also
-    /// reading/mutating unit components.
-    spatial_hash: SpatialHash,
-    /// Count of units that haven't been spatially initialized yet.
-    /// Incremented on spawn, decremented by spatialty after init.
-    uninitialized_units: u32,
     /// Number of units that moved in the most recent tick (from movement.rs).
     /// Used by benchmark/status reporting to gauge spatialty work.
     last_mover_count: usize,
@@ -118,9 +110,9 @@ pub struct Game {
     last_engaged_pairs: usize,
 }
 
-/// Neighbour-graph snapshot: how spatialty left the world this tick.
-/// `attacking`/`NearbyEnemies` are spatialty-owned, so post-combat reads
-/// reflect the current tick's spatialty output. Used by benchmark/status.
+/// Neighbour-graph snapshot: how nearby_enemies left the world this tick.
+/// `attacking`/`NearbyEnemies` are nearby_enemies-owned, so post-combat reads
+/// reflect the current tick's nearby_enemies output. Used by benchmark/status.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CombatHealth {
@@ -296,8 +288,6 @@ impl Game {
             entity_reverse: HashMap::new(),
             combat_scratch: systems::combat::CombatScratch::new(),
             movement_scratch: systems::movement::MovementScratch::default(),
-            spatial_hash: SpatialHash::new(),
-            uninitialized_units: 0,
             last_mover_count: 0,
             last_engaged_pairs: 0,
         }
@@ -433,25 +423,14 @@ impl Game {
         );
         self.last_mover_count = mover_count;
 
-        // Spatialty: maintains NearbyEnemies (runs after movement, before combat)
-        // Skip entirely when there's nothing to do — most ticks have no movers
-        // and all units are already initialized.
-        if mover_count > 0 || self.uninitialized_units > 0 {
-            let new_init_count = tick_system!(
-                "spatialty",
-                &mut self.world,
-                self.world_entity,
-                systems::spatialty::run(
-                    &mut self.world,
-                    self.world_entity,
-                    &mut self.spatial_hash,
-                    &self.movement_scratch.movers,
-                    mover_count > 0,
-                    self.uninitialized_units > 0,
-                )
-            );
-            self.uninitialized_units = self.uninitialized_units.saturating_sub(new_init_count);
-        }
+        // NearbyEnemies: brute-force rebuild of enemy adjacency lists.
+        // Runs after movement (so positions are current) and before combat.
+        tick_system!(
+            "nearby_enemies",
+            &mut self.world,
+            self.world_entity,
+            systems::nearby_enemies::run(&mut self.world)
+        );
 
         // Combat (no longer needs SpatialHash — reads NearbyEnemies)
         let combat_dead = tick_system!(
@@ -542,7 +521,6 @@ impl Game {
             self.world_entity,
             systems::death_cleanup::run(
                 &mut self.world,
-                &mut self.spatial_hash,
                 all_dead,
                 &mut self.entity_reverse,
             )
@@ -605,7 +583,6 @@ impl Game {
         }
 
         let entity = self.world.spawn_unit(unit_type, owner, city_pos);
-        self.uninitialized_units += 1;
         let unit_id = format!("unit_{}", entity.id());
         self.entity_registry.insert(unit_id.clone(), entity);
         self.entity_reverse.insert(entity, unit_id.clone());

@@ -16,7 +16,6 @@ use crate::config::CityUpgradeSettings;
 use crate::game::components::*;
 use crate::game::economy::{City, UnitType};
 use crate::game::game::{Game, GameSettings, TickContext};
-use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::{Equipment, Terrain};
 use crate::game::world_ext::WorldExt;
 use hecs::World;
@@ -499,14 +498,14 @@ impl SupplyFixture {
     }
 }
 
-/// Pre-built fixture for spatialty benchmarks.
-struct SpatialtyFixture {
+/// Pre-built fixture for nearby_enemies benchmarks.
+struct NearbyEnemiesFixture {
     world: World,
     world_entity: hecs::Entity,
     entity_ids: Vec<hecs::Entity>,
 }
 
-impl SpatialtyFixture {
+impl NearbyEnemiesFixture {
     fn new_movers(
         width: u32,
         height: u32,
@@ -648,173 +647,6 @@ impl DeathCleanupFixture {
 }
 
 // ============================================================================
-// Spatial Hash Benchmarks (8) — unchanged
-// ============================================================================
-
-fn bench_spatial_hash() -> Vec<MicrobenchmarkResult> {
-    let cfg = BenchConfig::default();
-    let mut results = Vec::new();
-
-    // Insert at different scales
-    for n in [100, 1000, 5000] {
-        let id = format!("insert_{}", n);
-        let result = run_bench(
-            cfg,
-            || {},
-            || {
-                let mut hash = SpatialHash::new();
-                for i in 0..n {
-                    hash.insert(
-                        make_dummy_entity(i as u64),
-                        (i % 100) as f32,
-                        (i / 100) as f32,
-                    );
-                }
-                black_box(&hash);
-            },
-        );
-        results.push(MicrobenchmarkResult {
-            id: format!("spatial_hash/{}", id),
-            group: "spatial_hash".to_string(),
-            ..result
-        });
-    }
-
-    // Query sparse
-    let result = run_bench(
-        cfg,
-        || {},
-        || {
-            let mut hash = SpatialHash::new();
-            for i in 0..100 {
-                hash.insert(
-                    make_dummy_entity(i as u64),
-                    (i % 50) as f32 * 5.0,
-                    (i / 50) as f32 * 5.0,
-                );
-            }
-            let hash = hash;
-            let mut out = Vec::new();
-            for i in 0..10 {
-                hash.query_nearby_into(i as f32 * 3.0 + 1.0, i as f32 * 3.0 + 1.0, &mut out);
-            }
-            black_box(out.len());
-        },
-    );
-    results.push(MicrobenchmarkResult {
-        id: "spatial_hash/query_sparse".to_string(),
-        group: "spatial_hash".to_string(),
-        ..result
-    });
-
-    // Query dense
-    let result = run_bench(
-        cfg,
-        || {},
-        || {
-            let mut hash = SpatialHash::new();
-            for i in 0..1000 {
-                hash.insert(
-                    make_dummy_entity(i as u64),
-                    10.0 + (i % 10) as f32 * 0.1,
-                    10.0 + (i / 10) as f32 * 0.1,
-                );
-            }
-            let hash = hash;
-            let mut out = Vec::new();
-            for i in 0..10 {
-                hash.query_nearby_into(10.0 + i as f32 * 0.5, 10.0 + i as f32 * 0.5, &mut out);
-            }
-            black_box(out.len());
-        },
-    );
-    results.push(MicrobenchmarkResult {
-        id: "spatial_hash/query_dense".to_string(),
-        group: "spatial_hash".to_string(),
-        ..result
-    });
-
-    // Buffer reuse
-    let result = run_bench(
-        cfg,
-        || {},
-        || {
-            let mut hash = SpatialHash::new();
-            for i in 0..200 {
-                hash.insert(
-                    make_dummy_entity(i as u64),
-                    (i % 20) as f32 * 3.0,
-                    (i / 20) as f32 * 3.0,
-                );
-            }
-            let hash = hash;
-            let mut out = Vec::with_capacity(100);
-            for i in 0..10 {
-                hash.query_nearby_into(i as f32 * 4.0 + 2.0, i as f32 * 4.0 + 2.0, &mut out);
-            }
-            black_box(out.len());
-        },
-    );
-    results.push(MicrobenchmarkResult {
-        id: "spatial_hash/query_buffer_reuse".to_string(),
-        group: "spatial_hash".to_string(),
-        ..result
-    });
-
-    // Remove + reinsert (spatialty pattern)
-    let result = run_bench(
-        cfg,
-        || {},
-        || {
-            let mut hash = SpatialHash::new();
-            let positions: Vec<_> = (0..100)
-                .map(|i| {
-                    let e = make_dummy_entity(i as u64);
-                    let x = (i % 10) as f32 * 3.0;
-                    let y = (i / 10) as f32 * 3.0;
-                    hash.insert(e, x, y);
-                    (e, x, y)
-                })
-                .collect();
-            for (e, old_x, old_y) in &positions {
-                hash.remove(*e, *old_x, *old_y);
-                hash.insert(*e, old_x + 2.0, old_y + 2.0);
-            }
-            black_box(positions.len());
-        },
-    );
-    results.push(MicrobenchmarkResult {
-        id: "spatial_hash/remove_reinsert".to_string(),
-        group: "spatial_hash".to_string(),
-        ..result
-    });
-
-    // Clear
-    let result = run_bench(
-        cfg,
-        || {},
-        || {
-            let mut hash = SpatialHash::new();
-            for i in 0..1000 {
-                hash.insert(
-                    make_dummy_entity(i as u64),
-                    (i % 50) as f32 * 2.0,
-                    (i / 50) as f32 * 2.0,
-                );
-            }
-            hash.clear();
-            black_box(0);
-        },
-    );
-    results.push(MicrobenchmarkResult {
-        id: "spatial_hash/clear".to_string(),
-        group: "spatial_hash".to_string(),
-        ..result
-    });
-
-    results
-}
-
 // ============================================================================
 // ECS Benchmarks (8) — renamed query_positions 100/1000 → 5000/10000
 // ============================================================================
@@ -1057,118 +889,49 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         ..result
     });
 
-    // --- Spatialty ---
+    // --- Nearby Enemies ---
 
-    // Spatialty with 100 movers (setup outside timer)
+    // NearbyEnemies with 100 units (full brute-force rebuild)
     let result = run_bench_with_setup(
         cfg,
-        || SpatialtyFixture::new_movers(30, 30, 2, &ut, 100),
-        |f: &mut SpatialtyFixture| {
-            let movers: Vec<_> = f
-                .entity_ids
-                .iter()
-                .copied()
-                .map(|e| {
-                    let old = UnitPosition { x: 10.0, y: 10.0 };
-                    let new = UnitPosition { x: 12.0, y: 12.0 };
-                    (e, old, new)
-                })
-                .collect();
-            let mut spatial = SpatialHash::new();
-            for &e in &f.entity_ids {
-                if let Ok(pos) = f.world.get::<&UnitPosition>(e) {
-                    spatial.insert(e, pos.x, pos.y);
-                }
-            }
-            crate::game::systems::spatialty::run(
-                &mut f.world,
-                f.world_entity,
-                &mut spatial,
-                &movers,
-                true,
-                true,
-            );
-            black_box(movers.len());
+        || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 100),
+        |f: &mut NearbyEnemiesFixture| {
+            crate::game::systems::nearby_enemies::run(&mut f.world);
+            black_box(f.entity_ids.len());
         },
     );
     results.push(MicrobenchmarkResult {
-        id: "systems/spatialty_100".to_string(),
+        id: "systems/nearby_enemies_100".to_string(),
         group: "systems".to_string(),
         ..result
     });
 
-    // Spatialty with 200 movers (realistic scale — game has ~200 movers/tick)
+    // NearbyEnemies with 200 units (realistic scale)
     let result = run_bench_with_setup(
         cfg,
-        || SpatialtyFixture::new_movers(30, 30, 2, &ut, 200),
-        |f: &mut SpatialtyFixture| {
-            let movers: Vec<_> = f
-                .entity_ids
-                .iter()
-                .copied()
-                .map(|e| {
-                    let old = UnitPosition { x: 10.0, y: 10.0 };
-                    let new = UnitPosition { x: 12.0, y: 12.0 };
-                    (e, old, new)
-                })
-                .collect();
-            let mut spatial = SpatialHash::new();
-            for &e in &f.entity_ids {
-                if let Ok(pos) = f.world.get::<&UnitPosition>(e) {
-                    spatial.insert(e, pos.x, pos.y);
-                }
-            }
-            crate::game::systems::spatialty::run(
-                &mut f.world,
-                f.world_entity,
-                &mut spatial,
-                &movers,
-                true,
-                true,
-            );
-            black_box(movers.len());
+        || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 200),
+        |f: &mut NearbyEnemiesFixture| {
+            crate::game::systems::nearby_enemies::run(&mut f.world);
+            black_box(f.entity_ids.len());
         },
     );
     results.push(MicrobenchmarkResult {
-        id: "systems/spatialty_200".to_string(),
+        id: "systems/nearby_enemies_200".to_string(),
         group: "systems".to_string(),
         ..result
     });
 
-    // Spatialty with 500 movers (stress test hash density + NearbyEnemies updates)
+    // NearbyEnemies with 500 units (stress test brute-force density)
     let result = run_bench_with_setup(
         cfg,
-        || SpatialtyFixture::new_movers(40, 40, 2, &ut, 500),
-        |f: &mut SpatialtyFixture| {
-            let movers: Vec<_> = f
-                .entity_ids
-                .iter()
-                .copied()
-                .map(|e| {
-                    let old = UnitPosition { x: 10.0, y: 10.0 };
-                    let new = UnitPosition { x: 12.0, y: 12.0 };
-                    (e, old, new)
-                })
-                .collect();
-            let mut spatial = SpatialHash::new();
-            for &e in &f.entity_ids {
-                if let Ok(pos) = f.world.get::<&UnitPosition>(e) {
-                    spatial.insert(e, pos.x, pos.y);
-                }
-            }
-            crate::game::systems::spatialty::run(
-                &mut f.world,
-                f.world_entity,
-                &mut spatial,
-                &movers,
-                true,
-                true,
-            );
-            black_box(movers.len());
+        || NearbyEnemiesFixture::new_movers(40, 40, 2, &ut, 500),
+        |f: &mut NearbyEnemiesFixture| {
+            crate::game::systems::nearby_enemies::run(&mut f.world);
+            black_box(f.entity_ids.len());
         },
     );
     results.push(MicrobenchmarkResult {
-        id: "systems/spatialty_500".to_string(),
+        id: "systems/nearby_enemies_500".to_string(),
         group: "systems".to_string(),
         ..result
     });
@@ -1329,11 +1092,9 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || DeathCleanupFixture::new(200, 50),
         |f: &mut DeathCleanupFixture| {
-            let mut spatial = SpatialHash::new();
             let mut entity_reverse: HashMap<hecs::Entity, String> = HashMap::new();
             crate::game::systems::death_cleanup::run(
                 &mut f.world,
-                &mut spatial,
                 f.dead_entities.clone(),
                 &mut entity_reverse,
             );
@@ -1584,12 +1345,6 @@ pub fn run_microbenchmarks() -> Vec<MicrobenchmarkResult> {
 
     println!("\n🔬 Running microbenchmarks...");
     println!("  ───────────────────────────────────────────────");
-
-    let spatial = bench_spatial_hash();
-    for r in &spatial {
-        print_result(r);
-    }
-    results.extend(spatial);
 
     let ecs = bench_ecs();
     for r in &ecs {
