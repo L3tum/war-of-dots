@@ -17,20 +17,20 @@
 
 use crate::game::components::*;
 use crate::game::constants::COMBAT_RANGE_SQ;
+use crate::game::game::TickContext;
 use hecs::Entity;
 
 /// Cell size equals COMBAT_RANGE (sqrt(4.0) = 2.0).
 const CELL_SIZE: f32 = 2.0;
 
 /// Data stored per entity in a grid cell.
-/// owner_idx is the index into the units array — enables O(1) owner comparison
-/// because units with the same owner share the same player_id string at the
-/// same array position (deduplicated below).
+/// owner_idx is the compact owner ID from TickContext (u8).
+/// Enables O(1) owner comparison with a single-byte integer equality.
 #[derive(Clone, Copy)]
 struct CellEntry {
     entity: Entity,
     pos: UnitPosition,
-    owner_idx: usize, // index into units array
+    owner_idx: u8,
 }
 
 /// Coarse spatial grid: 1D array of cell buckets.
@@ -43,8 +43,8 @@ struct GridIndex {
 
 impl GridIndex {
     /// Build grid from units array.
-    /// `units` is indexed; each entry's position in the array is its owner_idx.
-    fn build(units: &[(Entity, UnitPosition, String, bool)]) -> Self {
+    /// `units` carries compact owner IDs (u8) from TickContext — no dedup needed.
+    fn build(units: &[(Entity, UnitPosition, u8, bool)]) -> Self {
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
@@ -62,7 +62,7 @@ impl GridIndex {
 
         let mut cells: Vec<Vec<CellEntry>> = vec![Vec::with_capacity(4); total];
 
-        for (i, &(e, pos, _, _)) in units.iter().enumerate() {
+        for &(e, pos, owner_id, _) in units.iter() {
             let c = cell_for(pos);
             let cx = ((c.0 - min_x) as usize).min(width - 1);
             let cy = ((c.1 - min_y) as usize).min(height - 1);
@@ -70,7 +70,7 @@ impl GridIndex {
             cells[idx].push(CellEntry {
                 entity: e,
                 pos,
-                owner_idx: i,
+                owner_idx: owner_id, // u8 directly — no array index indirection
             });
         }
 
@@ -103,16 +103,16 @@ fn cell_for(pos: UnitPosition) -> (i32, i32) {
     )
 }
 
-pub fn run(world: &mut hecs::World) {
-    // 1. Collect all living unit data in one ECS query.
-    //    Each entry: (entity, position, owner_string, is_moved).
-    //    The array index IS the owner identity — same array index = same unit,
-    //    so for owner comparison we just compare indices.
-    let units: Vec<(Entity, UnitPosition, String, bool)> = world
-        .query::<(Entity, &UnitPosition, &UnitOwner, &UnitFlags)>()
+pub fn run(world: &mut hecs::World, ctx: &TickContext) {
+    // 1. Collect all living unit data in one ECS query (no &UnitOwner —
+    //    owner IDs come from the shared TickContext lookup).
+    //    Each entry: (entity, position, compact_owner_id, is_moved).
+    let units: Vec<(Entity, UnitPosition, u8, bool)> = world
+        .query::<(Entity, &UnitPosition, &UnitFlags)>()
         .iter()
-        .map(|(e, pos, owner, flags)| {
-            (e, *pos, owner.player_id.clone(), flags.moved)
+        .filter_map(|(e, pos, flags)| {
+            let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
+            Some((e, *pos, owner_id, flags.moved))
         })
         .collect();
 
@@ -124,38 +124,11 @@ pub fn run(world: &mut hecs::World) {
     // 2. Build grid index.
     let grid = GridIndex::build(&units);
 
-    // Build owner lookup: for each unit index, which other indices share the
-    // same owner? We need owner equality, not identity. Create a set of
-    // owner indices grouped by player_id.
-    // Simpler: just compare player_id strings. Since most units have different
-    // owners (only same-player units share), we use a compact owner ID.
-    //
-    // Optimisation: build a parallel `owner_id` array that maps each unit index
-    // to a small usize owner group ID. Then owner comparison is just usize equality.
-    let owner_ids: Vec<usize> = {
-        let mut owner_map: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::with_capacity(16);
-        let mut next_id: usize = 0;
-        units
-            .iter()
-            .map(|(_, _, ref pid, _)| {
-                *owner_map.entry(pid.as_str()).or_insert_with(|| {
-                    let id = next_id;
-                    next_id += 1;
-                    id
-                })
-            })
-            .collect()
-    };
-
-    debug_assert_eq!(owner_ids.len(), n);
-
     // Reuse buffer to avoid per-unit allocation.
     let mut enemies = Vec::with_capacity(16);
 
     // 3. For each unit, query 3×3 neighbourhood and build NearbyEnemies.
-    for (my_idx, &(entity, pos, _, is_moved)) in units.iter().enumerate() {
-        let my_owner = owner_ids[my_idx];
+    for &(entity, pos, my_owner, is_moved) in units.iter() {
         let c = cell_for(pos);
 
         // Collect 3×3 neighbourhood entries — no HashMap lookups, no linear scans.
@@ -167,8 +140,8 @@ pub fn run(world: &mut hecs::World) {
                         if entry.entity == entity {
                             continue;
                         }
-                        // Fast owner comparison.
-                        if owner_ids[entry.owner_idx] == my_owner {
+                        // Fast owner comparison — direct u8 equality.
+                        if entry.owner_idx == my_owner {
                             continue;
                         }
                         let dx_pos = pos.x - entry.pos.x;
@@ -211,6 +184,7 @@ pub fn run(world: &mut hecs::World) {
 mod tests {
     use super::*;
     use crate::config::CityUpgradeSettings;
+    use crate::game::game::TickContext;
     use crate::game::world_ext::WorldExt;
 
     fn setup() -> (hecs::World, hecs::Entity) {
@@ -246,12 +220,18 @@ mod tests {
         ))
     }
 
+    /// Helper: build TickContext and run the system (used by most tests).
+    fn build_ctx_and_run(world: &mut hecs::World, world_entity: hecs::Entity) {
+        let ctx = TickContext::build(world, world_entity).unwrap();
+        run(world, &ctx);
+    }
+
     #[test]
     fn initializes_new_spawns_and_sees_each_other() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let a = make_unit(&mut world, "P1", 10.0, 10.0, false);
         let b = make_unit(&mut world, "P2", 10.5, 10.5, false);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         let nearby_a = world.get::<&NearbyEnemies>(a).unwrap();
         assert!(nearby_a.initialized);
@@ -267,10 +247,10 @@ mod tests {
 
     #[test]
     fn ignores_same_owner() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let a = make_unit(&mut world, "P1", 10.0, 10.0, false);
         let b = make_unit(&mut world, "P1", 10.5, 10.5, false);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         let nearby_a = world.get::<&NearbyEnemies>(a).unwrap();
         assert!(
@@ -286,12 +266,12 @@ mod tests {
 
     #[test]
     fn mover_sets_attacking_with_enemy_nearby() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         // Stationary defender (moved=false).
         let b = make_unit(&mut world, "P2", 10.5, 10.5, false);
         // Mover advancing toward B (moved=true).
         let a = make_unit(&mut world, "P1", 10.0, 10.0, true);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         assert!(
             world.get::<&UnitFlags>(a).unwrap().attacking,
@@ -306,11 +286,11 @@ mod tests {
 
     #[test]
     fn mover_clears_attacking_when_no_enemy_nearby() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         // Mover at a far distance from anyone.
         let a = make_unit(&mut world, "P1", 0.0, 0.0, true);
         let b = make_unit(&mut world, "P2", 100.0, 100.0, false);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         assert!(
             !world.get::<&UnitFlags>(a).unwrap().attacking,
@@ -320,10 +300,10 @@ mod tests {
 
     #[test]
     fn stationary_defender_does_not_become_attacker() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let b = make_unit(&mut world, "P2", 10.5, 10.5, false);
         let a = make_unit(&mut world, "P1", 10.0, 10.0, true);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         assert!(
             !world.get::<&UnitFlags>(b).unwrap().attacking,
@@ -337,10 +317,10 @@ mod tests {
 
     #[test]
     fn two_nearby_movers_see_each_other_and_attack() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let a = make_unit(&mut world, "P1", 10.0, 10.0, true);
         let b = make_unit(&mut world, "P2", 10.5, 10.5, true);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         assert!(world
             .get::<&NearbyEnemies>(a)
@@ -358,11 +338,11 @@ mod tests {
 
     #[test]
     fn three_owners_all_see_each_other() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let a = make_unit(&mut world, "P1", 10.0, 10.0, false);
         let b = make_unit(&mut world, "P2", 10.5, 10.5, false);
         let cc = make_unit(&mut world, "P3", 10.2, 10.2, false);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         let na = world.get::<&NearbyEnemies>(a).unwrap();
         assert!(na.entities.contains(&b) && na.entities.contains(&cc));
@@ -374,13 +354,13 @@ mod tests {
 
     #[test]
     fn dense_cluster_filters_self_and_allies() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let p1a = make_unit(&mut world, "P1", 10.0, 10.0, false);
         let p1b = make_unit(&mut world, "P1", 10.1, 10.1, false);
         let p1c = make_unit(&mut world, "P1", 10.2, 10.2, false);
         let p2a = make_unit(&mut world, "P2", 10.3, 10.3, false);
         let p2b = make_unit(&mut world, "P2", 10.4, 10.4, false);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         for (unit, label) in [(&p1a, "P1A"), (&p1b, "P1B"), (&p1c, "P1C")] {
             let nb = world.get::<&NearbyEnemies>(*unit).unwrap();
@@ -410,16 +390,16 @@ mod tests {
 
     #[test]
     fn empty_world_does_not_panic() {
-        let (mut world, _world_entity) = setup();
-        run(&mut world);
+        let (mut world, world_entity) = setup();
+        build_ctx_and_run(&mut world, world_entity);
     }
 
     #[test]
     fn units_beyond_combat_range_not_seen() {
-        let (mut world, _world_entity) = setup();
+        let (mut world, world_entity) = setup();
         let a = make_unit(&mut world, "P1", 0.0, 0.0, false);
         let b = make_unit(&mut world, "P2", 10.0, 10.0, false);
-        run(&mut world);
+        build_ctx_and_run(&mut world, world_entity);
 
         let nearby_a = world.get::<&NearbyEnemies>(a).unwrap();
         assert!(nearby_a.entities.is_empty(), "far units should not be in NearbyEnemies");

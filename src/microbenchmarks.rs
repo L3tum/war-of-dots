@@ -896,7 +896,8 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 100),
         |f: &mut NearbyEnemiesFixture| {
-            crate::game::systems::nearby_enemies::run(&mut f.world);
+            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
             black_box(f.entity_ids.len());
         },
     );
@@ -911,7 +912,8 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 200),
         |f: &mut NearbyEnemiesFixture| {
-            crate::game::systems::nearby_enemies::run(&mut f.world);
+            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
             black_box(f.entity_ids.len());
         },
     );
@@ -926,7 +928,8 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(40, 40, 2, &ut, 500),
         |f: &mut NearbyEnemiesFixture| {
-            crate::game::systems::nearby_enemies::run(&mut f.world);
+            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
             black_box(f.entity_ids.len());
         },
     );
@@ -944,11 +947,13 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || CombatFixture::new_dense(20, 20, 2, &ut, 100),
         |f: &mut CombatFixture| {
             let mut scratch = crate::game::systems::combat::CombatScratch::new();
+            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
             crate::game::systems::combat::run(
                 &mut f.world,
                 f.world_entity,
                 &mut scratch,
                 &settings,
+                &ctx,
             );
             black_box(scratch.engaged_pairs());
         },
@@ -965,11 +970,13 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || CombatFixture::new_dense(30, 30, 2, &ut, 400),
         |f: &mut CombatFixture| {
             let mut scratch = crate::game::systems::combat::CombatScratch::new();
+            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
             crate::game::systems::combat::run(
                 &mut f.world,
                 f.world_entity,
                 &mut scratch,
                 &settings,
+                &ctx,
             );
             black_box(scratch.engaged_pairs());
         },

@@ -10,6 +10,7 @@ use crate::map::map::Map;
 use hecs::Entity;
 use hecs::World;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 #[cfg(any(debug_assertions, feature = "debug-overlay"))]
 use super::debug_stats::DebugSystemGuard;
@@ -170,6 +171,10 @@ pub struct TickContext {
     pub height: u32,
     /// Entity+position handles grouped by player ID
     pub units_by_player: HashMap<String, Vec<UnitHandle>>,
+    /// Compact owner lookup: entity → player index (0..=255).
+    /// Shared across systems so nearby_enemies and combat can do
+    /// O(1) u8 equality instead of per-pair ECS borrows + String comparison.
+    pub owner_id_by_entity: HashMap<Entity, u8>,
 }
 
 impl TickContext {
@@ -189,17 +194,37 @@ impl TickContext {
         };
         // wb dropped — borrow released
 
-        // Single pass: group entities+positions by player
+        // Single pass: group entities+positions by player AND build owner_id lookup.
+        // Both structures are built from the same query, so systems like
+        // nearby_enemies and combat can use owner_id_by_entity for O(1) u8
+        // comparison instead of their own &UnitOwner ECS queries.
         let mut units_by_player: HashMap<String, Vec<UnitHandle>> = HashMap::new();
+        let mut owner_id_by_entity: HashMap<Entity, u8> = HashMap::with_capacity(512);
+        let mut player_id_to_index: HashMap<&str, u8> = HashMap::with_capacity(16);
+        let mut next_id: u8 = 0;
+
         for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
+            let pid = &owner.player_id;
+            let id = match player_id_to_index.entry(pid.as_str()) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let id = next_id;
+                    e.insert(id);
+                    next_id += 1;
+                    id
+                }
+            };
+            owner_id_by_entity.insert(entity, id);
             units_by_player
-                .entry(owner.player_id.clone())
+                .entry(pid.clone())
                 .or_default()
                 .push(UnitHandle {
                     entity,
                     pos: (*pos).as_tuple(),
                 });
         }
+
+        debug_assert!(next_id < 255, "TickContext: too many players (max 255 for u8 owner IDs)");
 
         Some(Self {
             world_entity,
@@ -208,6 +233,7 @@ impl TickContext {
             width,
             height,
             units_by_player,
+            owner_id_by_entity,
         })
     }
 }
@@ -425,25 +451,33 @@ impl Game {
 
         // NearbyEnemies: brute-force rebuild of enemy adjacency lists.
         // Runs after movement (so positions are current) and before combat.
-        tick_system!(
-            "nearby_enemies",
-            &mut self.world,
-            self.world_entity,
-            systems::nearby_enemies::run(&mut self.world)
-        );
-
-        // Combat (no longer needs SpatialHash — reads NearbyEnemies)
-        let combat_dead = tick_system!(
-            "combat",
-            &mut self.world,
-            self.world_entity,
-            systems::combat::run(
+        // Uses shared TickContext owner lookup instead of its own &UnitOwner query.
+        if let Some(ref ctx) = ctx {
+            tick_system!(
+                "nearby_enemies",
                 &mut self.world,
                 self.world_entity,
-                &mut self.combat_scratch,
-                &self.settings
+                systems::nearby_enemies::run(&mut self.world, ctx)
+            );
+        }
+
+        // Combat (reads NearbyEnemies, uses shared TickContext for owner lookups)
+        let combat_dead: Vec<hecs::Entity> = if let Some(ref ctx) = ctx {
+            tick_system!(
+                "combat",
+                &mut self.world,
+                self.world_entity,
+                systems::combat::run(
+                    &mut self.world,
+                    self.world_entity,
+                    &mut self.combat_scratch,
+                    &self.settings,
+                    ctx
+                )
             )
-        );
+        } else {
+            Vec::new()
+        };
         // Expose engaged-pair count for benchmark/status reporting.
         self.last_engaged_pairs = self.combat_scratch.engaged_pairs();
 
