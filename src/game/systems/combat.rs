@@ -370,13 +370,21 @@ pub fn run(
                 let a_rate = world
                     .get::<&UnitTypeId>(*entity1)
                     .ok()
-                    .and_then(|ut| unit_types_index.get(&ut.name).map(|&i| &settings.unit_types[i]))
+                    .and_then(|ut| {
+                        unit_types_index
+                            .get(&ut.name)
+                            .map(|&i| &settings.unit_types[i])
+                    })
                     .map(|ut| ut.fighting_attrition)
                     .unwrap_or(1.0);
                 let d_rate = world
                     .get::<&UnitTypeId>(entity2)
                     .ok()
-                    .and_then(|ut| unit_types_index.get(&ut.name).map(|&i| &settings.unit_types[i]))
+                    .and_then(|ut| {
+                        unit_types_index
+                            .get(&ut.name)
+                            .map(|&i| &settings.unit_types[i])
+                    })
                     .map(|ut| ut.fighting_attrition)
                     .unwrap_or(1.0);
                 (a_rate, d_rate)

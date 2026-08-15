@@ -23,8 +23,16 @@ use crate::map::map::{Map, MapConfig};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
 
+/// Number of measured (timed) runs per benchmark; the per-tick series are
+/// averaged across these runs and summary latency/overhead stats are computed
+/// over the combined pool of all runs.
+pub const MEASURED_RUNS: u32 = 3;
+/// Warmup ticks per measured run (discarded; warms caches/archetypes and lets
+/// the battle front converge so measured ticks start near steady state).
+pub const BENCH_WARMUP_TICKS: u64 = 200;
+
 /// Per-tick benchmark data point
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TickData {
     pub total_ms: f64,
     pub entity_count: u32,
@@ -229,11 +237,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     );
 
     // Benchmark protocol: one warmup pass per run, then MEASURED_RUNS measured
-    // passes of `config.ticks` ticks each; results are averaged across runs to
-    // smooth out run-to-run variance.
-    const MEASURED_RUNS: u32 = 3;
-    const WARMUP_TICKS: u64 = 50;
+    // passes of `config.ticks` ticks each; the per-tick series are averaged
+    // across runs to smooth out run-to-run variance.
     let mut all_tick_data: Vec<TickData> = Vec::new();
+    // Per-run tick arrays, kept so we can compute a per-tick-index average
+    // (each run is seeded identically, so tick `i` is the same sim phase).
+    let mut runs_tick_data: Vec<Vec<TickData>> = Vec::new();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let mut agg_system: std::collections::HashMap<String, Vec<serde_json::Value>> =
         std::collections::HashMap::new();
@@ -261,7 +270,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     }
     println!(
         "  Runs per config: {} measured (each {} ticks, {} warmup)",
-        MEASURED_RUNS, config.ticks, WARMUP_TICKS
+        MEASURED_RUNS, config.ticks, BENCH_WARMUP_TICKS
     );
 
     for run in 0..MEASURED_RUNS {
@@ -324,7 +333,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         game.start();
 
         // Warmup (with AI to warm up caches & archetypes)
-        for _ in 0..WARMUP_TICKS {
+        for _ in 0..BENCH_WARMUP_TICKS {
             sim.tick(&mut game, &config);
             game.tick_game();
         }
@@ -396,7 +405,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
             run_tick_data.push(td);
         }
-        all_tick_data.extend(run_tick_data);
+        all_tick_data.extend(run_tick_data.clone());
+        runs_tick_data.push(run_tick_data);
         bench_elapsed_total += run_start.elapsed();
         remaining_units = game.query_all_units().len();
 
@@ -436,9 +446,54 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     let final_detailed_timings: Vec<serde_json::Value> = Vec::new();
 
-    // Combined results across all measured runs
+    // Combined results across all measured runs.
     let bench_elapsed = bench_elapsed_total;
+    // `tick_data` is the combined raw pool of all 3×N measured ticks. Summary
+    // latency/overhead percentiles, min/max and wall time are computed over this
+    // honest distribution; the averages are identical to the averaged series.
     let tick_data = all_tick_data;
+    // Per-tick-index average across the measured runs (length == config.ticks).
+    // Each run is seeded identically so tick `i` is the same sim phase — this is
+    // what the charts and the per-tick summary arrays display (one smooth
+    // averaged trajectory instead of 3 stitched battles).
+    let avg_tick_data: Vec<TickData> = if !runs_tick_data.is_empty() {
+        (0..config.ticks as usize)
+            .map(|i| {
+                let n = runs_tick_data.len() as f64;
+                let sum_total = runs_tick_data.iter().map(|r| r[i].total_ms).sum::<f64>();
+                let sum_entity = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].entity_count as f64)
+                    .sum::<f64>();
+                let sum_unit = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].unit_count as f64)
+                    .sum::<f64>();
+                let sum_sys = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].system_sum_ms)
+                    .sum::<f64>();
+                let sum_movers = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].movers as f64)
+                    .sum::<f64>();
+                let sum_combats = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].combats as f64)
+                    .sum::<f64>();
+                TickData {
+                    total_ms: sum_total / n,
+                    entity_count: (sum_entity / n).round() as u32,
+                    unit_count: (sum_unit / n).round() as u32,
+                    system_sum_ms: sum_sys / n,
+                    movers: (sum_movers / n).round() as u32,
+                    combats: (sum_combats / n).round() as u32,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let recruit_events = ((config.ticks / 100).max(1) - 1) as u32;
     let total_recruited =
         total_units + recruit_events * (config.units_per_city / 2).max(1) * total_cities as u32;
@@ -462,7 +517,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "  Total wall time: {:.2}ms",
         bench_elapsed.as_secs_f64() * 1000.0
     );
-    println!("  Ticks completed: {}", tick_data.len());
+    println!(
+        "  Ticks completed: {} ({} runs × {})",
+        tick_data.len(),
+        MEASURED_RUNS,
+        config.ticks
+    );
     println!(
         "  Avg tick (wall): {:.3}ms",
         bench_elapsed.as_secs_f64() * 1000.0 / tick_data.len() as f64
@@ -546,7 +606,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         let avg = s["avg_ms"].as_f64().unwrap_or(0.0);
         let p99 = s["p99_ms"].as_f64().unwrap_or(0.0);
         let pct = if config.ticks > 0 {
-            calls as f64 / (config.ticks + WARMUP_TICKS) as f64 * 100.0
+            calls as f64 / (config.ticks + BENCH_WARMUP_TICKS) as f64 * 100.0
         } else {
             0.0
         };
@@ -620,6 +680,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "cities": total_cities, "units_per_city": config.units_per_city,
             "total_units_initial": total_units, "total_units_recruited": total_recruited,
             "ticks": config.ticks, "seed": config.seed,
+            "measured_runs": MEASURED_RUNS, "warmup_ticks": BENCH_WARMUP_TICKS,
+            "bench_prev": config.bench_prev, "detailed_systems": config.detailed_systems,
         },
         "results": {
             "wall_time_ms": bench_elapsed.as_secs_f64() * 1000.0,
@@ -645,9 +707,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "overhead_durations_ms": overhead_durations,
         "system_timings": final_system_timings,
         "detailed_timings": final_detailed_timings,
-        "tick_durations_ms": tick_durations,
-        "movers_per_tick": tick_data.iter().map(|td| td.movers).collect::<Vec<_>>(),
-        "combats_per_tick": tick_data.iter().map(|td| td.combats).collect::<Vec<_>>(),
+        // Per-tick arrays are the averaged series (length == config.ticks),
+        // matching the charts. Note overhead_durations_ms above stays the raw
+        // 3×N distribution (it backs the overhead percentiles); the length
+        // divergence from the per-tick arrays is intentional (Raw-JSON only).
+        "tick_durations_ms": avg_tick_data.iter().map(|td| td.total_ms).collect::<Vec<f64>>(),
+        "movers_per_tick": avg_tick_data.iter().map(|td| td.movers).collect::<Vec<_>>(),
+        "combats_per_tick": avg_tick_data.iter().map(|td| td.combats).collect::<Vec<_>>(),
         "combat_diag": {
             "avg_candidates_per_tick": diag_candidates as f64 / tick_data.len() as f64,
             "avg_attackers_per_tick": diag_attackers as f64 / tick_data.len() as f64,
@@ -665,7 +731,9 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
     BenchmarkResults {
         config,
-        tick_data,
+        // Averages the per-tick series across measured runs (length == ticks);
+        // summary latency/overhead stats are over the raw 3×N pool.
+        tick_data: avg_tick_data,
         summary,
     }
 }
@@ -688,8 +756,8 @@ pub fn run_benchmark_json(config: BenchmarkConfig) -> serde_json::Value {
 /// Generate a self-contained HTML report from benchmark results.
 pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>) -> String {
     let tick_count = results.config.ticks;
-    // Actual total ticks including 50-tick warmup
-    let total_ticks_with_warmup = tick_count + 50;
+    // Total ticks per run including warmup (for the "% of Ticks" denominator).
+    let total_ticks_with_warmup = tick_count + BENCH_WARMUP_TICKS;
     let wall_time = results.summary["results"]["wall_time_ms"]
         .as_f64()
         .unwrap_or(0.0);
@@ -727,39 +795,51 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         .as_f64()
         .unwrap_or(0.0);
 
-    // Extract spatial hash timing for Tick Composition
-    let avg_spatial_hash = if let Some(systems) = results.summary["system_timings"].as_array() {
-        systems
-            .iter()
-            .find_map(|s| {
-                if s["name"].as_str() == Some("spatial_hash") {
-                    Some(s["avg_ms"].as_f64().unwrap_or(0.0))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0.0)
-    } else {
-        0.0
-    };
     let avg_movers = results.summary["results"]["avg_movers_per_tick"]
         .as_f64()
         .unwrap_or(0.0);
     let avg_combats = results.summary["results"]["avg_combats_per_tick"]
         .as_f64()
         .unwrap_or(0.0);
+    let overhead_p50 = results.summary["overhead"]["p50_ms"]
+        .as_f64()
+        .unwrap_or(0.0);
+    // Deaths/tick is derived: units change only via recruitment (adds) and
+    // combat deaths (removes), so total deaths = initial + recruited - remaining.
+    let deaths_per_tick = if tick_count > 0 {
+        (units_initial as f64 + units_recruited as f64 - units_remaining as f64) / tick_count as f64
+    } else {
+        0.0
+    };
 
-    // Parse previous report for comparison (system timings + latency metrics)
+    // Parse previous report for comparison (per-system objects + latency metrics).
+    // `prev_timings` now maps system name -> the full per-system object so the
+    // report can show per-column deltas (total/avg/calls/p50/p90/p99).
     let (prev_timings, prev_json) = prev_html
         .map(parse_previous_report)
         .unwrap_or((std::collections::HashMap::new(), serde_json::Value::Null));
-    let comparison_note = if prev_html.is_some() {
-        "<p class='note'>📊 Comparison with previous run enabled. 🟢 = faster, 🔴 = slower</p>"
-    } else {
-        ""
+    let comparison_note = match prev_html {
+        Some(p) => format!(
+            "<p class='note'>📊 Comparison with: <b>{}</b> — 🟢 = faster/less, 🔴 = slower/more. Deltas appear under each value; comparisons are only meaningful if the previous run used the same ticks/units.</p>",
+            p
+        ),
+        None => String::new(),
     };
+    // Previous report's total ticks per run (for reconstructing % of Ticks).
+    let prev_total_ticks_with_warmup: f64 = prev_json
+        .get("config")
+        .map(|c| {
+            let ticks = c.get("ticks").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let warm = c
+                .get("warmup_ticks")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            ticks + warm
+        })
+        .unwrap_or(0.0);
 
-    // Extract previous latency metrics for Summary deltas
+    // Extract previous metrics for Summary deltas (field-presence based: any
+    // field missing from an older report simply yields no delta).
     let prev_avg = prev_json
         .get("latency")
         .and_then(|l| l.get("avg_ms"))
@@ -780,6 +860,30 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         .get("latency")
         .and_then(|l| l.get("p99_ms"))
         .and_then(|v| v.as_f64());
+    let prev_wall = prev_json
+        .get("results")
+        .and_then(|r| r.get("wall_time_ms"))
+        .and_then(|v| v.as_f64());
+    let prev_min = prev_json
+        .get("latency")
+        .and_then(|l| l.get("min_ms"))
+        .and_then(|v| v.as_f64());
+    let prev_max = prev_json
+        .get("latency")
+        .and_then(|l| l.get("max_ms"))
+        .and_then(|v| v.as_f64());
+    let prev_overhead_p50 = prev_json
+        .get("overhead")
+        .and_then(|o| o.get("p50_ms"))
+        .and_then(|v| v.as_f64());
+    let prev_overhead_p95 = prev_json
+        .get("overhead")
+        .and_then(|o| o.get("p95_ms"))
+        .and_then(|v| v.as_f64());
+    let prev_overhead_p99 = prev_json
+        .get("overhead")
+        .and_then(|o| o.get("p99_ms"))
+        .and_then(|v| v.as_f64());
     let prev_avg_system = prev_json
         .get("results")
         .and_then(|r| r.get("avg_system_ms"))
@@ -788,31 +892,154 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         .get("results")
         .and_then(|r| r.get("avg_overhead_ms"))
         .and_then(|v| v.as_f64());
+    let prev_units_remaining = prev_json
+        .get("results")
+        .and_then(|r| r.get("units_remaining"))
+        .and_then(|v| v.as_f64());
+    let prev_units_recruited = prev_json
+        .get("config")
+        .and_then(|c| c.get("total_units_recruited"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_movers = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_movers_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_combats = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_combats_per_tick"))
+        .and_then(|v| v.as_f64());
+    // Deaths/tick derived from the previous report (initial + recruited - remaining)/ticks.
+    let prev_deaths_per_tick: Option<f64> = (|| {
+        let init = prev_json
+            .get("config")
+            .and_then(|c| c.get("total_units_initial"))
+            .and_then(|v| v.as_f64())?;
+        let rec = prev_json
+            .get("config")
+            .and_then(|c| c.get("total_units_recruited"))
+            .and_then(|v| v.as_f64())?;
+        let rem = prev_json
+            .get("results")
+            .and_then(|r| r.get("units_remaining"))
+            .and_then(|v| v.as_f64())?;
+        let ticks = prev_json
+            .get("config")
+            .and_then(|c| c.get("ticks"))
+            .and_then(|v| v.as_f64())?;
+        if ticks > 0.0 {
+            Some((init + rec - rem) / ticks)
+        } else {
+            None
+        }
+    })();
 
-    /// Helper: format a metric with optional delta indicator
-    fn delta_html(current: f64, previous: Option<f64>) -> String {
+    /// Inline delta for a summary card (lower is better). Empty when no/insignificant change.
+    fn delta_html(current: f64, previous: Option<f64>, unit: &str, abs_threshold: f64) -> String {
         match previous {
-            Some(prev) if (current - prev).abs() > 0.0005 => {
+            Some(prev) if (current - prev).abs() > abs_threshold => {
                 let change = current - prev;
-                let pct = change / prev * 100.0;
+                let pct = if prev.abs() > 1e-9 {
+                    change / prev * 100.0
+                } else {
+                    0.0
+                };
                 let emoji = if change < 0.0 { "🟢" } else { "🔴" };
                 let color = if change < 0.0 { "#0f0" } else { "#f44" };
                 format!(
-                    " <span style='color:{};font-size:11px'>{}{:+.3}ms ({:+.1}%)</span>",
-                    color, emoji, change, pct
+                    " <span style='color:{};font-size:11px'>{}{:+.3}{} ({:+.1}%)</span>",
+                    color, emoji, change, unit, pct
                 )
             }
-            _ => "".to_string(),
+            _ => String::new(),
         }
     }
 
-    let avg_tick_delta = delta_html(avg_tick, prev_avg);
-    let p50_delta = delta_html(p50, prev_p50);
-    let p90_delta = delta_html(p90, prev_p90);
-    let p95_delta = delta_html(p95, prev_p95);
-    let p99_delta = delta_html(p99, prev_p99);
-    let avg_system_delta = delta_html(avg_system, prev_avg_system);
-    let avg_overhead_delta = delta_html(avg_overhead, prev_avg_overhead);
+    /// Render a table cell with an inline per-value delta (lower is better).
+    fn cell_delta(
+        value: &str,
+        current: f64,
+        previous: Option<f64>,
+        unit: &str,
+        abs_threshold: f64,
+    ) -> String {
+        let inner = match previous {
+            Some(prev) if (current - prev).abs() > abs_threshold => {
+                let change = current - prev;
+                let pct = if prev.abs() > 1e-9 {
+                    change / prev * 100.0
+                } else {
+                    0.0
+                };
+                let color = if change < 0.0 { "#0f0" } else { "#f44" };
+                let arrow = if change < 0.0 { "▼" } else { "▲" };
+                format!(
+                    "<div class='delta' style='color:{}'>{arrow}{change:+.3}{} ({pct:+.1}%)</div>",
+                    color, unit
+                )
+            }
+            Some(_) => "<div class='delta' style='color:#555'>≈0</div>".to_string(),
+            None => String::new(),
+        };
+        format!("<td>{value}{inner}</td>")
+    }
+
+    /// Adaptive time format for microbench values: ns for <1µs, µs for <1ms, ms otherwise.
+    fn fmt_ns(x: f64) -> String {
+        let a = x.abs();
+        if a < 1000.0 {
+            format!("{x:.1}ns")
+        } else if a < 1_000_000.0 {
+            format!("{:.2}µs", x / 1000.0)
+        } else {
+            format!("{:.4}ms", x / 1_000_000.0)
+        }
+    }
+
+    /// Per-column microbench delta rendered under a value (lower is better).
+    /// Empty when there is no previous value or the change is ≤1 ns (noise).
+    fn micro_delta_ns(current: f64, previous: Option<f64>) -> String {
+        let Some(prev) = previous else {
+            return String::new();
+        };
+        let change = current - prev;
+        if change.abs() <= 1.0 {
+            return String::new();
+        }
+        let color = if change < 0.0 { "#0f0" } else { "#f44" };
+        let arrow = if change < 0.0 { "▼" } else { "▲" };
+        let mag = change.abs();
+        let val = if mag < 1000.0 {
+            format!("{change:+.1}ns")
+        } else if mag < 1_000_000.0 {
+            format!("{:+.2}µs", change / 1000.0)
+        } else {
+            format!("{:+.3}ms", change / 1_000_000.0)
+        };
+        format!("<div class='delta' style='color:{color}'>{arrow}{val}</div>")
+    }
+
+    // ms thresholds keep the previous 0.0005ms; count/rate thresholds per D8.
+    const MS: f64 = 0.0005;
+    const COUNT: f64 = 1.0;
+    const RATE: f64 = 0.05;
+    let avg_tick_delta = delta_html(avg_tick, prev_avg, "ms", MS);
+    let p50_delta = delta_html(p50, prev_p50, "ms", MS);
+    let p90_delta = delta_html(p90, prev_p90, "ms", MS);
+    let p95_delta = delta_html(p95, prev_p95, "ms", MS);
+    let p99_delta = delta_html(p99, prev_p99, "ms", MS);
+    let wall_time_delta = delta_html(wall_time, prev_wall, "ms", MS);
+    let min_tick_delta = delta_html(min_tick, prev_min, "ms", MS);
+    let max_tick_delta = delta_html(max_tick, prev_max, "ms", MS);
+    let avg_system_delta = delta_html(avg_system, prev_avg_system, "ms", MS);
+    let avg_overhead_delta = delta_html(avg_overhead, prev_avg_overhead, "ms", MS);
+    let overhead_p50_delta = delta_html(overhead_p50, prev_overhead_p50, "ms", MS);
+    let overhead_p95_delta = delta_html(overhead_p95, prev_overhead_p95, "ms", MS);
+    let overhead_p99_delta = delta_html(overhead_p99, prev_overhead_p99, "ms", MS);
+    let units_remaining_delta = delta_html(units_remaining as f64, prev_units_remaining, "", COUNT);
+    let units_recruited_delta = delta_html(units_recruited as f64, prev_units_recruited, "", COUNT);
+    let avg_movers_delta = delta_html(avg_movers, prev_avg_movers, "", COUNT);
+    let avg_combats_delta = delta_html(avg_combats, prev_avg_combats, "", COUNT);
+    let deaths_per_tick_delta = delta_html(deaths_per_tick, prev_deaths_per_tick, "", RATE);
 
     let tick_durations: Vec<f64> = results.tick_data.iter().map(|td| td.total_ms).collect();
     let entity_counts: Vec<u32> = results.tick_data.iter().map(|td| td.entity_count).collect();
@@ -853,23 +1080,36 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             let p99 = s["p99_ms"].as_f64().unwrap_or(0.0);
             let pct = if total_ticks_with_warmup > 0 { calls as f64 / total_ticks_with_warmup as f64 * 100.0 } else { 0.0 };
 
-            // Comparison delta
-            let delta = if let Some(prev_total) = prev_timings.get(name) {
-                let change = total - prev_total;
-                let pct_change = if *prev_total > 0.0 { change / prev_total * 100.0 } else { 0.0 };
-                let emoji = if change < -0.01 { "🟢" } else if change > 0.01 { "🔴" } else { "⚪" };
-                format!("<td style='color:{}'>{:.1}ms ({}){:+.1}%</td>",
-                    if change < 0.0 { "#0f0" } else if change > 0.0 { "#f44" } else { "#aaa" },
-                    change, emoji, pct_change)
-            } else {
-                "<td style='color:#888'>new</td>".to_string()
-            };
+            // Previous per-system object (full: total/avg/calls/p50/p90/p99), or
+            // None if this system is new / the previous report lacks it.
+            let prev = prev_timings.get(name);
+            let prev_total: Option<f64> = prev.and_then(|p| p.get("total_ms")).and_then(|v| v.as_f64());
+            let prev_avg: Option<f64> = prev.and_then(|p| p.get("avg_ms")).and_then(|v| v.as_f64());
+            let prev_calls: Option<f64> = prev.and_then(|p| p.get("call_count")).and_then(|v| v.as_f64());
+            let prev_p50: Option<f64> = prev.and_then(|p| p.get("p50_ms")).and_then(|v| v.as_f64());
+            let prev_p90: Option<f64> = prev.and_then(|p| p.get("p90_ms")).and_then(|v| v.as_f64());
+            let prev_p99: Option<f64> = prev.and_then(|p| p.get("p99_ms")).and_then(|v| v.as_f64());
+            // % of Ticks delta reconstructed with the previous report's own denominator.
+            let prev_pct: Option<f64> = prev_calls.and_then(|pc| {
+                if prev_total_ticks_with_warmup > 0.0 { Some(pc / prev_total_ticks_with_warmup * 100.0) } else { None }
+            });
 
-            format!("<tr><td>{}</td><td>{:.1}</td><td>{:.3}</td><td>{}</td><td>{:.0}%</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td>{}</tr>",
-                name, total, avg, calls, pct, p50, p90, p99, delta)
+            // Total cell: flag the system "new" when it's absent from the previous report.
+            let total_cell = match prev_total {
+                Some(_) => cell_delta(&format!("{:.1}", total), total, prev_total, "ms", 0.01),
+                None => format!("<td><span style='color:#888'>{:.1} <i>new</i></span></td>", total),
+            };
+            let avg_cell = cell_delta(&format!("{:.3}", avg), avg, prev_avg, "ms", 0.001);
+            let calls_cell = cell_delta(&format!("{}", calls), calls as f64, prev_calls, "", 0.5);
+            let pct_cell = cell_delta(&format!("{:.0}%", pct), pct, prev_pct, "", 0.5);
+            let p50_cell = cell_delta(&format!("{:.3}", p50), p50, prev_p50, "ms", 0.001);
+            let p90_cell = cell_delta(&format!("{:.3}", p90), p90, prev_p90, "ms", 0.001);
+            let p99_cell = cell_delta(&format!("{:.3}", p99), p99, prev_p99, "ms", 0.001);
+
+            format!("<tr><td>{}</td>{total_cell}{avg_cell}{calls_cell}{pct_cell}{p50_cell}{p90_cell}{p99_cell}</tr>", name)
         }).collect::<Vec<_>>().join("\n      ")
     } else {
-        "<tr><td colspan='9'>Debug stats not available</td></tr>".to_string()
+        "<tr><td colspan='8'>Debug stats not available</td></tr>".to_string()
     };
 
     // System bar chart SVG (sorted by total_ms descending, same as table)
@@ -954,22 +1194,21 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         }
     };
 
-    // Microbenchmark table rows
-    let prev_micro_timings: std::collections::HashMap<String, f64> = prev_json
+    // Microbenchmark table rows. Previous per-bench object kept for per-column
+    // deltas (mean/min/median/p99, field-presence: older reports only have
+    // mean_ns, so their min/median/p99 cells render without a delta).
+    let prev_micro: std::collections::HashMap<String, &serde_json::Value> = prev_json
         .get("microbenchmarks")
         .and_then(|mb| mb.get("benchmarks"))
         .and_then(|b| b.as_array())
         .map(|arr| {
-            let mut map = std::collections::HashMap::new();
-            for b in arr {
-                if let (Some(id), Some(mean)) = (
-                    b.get("id").and_then(|v| v.as_str()),
-                    b.get("mean_ns").and_then(|v| v.as_f64()),
-                ) {
-                    map.insert(id.to_string(), mean);
-                }
-            }
-            map
+            arr.iter()
+                .filter_map(|b| {
+                    b.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| (id.to_string(), b))
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -977,32 +1216,26 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         let mb = &results.summary["microbenchmarks"];
         if let Some(benchmarks) = mb.get("benchmarks").and_then(|b| b.as_array()) {
             if benchmarks.is_empty() {
-                "<tr><td colspan='6'>No microbenchmark data</td></tr>".to_string()
+                "<tr><td colspan='8'>No microbenchmark data</td></tr>".to_string()
             } else {
                 benchmarks.iter().map(|b| {
                     let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                     let mean_ns = b.get("mean_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let mean_ms = mean_ns / 1_000_000.0;
                     let std_dev_ns = b.get("std_dev_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let std_ms = std_dev_ns / 1_000_000.0;
+                    let min_ns = b.get("min_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let median_ns = b.get("median_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p99_ns = b.get("p99_ns").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let n = b.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
                     let group = b.get("group").and_then(|v| v.as_str()).unwrap_or("");
 
-                    // Comparison delta
-                    let delta = if let Some(prev_ns) = prev_micro_timings.get(id) {
-                        let change = mean_ns - prev_ns;
-                        let pct = if *prev_ns > 0.0 { change / prev_ns * 100.0 } else { 0.0 };
-                        let emoji = if change < -0.01 { "🟢" } else if change > 0.01 { "🔴" } else { "⚪" };
-                        let change_ms = change / 1_000_000.0;
-                        format!("<td style='color:{}'>{:.2}ms ({}){:+.1}%</td>",
-                            if change < 0.0 { "#0f0" } else if change > 0.0 { "#f44" } else { "#aaa" },
-                            change_ms, emoji, pct)
-                    } else {
-                        "<td style='color:#888'>new</td>".to_string()
-                    };
+                    // Per-column deltas (lower is better), each in its own unit.
+                    let prev = prev_micro.get(id);
+                    let mean_d = micro_delta_ns(mean_ns, prev.and_then(|p| p.get("mean_ns").and_then(|v| v.as_f64())));
+                    let min_d = micro_delta_ns(min_ns, prev.and_then(|p| p.get("min_ns").and_then(|v| v.as_f64())));
+                    let median_d = micro_delta_ns(median_ns, prev.and_then(|p| p.get("median_ns").and_then(|v| v.as_f64())));
+                    let p99_d = micro_delta_ns(p99_ns, prev.and_then(|p| p.get("p99_ns").and_then(|v| v.as_f64())));
 
                     let group_color = match group {
-                        "spatial_hash" => "rgba(255,165,0,0.2)",
                         "ecs" => "rgba(0,255,136,0.2)",
                         "systems" => "rgba(255,102,0,0.2)",
                         "map" => "rgba(102,204,255,0.2)",
@@ -1011,12 +1244,18 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
                         _ => "rgba(255,255,255,0.05)",
                     };
 
-                    format!("<tr style='background:{}'><td>{}</td><td>{:.3}ms</td><td>±{:.3}ms</td><td>{}</td><td>{}</td>{}</tr>",
-                        group_color, id, mean_ms, std_ms, n, group, delta)
+                    format!("<tr style='background:{}'><td>{}</td><td>{}{}</td><td>±{}</td><td>{}{}</td><td>{}{}</td><td>{}{}</td><td>{}</td><td>{}</td></tr>",
+                        group_color, id,
+                        fmt_ns(mean_ns), mean_d,
+                        fmt_ns(std_dev_ns),
+                        fmt_ns(min_ns), min_d,
+                        fmt_ns(median_ns), median_d,
+                        fmt_ns(p99_ns), p99_d,
+                        n, group)
                 }).collect::<Vec<_>>().join("\n      ")
             }
         } else {
-            "<tr><td colspan='6'>No microbenchmark data</td></tr>".to_string()
+            "<tr><td colspan='8'>No microbenchmark data</td></tr>".to_string()
         }
     };
 
@@ -1026,6 +1265,48 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         .and_then(|mb| mb.get("count"))
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
+
+    // Configuration-section strings (item 4.1). Field-presence: older reports
+    // without these config keys still render a sensible value.
+    let measured_runs_cfg: u64 = results
+        .summary
+        .get("config")
+        .and_then(|c| c.get("measured_runs"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(MEASURED_RUNS as u64);
+    let measured_runs_str = measured_runs_cfg.to_string();
+    let warmup_ticks_str: String = results
+        .summary
+        .get("config")
+        .and_then(|c| c.get("warmup_ticks"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(BENCH_WARMUP_TICKS)
+        .to_string();
+    let detailed_systems_str: String = match results
+        .summary
+        .get("config")
+        .and_then(|c| c.get("detailed_systems"))
+        .and_then(|v| v.as_array())
+    {
+        Some(arr) if !arr.is_empty() => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "—".to_string(),
+    };
+    let bench_prev_str: String = match prev_html {
+        Some(p) => p.to_string(),
+        None => "— (no --bench-prev)".to_string(),
+    };
+    let prev_seed_ticks_str: String = (|| {
+        let cfg = prev_json.get("config")?;
+        let seed = cfg.get("seed").and_then(|v| v.as_f64())?;
+        let ticks = cfg.get("ticks").and_then(|v| v.as_f64())?;
+        Some(format!("{:.0} / {:.0}", seed, ticks))
+    })()
+    .unwrap_or_else(|| "—".to_string());
+    let ticks_measured = format!("{} × {}", measured_runs_cfg, tick_count);
 
     // Pie chart data: top systems by total_ms
     let (pie_labels, pie_data) = if let Some(systems) = system_timings.as_array() {
@@ -1089,6 +1370,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         .chart-container {{ background: rgba(255,255,255,0.03); border-radius: 8px; padding: 15px; margin: 10px 0; }}
         pre {{ background:#111;padding:15px;border-radius:8px;overflow:auto;font-size:11px;max-height:400px; }}
         .note {{ color: #888; font-size: 12px; font-style: italic; margin-top: 5px; }}
+        .delta {{ font-size: 10px; line-height: 1.1; margin-top: 1px; }}
     </style>
 </head>
 <body>
@@ -1105,33 +1387,52 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             <tr><td>Initial units</td><td>{units_initial}</td></tr>
             <tr><td>Ticks</td><td>{ticks}</td></tr>
             <tr><td>Seed</td><td>{seed}</td></tr>
+            <tr><td>Measured runs</td><td>{measured_runs_str} (per-tick series averaged; latency/overhead over all {measured_runs_str}×{ticks} ticks)</td></tr>
+            <tr><td>Warmup ticks</td><td>{warmup_ticks_str} (discarded)</td></tr>
+            <tr><td>Detailed systems</td><td>{detailed_systems_str}</td></tr>
+            <tr><td>Compared against</td><td>{bench_prev_str}</td></tr>
+            <tr><td>Previous seed / ticks</td><td>{prev_seed_ticks_str}</td></tr>
         </table>
 
         <h2>Summary</h2>
+
+        <h3>Tick Latency (per tick)</h3>
         <div class="metrics">
             <div class="metric"><div class="value">{avg_tick:.3}ms{avg_tick_delta}</div><div class="label">Avg Tick</div></div>
-            <div class="metric"><div class="value">{wall_time:.1}ms</div><div class="label">Total Wall Time</div></div>
-            <div class="metric"><div class="value">{min_tick:.3}ms</div><div class="label">Min Tick</div></div>
-            <div class="metric"><div class="value">{max_tick:.3}ms</div><div class="label">Max Tick</div></div>
             <div class="metric"><div class="value">{p50:.3}ms{p50_delta}</div><div class="label">P50</div></div>
             <div class="metric"><div class="value">{p90:.3}ms{p90_delta}</div><div class="label">P90</div></div>
             <div class="metric"><div class="value">{p95:.3}ms{p95_delta}</div><div class="label">P95</div></div>
             <div class="metric"><div class="value">{p99:.3}ms{p99_delta}</div><div class="label">P99</div></div>
-            <div class="metric"><div class="value">{units_remaining}</div><div class="label">Units Remaining</div></div>
-            <div class="metric"><div class="value">{units_recruited}</div><div class="label">Total Recruited</div></div>
+            <div class="metric"><div class="value">{min_tick:.3}ms{min_tick_delta}</div><div class="label">Min Tick</div></div>
+            <div class="metric"><div class="value">{max_tick:.3}ms{max_tick_delta}</div><div class="label">Max Tick</div></div>
         </div>
 
-        <h3>Tick Composition</h3>
+        <h3>Total / Throughput</h3>
+        <div class="metrics">
+            <div class="metric"><div class="value">{wall_time:.1}ms{wall_time_delta}</div><div class="label">Total Wall Time</div></div>
+            <div class="metric"><div class="value">{ticks_measured}</div><div class="label">Ticks Measured</div></div>
+        </div>
+
+        <h3>Tick Composition (per tick)</h3>
         <div class="metrics">
             <div class="metric"><div class="value">{avg_system:.3}ms{avg_system_delta}</div><div class="label">Avg System Time</div></div>
-            <div class="metric"><div class="value">{avg_spatial_hash:.3}ms</div><div class="label">Avg Spatial Hash</div></div>
-            <div class="metric"><div class="value">{avg_movers:.0}</div><div class="label">Avg Movers/Tick</div></div>
-            <div class="metric"><div class="value">{avg_combats:.0}</div><div class="label">Avg Combats/Tick</div></div>
             <div class="metric"><div class="value">{avg_overhead:.3}ms{avg_overhead_delta}</div><div class="label">Avg Overhead</div></div>
-            <div class="metric"><div class="value">{overhead_p95:.3}ms</div><div class="label">Overhead P95</div></div>
-            <div class="metric"><div class="value">{overhead_p99:.3}ms</div><div class="label">Overhead P99</div></div>
+            <div class="metric"><div class="value">{overhead_p50:.3}ms{overhead_p50_delta}</div><div class="label">Overhead P50</div></div>
+            <div class="metric"><div class="value">{overhead_p95:.3}ms{overhead_p95_delta}</div><div class="label">Overhead P95</div></div>
+            <div class="metric"><div class="value">{overhead_p99:.3}ms{overhead_p99_delta}</div><div class="label">Overhead P99</div></div>
         </div>
         <p class="note">Overhead = tick time − sum of all system times (archetype rebuild, query setup, entity spawning, debug guard)</p>
+        <p class="note">Per-tick cards are averages across the {measured_runs_str} measured runs. Total Wall Time is the sum over all {measured_runs_str} runs. Latency percentiles are computed over all {measured_runs_str}×{ticks} individual ticks, not the averaged series.</p>
+
+        <h3>Battle Activity</h3>
+        <div class="metrics">
+            <div class="metric"><div class="value">{units_remaining}{units_remaining_delta}</div><div class="label">Units Remaining</div></div>
+            <div class="metric"><div class="value">{units_recruited}{units_recruited_delta}</div><div class="label">Total Recruited</div></div>
+            <div class="metric"><div class="value">{deaths_per_tick:.2}{deaths_per_tick_delta}</div><div class="label">Deaths/Tick*</div></div>
+            <div class="metric"><div class="value">{avg_movers:.0}{avg_movers_delta}</div><div class="label">Avg Movers/Tick</div></div>
+            <div class="metric"><div class="value">{avg_combats:.0}{avg_combats_delta}</div><div class="label">Avg Combats/Tick</div></div>
+        </div>
+        <p class="note">*Deaths/Tick derived: (initial + recruited − remaining) / ticks — assumes units only leave via combat death.</p>
 
         <h2>Per-Tick Timing</h2>
         <div class="chart-container"><canvas id="tickChart" height="120"></canvas></div>
@@ -1148,7 +1449,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         <table>
             <thead><tr>
                 <th>System</th><th>Total (ms)</th><th>Avg/Call</th><th>Calls</th>
-                <th>% of Ticks</th><th>P50</th><th>P90</th><th>P99</th><th>Delta (prev)</th>
+                <th>% of Ticks</th><th>P50</th><th>P90</th><th>P99</th>
             </tr></thead>
             <tbody>
       {system_rows}
@@ -1177,8 +1478,9 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         <p class="note">{microbench_count} isolated benchmarks measuring specific operations and systems</p>
         <table>
             <thead><tr>
-                <th>Benchmark</th><th>Mean</th><th>Std Dev</th><th>Iterations</th>
-                <th>Group</th><th>Delta (prev)</th>
+                <th>Benchmark</th><th>Mean</th><th>Std Dev</th><th>Min</th>
+                <th>Median</th><th>P99</th><th>Iterations</th>
+                <th>Group</th>
             </tr></thead>
             <tbody>
       {microbench_rows}
@@ -1321,21 +1623,39 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         p95_delta = p95_delta,
         p99 = p99,
         p99_delta = p99_delta,
+        wall_time_delta = wall_time_delta,
+        min_tick_delta = min_tick_delta,
+        max_tick_delta = max_tick_delta,
         units_initial = units_initial,
         units_recruited = units_recruited,
+        units_recruited_delta = units_recruited_delta,
         units_remaining = units_remaining,
+        units_remaining_delta = units_remaining_delta,
         cities = cities,
         units_per_city = units_per_city,
         ticks = tick_count,
         avg_system = avg_system,
         avg_system_delta = avg_system_delta,
-        avg_spatial_hash = avg_spatial_hash,
         avg_movers = avg_movers,
+        avg_movers_delta = avg_movers_delta,
         avg_combats = avg_combats,
+        avg_combats_delta = avg_combats_delta,
+        deaths_per_tick = deaths_per_tick,
+        deaths_per_tick_delta = deaths_per_tick_delta,
         avg_overhead = avg_overhead,
         avg_overhead_delta = avg_overhead_delta,
+        overhead_p50 = overhead_p50,
+        overhead_p50_delta = overhead_p50_delta,
         overhead_p95 = overhead_p95,
+        overhead_p95_delta = overhead_p95_delta,
         overhead_p99 = overhead_p99,
+        overhead_p99_delta = overhead_p99_delta,
+        measured_runs_str = measured_runs_str,
+        warmup_ticks_str = warmup_ticks_str,
+        detailed_systems_str = detailed_systems_str,
+        bench_prev_str = bench_prev_str,
+        prev_seed_ticks_str = prev_seed_ticks_str,
+        ticks_measured = ticks_measured,
         system_rows = system_rows,
         system_bars = system_bars,
         svg_height = svg_height_val,
@@ -1378,10 +1698,14 @@ fn make_unit_types() -> Vec<UnitType> {
 }
 
 /// Parse a previous HTML benchmark report to extract system timings for comparison.
-/// Extracts the JSON from the <pre> tag and reads system_timings + latency.
+/// Extracts the JSON from the <pre> tag. Returns (system name -> full per-system
+/// object with total/avg/calls/p50/p90/p99, the whole parsed JSON).
 fn parse_previous_report(
     path: &str,
-) -> (std::collections::HashMap<String, f64>, serde_json::Value) {
+) -> (
+    std::collections::HashMap<String, serde_json::Value>,
+    serde_json::Value,
+) {
     use std::collections::HashMap;
 
     let content = match std::fs::read_to_string(path) {
@@ -1414,11 +1738,8 @@ fn parse_previous_report(
     let mut timings = HashMap::new();
     if let Some(systems) = json.get("system_timings").and_then(|s| s.as_array()) {
         for system in systems {
-            if let (Some(name), Some(total)) = (
-                system.get("name").and_then(|n| n.as_str()),
-                system.get("total_ms").and_then(|t| t.as_f64()),
-            ) {
-                timings.insert(name.to_string(), total);
+            if let Some(name) = system.get("name").and_then(|n| n.as_str()) {
+                timings.insert(name.to_string(), system.clone());
             }
         }
     }

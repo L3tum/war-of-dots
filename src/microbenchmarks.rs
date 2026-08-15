@@ -35,6 +35,12 @@ pub struct MicrobenchmarkResult {
     pub std_dev_ns: f64,
     /// Median time in nanoseconds.
     pub median_ns: f64,
+    /// Minimum (best-case, least clock noise) time in nanoseconds.
+    pub min_ns: f64,
+    /// 90th percentile time in nanoseconds.
+    pub p90_ns: f64,
+    /// 99th percentile time in nanoseconds.
+    pub p99_ns: f64,
     /// Number of iterations.
     pub n: u32,
 }
@@ -55,8 +61,8 @@ struct BenchConfig {
 impl Default for BenchConfig {
     fn default() -> Self {
         Self {
-            warmup: 5,
-            timed: 25,
+            warmup: 25,
+            timed: 100,
         }
     }
 }
@@ -65,14 +71,27 @@ impl BenchConfig {
     /// Higher iteration count for fast operations (< 20 µs) to beat clock noise.
     fn fast() -> Self {
         Self {
-            warmup: 10,
-            timed: 50,
+            warmup: 50,
+            timed: 200,
         }
     }
 }
 
-/// Compute basic statistics from a list of durations.
-fn compute_stats(durations: &[Duration]) -> (f64, f64, f64) {
+/// Timing statistics computed from a list of durations.
+#[derive(Clone, Copy)]
+struct BenchStats {
+    mean: f64,
+    std_dev: f64,
+    median: f64,
+    min: f64,
+    p90: f64,
+    p99: f64,
+}
+
+/// Compute basic statistics from a list of durations (mean, population std,
+/// median, min and p90/p99). Percentiles use the same nearest-rank index math
+/// as `benchmark::percentile` for consistency with the battle-benchmark latency.
+fn compute_stats(durations: &[Duration]) -> BenchStats {
     let n = durations.len() as f64;
     let ns: Vec<f64> = durations.iter().map(|d| d.as_nanos() as f64).collect();
     let sum: f64 = ns.iter().sum();
@@ -83,6 +102,7 @@ fn compute_stats(durations: &[Duration]) -> (f64, f64, f64) {
 
     let mut sorted = ns.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = sorted.first().copied().unwrap_or(0.0);
     let median = if n % 2.0 == 0.0 {
         let mid = (n / 2.0) as usize;
         (sorted[mid - 1] + sorted[mid]) / 2.0
@@ -90,7 +110,23 @@ fn compute_stats(durations: &[Duration]) -> (f64, f64, f64) {
         sorted[(n / 2.0) as usize]
     };
 
-    (mean, std_dev, median)
+    BenchStats {
+        mean,
+        std_dev,
+        median,
+        min,
+        p90: percentile_ns(&sorted, 90),
+        p99: percentile_ns(&sorted, 99),
+    }
+}
+
+/// Nearest-rank percentile over a pre-sorted (ascending) slice of ns values.
+fn percentile_ns(sorted: &[f64], p: u32) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((p as f64 / 100.0) * (sorted.len() - 1) as f64) as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 /// Run a benchmark with warmup + timed iterations.
@@ -99,14 +135,16 @@ fn run_bench(
     setup: impl Fn(),
     bench_fn: impl FnMut(),
 ) -> MicrobenchmarkResult {
-    // Warmup
+    let mut f = bench_fn;
+    // Warmup — run the bench body too (not just setup) so the timed operation
+    // isn't measuring a cold start.
     for _ in 0..config.warmup {
         setup();
+        f();
     }
 
     // Timed iterations
     let mut durations = Vec::with_capacity(config.timed);
-    let mut f = bench_fn;
     for _ in 0..config.timed {
         setup();
         let start = Instant::now();
@@ -115,11 +153,14 @@ fn run_bench(
         durations.push(elapsed);
     }
 
-    let (mean, std_dev, median) = compute_stats(&durations);
+    let stats = compute_stats(&durations);
     MicrobenchmarkResult {
-        mean_ns: mean,
-        std_dev_ns: std_dev,
-        median_ns: median,
+        mean_ns: stats.mean,
+        std_dev_ns: stats.std_dev,
+        median_ns: stats.median,
+        min_ns: stats.min,
+        p90_ns: stats.p90,
+        p99_ns: stats.p99,
         n: durations.len() as u32,
         ..MicrobenchmarkResult::default_empty()
     }
@@ -156,11 +197,14 @@ where
         durations.push(elapsed);
     }
 
-    let (mean, std_dev, median) = compute_stats(&durations);
+    let stats = compute_stats(&durations);
     MicrobenchmarkResult {
-        mean_ns: mean,
-        std_dev_ns: std_dev,
-        median_ns: median,
+        mean_ns: stats.mean,
+        std_dev_ns: stats.std_dev,
+        median_ns: stats.median,
+        min_ns: stats.min,
+        p90_ns: stats.p90,
+        p99_ns: stats.p99,
         n: durations.len() as u32,
         ..MicrobenchmarkResult::default_empty()
     }
@@ -186,6 +230,9 @@ fn run_bench_cumulative(
         mean_ns: result.mean_ns / repeats as f64,
         std_dev_ns: result.std_dev_ns / repeats as f64,
         median_ns: result.median_ns / repeats as f64,
+        min_ns: result.min_ns / repeats as f64,
+        p90_ns: result.p90_ns / repeats as f64,
+        p99_ns: result.p99_ns / repeats as f64,
         n: result.n,
         ..result
     }
@@ -214,6 +261,9 @@ where
         mean_ns: result.mean_ns / repeats as f64,
         std_dev_ns: result.std_dev_ns / repeats as f64,
         median_ns: result.median_ns / repeats as f64,
+        min_ns: result.min_ns / repeats as f64,
+        p90_ns: result.p90_ns / repeats as f64,
+        p99_ns: result.p99_ns / repeats as f64,
         n: result.n,
         ..result
     }
@@ -227,6 +277,9 @@ impl MicrobenchmarkResult {
             mean_ns: 0.0,
             std_dev_ns: 0.0,
             median_ns: 0.0,
+            min_ns: 0.0,
+            p90_ns: 0.0,
+            p99_ns: 0.0,
             n: 0,
         }
     }
@@ -1410,19 +1463,36 @@ pub fn run_microbenchmarks() -> Vec<MicrobenchmarkResult> {
 }
 
 fn print_result(r: &MicrobenchmarkResult) {
-    let mean_us = r.mean_ns / 1000.0;
-    let std_us = r.std_dev_ns / 1000.0;
-    if mean_us < 1000.0 {
-        println!(
-            "  {:<40} {:>10.2}µs ± {:.2}µs  ({} iters)",
-            r.id, mean_us, std_us, r.n
-        );
+    // Sub-µs ops: lead with min (best case, least clock noise); otherwise lead
+    // with mean. Sub-ms ops render in µs, larger ones in ms.
+    let sub_us = r.mean_ns < 1000.0;
+    if r.mean_ns < 1_000_000.0 {
+        if sub_us {
+            println!(
+                "  {:<40} {:>4} {:>9.1}ns  (med {:.1}, mean {:.1})  ({} iters)",
+                r.id, "min", r.min_ns, r.median_ns, r.mean_ns, r.n
+            );
+        } else {
+            println!(
+                "  {:<40} {:>4} {:>9.2}µs (min {:.1}µs, med {:.2}µs) ± {:.2}µs  ({} iters)",
+                r.id,
+                "mean",
+                r.mean_ns / 1000.0,
+                r.min_ns / 1000.0,
+                r.median_ns / 1000.0,
+                r.std_dev_ns / 1000.0,
+                r.n
+            );
+        }
     } else {
         println!(
-            "  {:<40} {:>10.2}ms ± {:.2}ms  ({} iters)",
+            "  {:<40} {:>4} {:>9.3}ms (min {:.3}ms, med {:.3}ms) ± {:.3}ms  ({} iters)",
             r.id,
-            mean_us / 1000.0,
-            std_us / 1000.0,
+            "mean",
+            r.mean_ns / 1e6,
+            r.min_ns / 1e6,
+            r.median_ns / 1e6,
+            r.std_dev_ns / 1e6,
             r.n
         );
     }
@@ -1437,6 +1507,9 @@ pub fn results_to_json(results: &[MicrobenchmarkResult]) -> serde_json::Value {
             "mean_ns": r.mean_ns,
             "std_dev_ns": r.std_dev_ns,
             "median_ns": r.median_ns,
+            "min_ns": r.min_ns,
+            "p90_ns": r.p90_ns,
+            "p99_ns": r.p99_ns,
             "n": r.n,
         })).collect::<Vec<_>>(),
         "count": results.len()

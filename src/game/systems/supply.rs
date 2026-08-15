@@ -198,7 +198,9 @@ pub fn run(
         if stats.men <= 0.0 {
             continue;
         }
-        let ut = unit_types_index.get(&utype.name).map(|&i| &settings.unit_types[i]);
+        let ut = unit_types_index
+            .get(&utype.name)
+            .map(|&i| &settings.unit_types[i]);
         let base_attrition = ut.map(|u| u.base_attrition).unwrap_or(1.0);
 
         // IMPORTANT: `ratio` is computed from the PRE-wear, untouched equipment,
@@ -696,7 +698,13 @@ mod tests {
         s.max_men = 1000.0;
 
         let manpower = |w: &World, we: hecs::Entity| -> u32 {
-            w.world_data(we).unwrap().funds.manpower.get("P1").copied().unwrap()
+            w.world_data(we)
+                .unwrap()
+                .funds
+                .manpower
+                .get("P1")
+                .copied()
+                .unwrap()
         };
 
         let mut scratch = SupplyScratch::new();
@@ -710,9 +718,23 @@ mod tests {
 
         // Two ticks on the SAME scratch (mirrors Game's persistent scratch).
         let ctx = TickContext::build_full(&world, world_entity);
-        let _ = run(&mut world, world_entity, &settings, &mut scratch, &ctx, &ut_index);
+        let _ = run(
+            &mut world,
+            world_entity,
+            &settings,
+            &mut scratch,
+            &ctx,
+            &ut_index,
+        );
         let ctx2 = TickContext::build_full(&world, world_entity);
-        let _ = run(&mut world, world_entity, &settings, &mut scratch, &ctx2, &ut_index);
+        let _ = run(
+            &mut world,
+            world_entity,
+            &settings,
+            &mut scratch,
+            &ctx2,
+            &ut_index,
+        );
 
         let end = manpower(&world, world_entity);
         // 2 ticks × 1 manpower = 2. With the carry-over bug it would be 3.
