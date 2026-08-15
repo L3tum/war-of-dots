@@ -114,10 +114,31 @@ pub struct Game {
     /// Number of engaged pairs in the most recent tick (from combat.rs).
     /// Used by benchmark/status reporting to gauge combat activity.
     last_engaged_pairs: usize,
+    /// Persistent "units_by_player no longer matches the ECS" flag — set by
+    /// movement, unit death, and recruitment; cleared only when a rebuild
+    /// actually runs. (Not part of the per-tick ctx_dirty, which is reset at
+    /// the top of every tick and would lose sets made between ticks or after
+    /// the rebuild point.)
+    units_by_player_stale: bool,
     /// Persisted TickContext, built once and updated incrementally.
     ctx: TickContext,
     /// Tracks which TickContext fields need updating this tick.
     ctx_dirty: TickContextDirty,
+    /// Persistent "game state changed since last influence run" flag. Set by
+    /// movement, city capture, unit death, successful recruitment, and
+    /// assign_city_owner. Cleared only when influence actually runs. NOT part
+    /// of the per-tick ctx_dirty (which is reset at the top of every tick).
+    influence_dirty: bool,
+    /// Set when influence runs, cleared when encirclement runs. Encirclement's
+    /// inputs (borders grids, cities, units_by_player) only change via an
+    /// influence run, so this is a faithful "encirclement inputs changed since
+    /// last run" signal. Invariants: (i) every cities_changed source also sets
+    /// influence_dirty; (ii) CITY_CAPTURE_TICK_INTERVAL % INFLUENCE_TICK_INTERVAL
+    /// == 0, so the influence block always services a change before the
+    /// encirclement block in the same tick.
+    encirclement_dirty: bool,
+    /// Pre-allocated influence scratch, cleared and reused each influence run.
+    influence_scratch: systems::influence::InfluenceScratch,
 }
 
 /// Neighbour-graph snapshot: how nearby_enemies left the world this tick.
@@ -191,12 +212,13 @@ pub struct TickContext {
 }
 
 /// Tracks which TickContext fields need updating this tick.
+/// NOTE: only holds intra-tick signals (set and consumed within the same
+/// tick_game). Cross-tick dirtiness (units_by_player, influence) lives in
+/// persistent Game fields that are cleared on consumption, not by this reset.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TickContextDirty {
     /// Set when city_capture reports ownership changes → clone cities
     pub cities_changed: bool,
-    /// Set after movement → rebuild units_by_player just-in-time before influence/encirclement
-    pub units_by_player_stale: bool,
 }
 
 impl TickContext {
@@ -417,6 +439,10 @@ impl Game {
             last_engaged_pairs: 0,
             ctx,
             ctx_dirty: TickContextDirty::default(),
+            units_by_player_stale: false,
+            influence_dirty: true,
+            encirclement_dirty: true,
+            influence_scratch: systems::influence::InfluenceScratch::new(),
         }
     }
 
@@ -434,6 +460,18 @@ impl Game {
     #[allow(dead_code)]
     pub fn last_engaged_pairs(&self) -> usize {
         self.last_engaged_pairs
+    }
+
+    /// Test-only: expose the persistent influence dirty flag.
+    #[cfg(test)]
+    pub fn influence_dirty_for_test(&self) -> bool {
+        self.influence_dirty
+    }
+
+    /// Test-only: total number of units grouped in ctx.units_by_player.
+    #[cfg(test)]
+    pub fn ctx_unit_count_for_test(&self) -> usize {
+        self.ctx.units_by_player.values().map(|v| v.len()).sum()
     }
 
     /// Snapshot of the neighbour graph as spatialty left it this tick.
@@ -546,7 +584,8 @@ impl Game {
         // Owner map: always current (updated incrementally in recruit_unit).
         // units_by_player: only rebuild on consumer ticks AND only if positions changed.
         if mover_count > 0 {
-            self.ctx_dirty.units_by_player_stale = true;
+            self.units_by_player_stale = true;
+            self.influence_dirty = true;
         }
         let is_consumer_tick = self
             .tick
@@ -554,10 +593,10 @@ impl Game {
             || self
                 .tick
                 .is_multiple_of(super::constants::CITY_CAPTURE_TICK_INTERVAL);
-        if is_consumer_tick && self.ctx_dirty.units_by_player_stale {
+        if is_consumer_tick && self.units_by_player_stale {
             tick_system!("tickcontext", &mut self.world, self.world_entity, {
                 self.ctx.rebuild_units_by_player(&self.world);
-                self.ctx_dirty.units_by_player_stale = false;
+                self.units_by_player_stale = false;
             });
         }
 
@@ -619,6 +658,7 @@ impl Game {
         );
         if !cities_changed.is_empty() {
             self.ctx_dirty.cities_changed = true;
+            self.influence_dirty = true;
         }
 
         // Influence: merged vision + border in one pass (every INFLUENCE_TICK_INTERVAL ticks)
@@ -631,13 +671,24 @@ impl Game {
                 self.ctx.update_cities(&self.world, self.world_entity);
                 self.ctx_dirty.cities_changed = false;
             }
-            let ctx = &self.ctx;
-            tick_system!(
-                "influence",
-                &mut self.world,
-                self.world_entity,
-                systems::influence::run(&mut self.world, ctx, self.tick)
-            );
+            if self.influence_dirty {
+                let ctx = &self.ctx;
+                tick_system!(
+                    "influence",
+                    &mut self.world,
+                    self.world_entity,
+                    systems::influence::run(
+                        &mut self.world,
+                        ctx,
+                        self.tick,
+                        &mut self.influence_scratch,
+                        true
+                    )
+                );
+                self.influence_dirty = false;
+                self.encirclement_dirty = true; // encirclement inputs changed
+            }
+            // else: skip compute + allocations; existing Arcs stay valid
         }
 
         // Encirclement: only every CITY_CAPTURE_TICK_INTERVAL ticks (strategic, not tactical)
@@ -645,18 +696,20 @@ impl Game {
             .tick
             .is_multiple_of(super::constants::CITY_CAPTURE_TICK_INTERVAL)
         {
-            // Update cities before encirclement reads them if they changed
-            if self.ctx_dirty.cities_changed {
-                self.ctx.update_cities(&self.world, self.world_entity);
-                self.ctx_dirty.cities_changed = false;
+            // NOTE: cities_changed is always serviced by the influence block above
+            // (30 % 3 == 0 ⇒ every encirclement tick is an influence tick that ran
+            // first), so it is always false here.
+            debug_assert!(!self.ctx_dirty.cities_changed);
+            if self.encirclement_dirty {
+                let ctx = &self.ctx;
+                tick_system!(
+                    "encirclement",
+                    &mut self.world,
+                    self.world_entity,
+                    systems::encirclement::run(&mut self.world, ctx, self.tick)
+                );
+                self.encirclement_dirty = false;
             }
-            let ctx = &self.ctx;
-            tick_system!(
-                "encirclement",
-                &mut self.world,
-                self.world_entity,
-                systems::encirclement::run(&mut self.world, ctx, self.tick)
-            );
         }
 
         // Surrender: only every 30 ticks
@@ -680,7 +733,7 @@ impl Game {
             .chain(surrender_dead)
             .collect();
 
-        let _death_count = tick_system!(
+        let death_count = tick_system!(
             "death_cleanup",
             &mut self.world,
             self.world_entity,
@@ -688,7 +741,14 @@ impl Game {
         );
 
         // Dead entities are despawned from the ECS — stale owner map entries are
-        // harmless since they won't appear in ECS queries.
+        // harmless since they won't appear in ECS queries. But dead units still
+        // sit in ctx.units_by_player until a rebuild — force one on the next
+        // consumer tick and mark influence stale so the grids don't keep
+        // projecting dead units (staleness fix).
+        if death_count > 0 {
+            self.units_by_player_stale = true;
+            self.influence_dirty = true;
+        }
 
         self.track_unit_losses();
 
@@ -761,6 +821,11 @@ impl Game {
             idx
         };
         self.ctx.owner_id_by_entity.insert(entity, player_idx);
+
+        // New unit isn't in ctx.units_by_player yet — force a rebuild on the
+        // next consumer tick and mark influence stale (staleness fix).
+        self.units_by_player_stale = true;
+        self.influence_dirty = true;
 
         if let Some(player) = self.players.get_mut(owner) {
             player.units.push(unit_id.clone());
@@ -1070,7 +1135,8 @@ impl Game {
 
     /// Assign ownership of a city to a player. Returns true if successful.
     pub fn assign_city_owner(&mut self, city_id: &str, owner: &str) -> bool {
-        self.world
+        let changed = self
+            .world
             .world_data_mut(self.world_entity)
             .map(|wb| {
                 wb.cities
@@ -1080,7 +1146,16 @@ impl Game {
                     .map(|c| c.owner = Some(owner.to_string()))
                     .is_some()
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if changed {
+            // City ownership changed — refresh the ctx snapshot inline (a
+            // ctx_dirty.cities_changed flag set here would be wiped at the top
+            // of the next tick_game) and mark influence stale so the grids
+            // reflect the new owner (staleness fix).
+            self.ctx.update_cities(&self.world, self.world_entity);
+            self.influence_dirty = true;
+        }
+        changed
     }
 
     /// Get map width.
@@ -1140,14 +1215,19 @@ impl Game {
     }
 
     /// Get border grid for a player as 2D Vec<Vec<u32>>[y][x].
-    /// Grids are stored flat internally; this converts for wire protocol compatibility.
+    /// Grids are stored flat as u16 internally; widened to u32 here for wire
+    /// protocol compatibility (the single u16→u32 export seam).
     pub fn border_grid_2d(&self, player_id: &str) -> Option<Vec<Vec<u32>>> {
         let wb = self.world.world_data(self.world_entity)?;
         let w = wb.terrain.width as usize;
         let h = wb.terrain.height as usize;
         wb.borders.grids.get(player_id).map(|flat| {
             (0..h)
-                .map(|y| (0..w).map(|x| flat[y * w + x]).collect())
+                .map(|y| {
+                    (0..w)
+                        .map(|x| flat[y * w + x] as u32)
+                        .collect()
+                })
                 .collect()
         })
     }
@@ -1460,4 +1540,250 @@ impl UnitQueryData {
 
 pub mod systems {
     pub use crate::game::systems::*;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CityUpgradeSettings;
+    use crate::game::components::UnitStats;
+    use crate::game::economy::UnitType;
+    use crate::game::unit::Equipment;
+    use crate::game::world_ext::WorldExt;
+    use crate::map::map::{Map, MapConfig};
+    use std::sync::Arc;
+
+    fn basic_unit_type() -> UnitType {
+        UnitType {
+            name: "infantry".to_string(),
+            symbol: "I".to_string(),
+            men: 1000,
+            equipment: vec![Equipment {
+                name: "rifle".to_string(),
+                count: 100,
+                max_count: 100,
+                cost_per_item: 2.5,
+            }],
+            soft_attack: 5.0,
+            soft_defense: 4.0,
+            hard_attack: 3.0,
+            hard_defense: 2.0,
+            recruitment_cost: 200,
+            max_organisation: 100.0,
+            reinforcement_rate: 5.0,
+            speed: 1.0,
+            base_attrition: 0.5,
+            fighting_attrition: 1.0,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
+            max_supply: 2000,
+        }
+    }
+
+    fn test_settings() -> GameSettings {
+        GameSettings {
+            starting_funds: 1000,
+            initial_manpower: 10_000,
+            funds_per_city: 1.0,
+            recruitment_rate: 1.0,
+            game_speed: 1.0,
+            use_standard_ruleset: true,
+            unit_types: vec![basic_unit_type()],
+            city_upgrade_settings: CityUpgradeSettings::default(),
+            water_speed: 0.5,
+        }
+    }
+
+    fn test_map() -> Map {
+        let config = MapConfig {
+            width: 20,
+            height: 20,
+            cities: vec![(3.0, 3.0), (16.0, 3.0), (3.0, 16.0), (16.0, 16.0)],
+            terrain_data: None,
+        };
+        Map::from_config(&config)
+    }
+
+    fn border_at(game: &Game, player: &str, x: i32, y: i32) -> u32 {
+        game.border_grid_2d(player)
+            .map(|g| g[y as usize][x as usize])
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn recruit_marks_influence_dirty_and_grid_updates() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.start();
+
+        let ut = basic_unit_type();
+        let unit_id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        assert!(game.entity_registry.contains_key(&unit_id));
+
+        // Before any tick: the new unit is not yet grouped, influence is dirty.
+        assert_eq!(game.ctx_unit_count_for_test(), 0);
+        assert!(game.influence_dirty_for_test());
+
+        // Tick to the next multiple of 3: rebuild + influence run.
+        game.tick_game(); // tick 1
+        game.tick_game(); // tick 2
+        game.tick_game(); // tick 3 → consumer tick
+        assert_eq!(game.ctx_unit_count_for_test(), 1, "rebuild must include the recruit");
+        assert!(!game.influence_dirty_for_test());
+        // City at (3,3) + unit at (3,3) project influence ≥ 5.
+        assert!(
+            border_at(&game, "player_0", 3, 3) >= 5,
+            "grid must reflect the recruit + city"
+        );
+    }
+
+    #[test]
+    fn quiet_play_skips_influence() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.start();
+
+        let ut = basic_unit_type();
+        let _unit_id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        // No orders, no combat → nothing moves after the first influence run.
+
+        for _ in 0..3 {
+            game.tick_game();
+        }
+        assert!(!game.influence_dirty_for_test(), "tick 3 must consume the dirt");
+        let snap_3 = game.border_grid_2d("player_0").unwrap();
+        let ptr_3 = Arc::as_ptr(
+            &game
+                .world
+                .world_data(game.world_entity)
+                .unwrap()
+                .borders
+                .grids,
+        ) as *const ();
+
+        for _ in 0..3 {
+            game.tick_game();
+        }
+        assert_eq!(game.tick_number(), 6);
+        assert!(!game.influence_dirty_for_test(), "no changes → must stay clean");
+        assert_eq!(game.border_grid_2d("player_0").unwrap(), snap_3);
+        assert_eq!(
+            Arc::as_ptr(
+                &game
+                    .world
+                    .world_data(game.world_entity)
+                    .unwrap()
+                    .borders
+                    .grids,
+            ) as *const (),
+            ptr_3,
+            "clean tick must not replace the grid Arc"
+        );
+    }
+
+    #[test]
+    fn death_removes_stale_unit_from_ctx_and_grid() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.assign_city_owner("city_1", "player_1");
+        game.start();
+
+        let ut = basic_unit_type();
+        let unit_id = game
+            .recruit_unit("city_0", &ut, "player_0")
+            .expect("recruit");
+        // Walk the unit away from the city so its grid cells are distinguishable.
+        // Unit speed on Plains is 0.1/tick; (3,3)→(10,10) is ~9.9 → ~99 ticks.
+        game.move_troops(&unit_id, "player_0", vec![(10.0, 10.0)]);
+
+        for _ in 0..110 {
+            game.tick_game();
+        }
+        // Unit arrived at (10,10); grid must show its influence there.
+        assert_eq!(border_at(&game, "player_0", 10, 10), 1, "unit influence at (10,10)");
+        assert_eq!(game.ctx_unit_count_for_test(), 1);
+
+        // Force death deterministically: men <= 0 → the surrender sweep (every
+        // 30 ticks) returns it for death_cleanup. Supply skips zero-men units,
+        // so the 0 is stable in the meantime. Run until it is reaped.
+        let entity = game.entity_registry[&unit_id];
+        {
+            let (stats,) = game
+                .world
+                .query_one_mut::<(&mut UnitStats,)>(entity)
+                .expect("unit entity must exist");
+            stats.men = 0.0;
+        }
+        for _ in 0..35 {
+            if game.query_all_units().is_empty() {
+                break;
+            }
+            game.tick_game();
+        }
+
+        assert!(
+            game.query_all_units().is_empty(),
+            "unit must be dead and despawned"
+        );
+        // The rebuild + influence run on the NEXT consumer tick (movement),
+        // which precedes death_cleanup in a tick — so allow a few more ticks
+        // before the stale unit is purged from ctx and the grid.
+        for _ in 0..3 {
+            game.tick_game();
+        }
+        assert_eq!(
+            game.ctx_unit_count_for_test(),
+            0,
+            "rebuild after death must drop the stale unit"
+        );
+        assert!(!game.influence_dirty_for_test());
+        assert_eq!(
+            border_at(&game, "player_0", 10, 10),
+            0,
+            "dead unit must no longer project influence"
+        );
+    }
+
+    #[test]
+    fn assign_city_owner_updates_influence_grid() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+
+        // Both players own a city and recruit a unit there.
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        assert!(game.assign_city_owner("city_1", "player_1"));
+        let ut = basic_unit_type();
+        assert!(game.recruit_unit("city_0", &ut, "player_0").is_some());
+        assert!(game.recruit_unit("city_1", &ut, "player_1").is_some());
+
+        assert!(game.influence_dirty_for_test());
+        for _ in 0..3 {
+            game.tick_game();
+        }
+        assert!(!game.influence_dirty_for_test());
+        assert_eq!(
+            border_at(&game, "player_0", 3, 3),
+            6,
+            "city (5) + unit (1) at (3,3)"
+        );
+        assert!(border_at(&game, "player_0", 3, 3) >= 5);
+
+        // Steal city_0 from player_0 to player_1 → next influence run must
+        // move the city projection. (assign_city_owner refreshes ctx.cities
+        // inline; a ctx_dirty flag set here would be wiped at tick start.)
+        assert!(game.assign_city_owner("city_0", "player_1"));
+        for _ in 0..3 {
+            game.tick_game();
+        }
+        assert!(!game.influence_dirty_for_test());
+        assert_eq!(
+            border_at(&game, "player_0", 3, 3),
+            1,
+            "player_0 keeps only its unit at (3,3) — city is gone"
+        );
+        assert!(
+            border_at(&game, "player_1", 3, 3) >= 5,
+            "player_1 grid must show the stolen city"
+        );
+    }
 }

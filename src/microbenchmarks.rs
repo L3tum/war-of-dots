@@ -585,7 +585,11 @@ impl NearbyEnemiesFixture {
 /// Pre-built fixture for influence benchmarks.
 struct InfluenceFixture {
     world: World,
-    world_entity: hecs::Entity,
+    /// Owner/units context, built once in `new()` (un-timed setup) so the
+    /// benchmark measures `influence::run` alone, not `TickContext::build_full`.
+    ctx: TickContext,
+    /// Reused scratch (SupplyFixture-style setup), capacity preserved across runs.
+    scratch: crate::game::systems::influence::InfluenceScratch,
 }
 
 impl InfluenceFixture {
@@ -598,10 +602,22 @@ impl InfluenceFixture {
     ) -> Self {
         let (mut world, world_entity) = make_world(width, height, num_players);
         spawn_n_units(&mut world, world_entity, unit_type, count);
-        Self {
+        let ctx = TickContext::build_full(&world, world_entity);
+        let mut fixture = Self {
             world,
-            world_entity,
-        }
+            ctx,
+            scratch: crate::game::systems::influence::InfluenceScratch::new(),
+        };
+        // Seed non-trivial border grids once (un-timed) so any downstream
+        // encirclement work in the same process is realistic.
+        crate::game::systems::influence::run(
+            &mut fixture.world,
+            &fixture.ctx,
+            1,
+            &mut fixture.scratch,
+            true,
+        );
+        fixture
     }
 }
 
@@ -625,17 +641,32 @@ impl CityCaptureFixture {
 /// Pre-built fixture for encirclement benchmarks.
 struct EncirclementFixture {
     world: World,
-    world_entity: hecs::Entity,
+    /// Context built once in `new()` (un-timed setup).
+    ctx: TickContext,
+    /// Reused scratch for the un-timed influence pre-run.
+    scratch: crate::game::systems::influence::InfluenceScratch,
 }
 
 impl EncirclementFixture {
     fn new(num_players: usize, unit_type: &UnitType, count: usize) -> Self {
         let (mut world, world_entity) = make_world(30, 30, num_players);
         spawn_n_units(&mut world, world_entity, unit_type, count);
-        Self {
+        let ctx = TickContext::build_full(&world, world_entity);
+        let mut fixture = Self {
             world,
-            world_entity,
-        }
+            ctx,
+            scratch: crate::game::systems::influence::InfluenceScratch::new(),
+        };
+        // Seed non-trivial border grids once (un-timed) — without this the
+        // dominant grid is all-NONE and the flood-fill is trivially cheap.
+        crate::game::systems::influence::run(
+            &mut fixture.world,
+            &fixture.ctx,
+            1,
+            &mut fixture.scratch,
+            true,
+        );
+        fixture
     }
 }
 
@@ -1135,8 +1166,13 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || InfluenceFixture::new(30, 30, 2, &ut, 100),
         |f: &mut InfluenceFixture| {
-            let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::influence::run(&mut f.world, &ctx, 1);
+            crate::game::systems::influence::run(
+                &mut f.world,
+                &f.ctx,
+                1,
+                &mut f.scratch,
+                true,
+            );
             black_box(100);
         },
     );
@@ -1151,13 +1187,41 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || InfluenceFixture::new(40, 40, 2, &ut, 500),
         |f: &mut InfluenceFixture| {
-            let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::influence::run(&mut f.world, &ctx, 1);
+            crate::game::systems::influence::run(
+                &mut f.world,
+                &f.ctx,
+                1,
+                &mut f.scratch,
+                true,
+            );
             black_box(500);
         },
     );
     results.push(MicrobenchmarkResult {
         id: "systems/influence_500".to_string(),
+        group: "systems".to_string(),
+        ..result
+    });
+
+    // Influence SKIP path: dirty=false must early-return with ~zero work.
+    // The full-game battle benchmark moves every unit each tick, so the skip
+    // is invisible there — this isolates it.
+    let result = run_bench_with_setup(
+        cfg,
+        || InfluenceFixture::new(30, 30, 2, &ut, 100),
+        |f: &mut InfluenceFixture| {
+            crate::game::systems::influence::run(
+                &mut f.world,
+                &f.ctx,
+                2,
+                &mut f.scratch,
+                false,
+            );
+            black_box(100);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "systems/influence_100_skip".to_string(),
         group: "systems".to_string(),
         ..result
     });
@@ -1225,13 +1289,13 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
 
     // --- Encirclement ---
 
-    // Encirclement with 100 units spread across map
+    // Encirclement with 100 units spread across map (fixture seeds non-trivial
+    // border grids so the dominant grid + flood-fill do real work)
     let result = run_bench_with_setup(
         cfg,
         || EncirclementFixture::new(4, &ut, 100),
         |f: &mut EncirclementFixture| {
-            let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::encirclement::run(&mut f.world, &ctx, 1);
+            crate::game::systems::encirclement::run(&mut f.world, &f.ctx, 1);
             black_box(100);
         },
     );

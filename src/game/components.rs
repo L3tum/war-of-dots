@@ -151,9 +151,12 @@ impl Default for VisionGrids {
 
 /// Per-player border influence grids.
 /// Stored as flat 1D Vec<T> indexed as [y * width + x] for cache efficiency.
+/// `u16` is sufficient: only strict-`>` ordering is consumed in-game, and
+/// `saturating_add` caps absurd stacks at `u16::MAX` (65,535). Export accessors
+/// (`border_grid_2d`) widen to `u32` for the wire/LLM/replay protocol.
 #[derive(Debug, Clone)]
 pub struct BorderGrids {
-    pub grids: Arc<HashMap<String, Vec<u32>>>,
+    pub grids: Arc<HashMap<String, Vec<u16>>>,
 }
 impl Default for BorderGrids {
     fn default() -> Self {

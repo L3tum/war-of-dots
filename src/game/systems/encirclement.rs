@@ -19,7 +19,7 @@ const NONE: u8 = 255;
 
 pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
     // Scoped Arc extraction for border grids (24 bytes pointer bump)
-    let border_grids: Arc<HashMap<String, Vec<u32>>> = match world.world_data(ctx.world_entity) {
+    let border_grids: Arc<HashMap<String, Vec<u16>>> = match world.world_data(ctx.world_entity) {
         Some(wb) => Arc::clone(&wb.borders.grids),
         None => return,
     };
@@ -110,13 +110,13 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
 /// Single-pass dominant player grid: for each cell, which player has the highest influence?
 /// Returns Vec<u8> where value is player index (0..N) or NONE (255) if no influence.
 fn build_dominant_player_grid(
-    border_grids: &HashMap<String, Vec<u32>>,
+    border_grids: &HashMap<String, Vec<u16>>,
     player_to_idx: &HashMap<&str, u8>,
     _nplayers: usize,
     grid_size: usize,
 ) -> Vec<u8> {
     let mut dominant = vec![NONE; grid_size];
-    let mut max_inf = vec![0u32; grid_size];
+    let mut max_inf = vec![0u16; grid_size];
 
     // Iterate players in sorted order so equal-influence ties break the same
     // way every run (strict `>` keeps the first player encountered).
@@ -198,3 +198,108 @@ fn mark_safe_near_cities_multi(
 }
 
 // Combined BFS is inline in run() — no separate function needed.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// In-test u32 reference implementation with logic identical to
+    /// `build_dominant_player_grid` (sorted players, strict `>`).
+    fn reference_dominant(
+        border_grids: &HashMap<String, Vec<u32>>,
+        player_to_idx: &HashMap<&str, u8>,
+        grid_size: usize,
+    ) -> Vec<u8> {
+        let mut dominant = vec![NONE; grid_size];
+        let mut max_inf = vec![0u32; grid_size];
+        let mut players: Vec<&str> = player_to_idx.keys().copied().collect();
+        players.sort();
+        for player_id in players {
+            let idx = *player_to_idx.get(player_id).unwrap();
+            if let Some(grid) = border_grids.get(player_id) {
+                for i in 0..grid_size {
+                    if grid[i] > max_inf[i] {
+                        max_inf[i] = grid[i];
+                        dominant[i] = idx;
+                    }
+                }
+            }
+        }
+        for i in 0..grid_size {
+            if max_inf[i] == 0 {
+                dominant[i] = NONE;
+            }
+        }
+        dominant
+    }
+
+    #[test]
+    fn dominant_grid_u16_matches_u32_reference() {
+        let grid_size = 900; // 30x30
+        let players = ["player_a", "player_b", "player_c"];
+        let player_to_idx: HashMap<&str, u8> = players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, i as u8))
+            .collect();
+
+        // Deterministic LCG
+        let mut rng = 0x9e37_79b9u32;
+        let mut next = move || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rng
+        };
+
+        let mut grids_u16: HashMap<String, Vec<u16>> = HashMap::new();
+        let mut grids_u32: HashMap<String, Vec<u32>> = HashMap::new();
+        for p in players {
+            let mut g16 = vec![0u16; grid_size];
+            let mut g32 = vec![0u32; grid_size];
+            for i in 0..grid_size {
+                // Sparse values including exact-tie points: 5, 10, 65530, 0
+                let v = match next() % 10 {
+                    0 => 0u32,
+                    1 => 5,
+                    2 => 10,
+                    3 => 65530,
+                    _ => next() % 65536,
+                };
+                g16[i] = v as u16;
+                g32[i] = v;
+            }
+            grids_u16.insert(p.to_string(), g16);
+            grids_u32.insert(p.to_string(), g32);
+        }
+
+        let d16 = build_dominant_player_grid(&grids_u16, &player_to_idx, 3, grid_size);
+        let d32 = reference_dominant(&grids_u32, &player_to_idx, grid_size);
+        assert_eq!(d16, d32, "u16 dominant grid must match u32 reference");
+
+        // Sanity: the grid is non-trivial (multiple players + NONE cells)
+        let seen: std::collections::HashSet<u8> = d16.iter().copied().collect();
+        assert!(seen.contains(&0));
+        assert!(seen.contains(&1));
+        assert!(seen.contains(&NONE));
+    }
+
+    #[test]
+    fn dominant_grid_missing_player_key() {
+        // One player has no grid entry at all — must not affect the outcome
+        // vs the reference on the same data.
+        let grid_size = 100;
+        let player_to_idx: HashMap<&str, u8> =
+            [("player_a", 0u8), ("player_b", 1u8), ("player_c", 2u8)].into_iter().collect();
+        let mut grids_u16: HashMap<String, Vec<u16>> = HashMap::new();
+        let mut grids_u32: HashMap<String, Vec<u32>> = HashMap::new();
+        for (p, base) in [("player_a", 3u32), ("player_c", 7u32)] {
+            let g: Vec<u16> = (0..grid_size).map(|i| (base + i as u32) as u16).collect();
+            let g32: Vec<u32> = (0..grid_size).map(|i| base + i as u32).collect();
+            grids_u16.insert(p.to_string(), g);
+            grids_u32.insert(p.to_string(), g32);
+        }
+        let d16 = build_dominant_player_grid(&grids_u16, &player_to_idx, 3, grid_size);
+        let d32 = reference_dominant(&grids_u32, &player_to_idx, grid_size);
+        assert_eq!(d16, d32);
+    }
+}
