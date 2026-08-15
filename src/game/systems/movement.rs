@@ -4,8 +4,6 @@
 
 use crate::game::components::*;
 use crate::game::game::GameSettings;
-#[cfg(feature = "perfect-movement")]
-use crate::game::systems::spatial_hash::SpatialHash;
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use hecs::Entity;
@@ -111,52 +109,7 @@ pub fn run(
         None => return 0,
     };
 
-    // ---------------------------------------------------------------------------
-    // perfect-movement: build spatial hash + check segment-circle interception
-    // ---------------------------------------------------------------------------
-    #[cfg(feature = "perfect-movement")]
-    let (spatial, positions_map): (SpatialHash, HashMap<hecs::Entity, UnitPosition>) = {
-        let positions: Vec<(hecs::Entity, UnitPosition)> = world
-            .query::<(Entity, &UnitPosition)>()
-            .iter()
-            .map(|(e, pos)| (e, *pos))
-            .collect();
-        let mut sh = SpatialHash::new();
-        for (e, pos) in &positions {
-            sh.insert(*e, pos.x, pos.y);
-        }
-        let map: HashMap<hecs::Entity, UnitPosition> = positions.into_iter().collect();
-        (sh, map)
-    };
-
-    // (No marker lifecycle here anymore: movers are recorded into
-    // `scratch.movers` inside the apply loop below and consumed by spatialty.)
-
     for (entity, change) in changes {
-        // perfect-movement: interception check before applying
-        #[cfg(feature = "perfect-movement")]
-        let (effective_new_pos, set_attacking) = if change.moved {
-            let old_pos = positions_map.get(&entity).copied();
-            if let Some(old_pos) = old_pos {
-                let nearby_ids = spatial.query_nearby(old_pos.x, old_pos.y);
-                let nearby_pos: Vec<(hecs::Entity, UnitPosition)> = nearby_ids
-                    .iter()
-                    .filter_map(|&e| positions_map.get(&e).map(|p| (e, *p)))
-                    .collect();
-                let (clamped_pos, intercepted) =
-                    check_segment_interception(old_pos, change.new_pos, &nearby_pos, entity);
-                if intercepted {
-                    (clamped_pos, true)
-                } else {
-                    (change.new_pos, false)
-                }
-            } else {
-                (change.new_pos, false)
-            }
-        } else {
-            (change.new_pos, false)
-        };
-
         if change.moved {
             // Record this mover for spatialty: (entity, pre-move pos, post-move
             // pos). Spatialty uses these directly for hash remove/insert, so no
@@ -166,18 +119,9 @@ pub fn run(
                 .push((entity, change.old_pos, change.new_pos));
         }
         if let Ok((mpos,)) = world.query_one_mut::<(&mut UnitPosition,)>(entity) {
-            #[cfg(feature = "perfect-movement")]
-            {
-                let final_pos = effective_new_pos;
-                mpos.x = final_pos.x.clamp(0.0, map_w - 1.0);
-                mpos.y = final_pos.y.clamp(0.0, map_h - 1.0);
-            }
-            #[cfg(not(feature = "perfect-movement"))]
-            {
-                // Clamp position to map bounds to prevent out-of-bounds access
-                mpos.x = change.new_pos.x.clamp(0.0, map_w - 1.0);
-                mpos.y = change.new_pos.y.clamp(0.0, map_h - 1.0);
-            }
+            // Clamp position to map bounds to prevent out-of-bounds access
+            mpos.x = change.new_pos.x.clamp(0.0, map_w - 1.0);
+            mpos.y = change.new_pos.y.clamp(0.0, map_h - 1.0);
         }
         if let Some(new_path) = change.new_path {
             if let Ok((mpath,)) = world.query_one_mut::<(&mut UnitPath,)>(entity) {
@@ -192,10 +136,6 @@ pub fn run(
         if change.moved {
             if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
                 mf.moved = true;
-                #[cfg(feature = "perfect-movement")]
-                if set_attacking {
-                    mf.attacking = true;
-                }
             }
         }
     }
@@ -297,54 +237,6 @@ fn unit_speed_with_terrain(terrain: &Terrain, water_speed: f32, unit_type_speed:
         _ => 1.0,
     };
     unit_type_speed * terrain_mod
-}
-
-/// Check if the movement segment intersects any enemy's combat circle.
-/// Returns (clamped_position, was_intercepted).
-///
-/// Uses segment-circle distance: projects the enemy position onto the movement
-/// segment and checks the closest-point distance against COMBAT_RANGE.
-#[cfg(feature = "perfect-movement")]
-fn check_segment_interception(
-    from: UnitPosition,
-    to: UnitPosition,
-    nearby: &[(hecs::Entity, UnitPosition)],
-    mover_entity: hecs::Entity,
-) -> (UnitPosition, bool) {
-    let mut best_t = f32::MAX;
-    let mut best_pos = to;
-    let mut intercepted = false;
-
-    for &(entity, enemy_pos) in nearby {
-        if entity == mover_entity {
-            continue;
-        }
-        // Compute closest point on segment [from → to] to enemy_pos
-        let dx = to.x - from.x;
-        let dy = to.y - from.y;
-        let seg_len_sq = dx * dx + dy * dy;
-        if seg_len_sq < f32::EPSILON {
-            continue;
-        }
-        let t = ((enemy_pos.x - from.x) * dx + (enemy_pos.y - from.y) * dy) / seg_len_sq;
-        let t_clamped = t.clamp(0.0, 1.0);
-        let closest_x = from.x + t_clamped * dx;
-        let closest_y = from.y + t_clamped * dy;
-        let dist_sq = (closest_x - enemy_pos.x).powi(2) + (closest_y - enemy_pos.y).powi(2);
-        if dist_sq < crate::game::constants::COMBAT_RANGE_SQ {
-            // Intercepted — clamp to this point if it's closer to `from`
-            if t_clamped < best_t {
-                best_t = t_clamped;
-                best_pos = UnitPosition {
-                    x: closest_x,
-                    y: closest_y,
-                };
-                intercepted = true;
-            }
-        }
-    }
-
-    (best_pos, intercepted)
 }
 
 #[cfg(test)]

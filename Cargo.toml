@@ -37,7 +37,6 @@ subtle = "2"
 [features]
 default = []
 debug-overlay = []
-perfect-movement = []
 microbenchmarks = []
 
 [[bin]]

@@ -9,8 +9,8 @@ use crate::game::world_ext::WorldExt;
 use crate::map::map::Map;
 use hecs::Entity;
 use hecs::World;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
 #[cfg(any(debug_assertions, feature = "debug-overlay"))]
 use super::debug_stats::DebugSystemGuard;
@@ -109,6 +109,10 @@ pub struct Game {
     /// Number of engaged pairs in the most recent tick (from combat.rs).
     /// Used by benchmark/status reporting to gauge combat activity.
     last_engaged_pairs: usize,
+    /// Persisted TickContext, built once and updated incrementally.
+    ctx: TickContext,
+    /// Tracks which TickContext fields need updating this tick.
+    ctx_dirty: TickContextDirty,
 }
 
 /// Neighbour-graph snapshot: how nearby_enemies left the world this tick.
@@ -162,10 +166,8 @@ pub struct UnitHandle {
 pub struct TickContext {
     /// The world entity handle (needed for world_data_mut writes)
     pub world_entity: hecs::Entity,
-    /// Cities snapshot — small (~20 entries), cloned once per tick
+    /// Cities snapshot — small (~20 entries), cloned lazily
     pub cities: Vec<crate::game::economy::City>,
-    /// Economy funds snapshot
-    pub funds: HashMap<String, u32>,
     /// Map dimensions (cached to avoid per-system world borrows)
     pub width: u32,
     pub height: u32,
@@ -174,49 +176,81 @@ pub struct TickContext {
     /// Compact owner lookup: entity → player index (0..=255).
     /// Shared across systems so nearby_enemies and combat can do
     /// O(1) u8 equality instead of per-pair ECS borrows + String comparison.
+    /// Updated incrementally (O(1) insert on recruit; stale entries on death
+    /// are harmless since dead entities don't appear in ECS queries).
     pub owner_id_by_entity: HashMap<Entity, u8>,
+    /// Persistent player→index mapping for incremental owner map updates.
+    pub player_id_to_index: HashMap<String, u8>,
+    /// Next available player index (monotonically increasing, never reused).
+    pub next_player_idx: u8,
+}
+
+/// Tracks which TickContext fields need updating this tick.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TickContextDirty {
+    /// Set when city_capture reports ownership changes → clone cities
+    pub cities_changed: bool,
+    /// Set after movement → rebuild units_by_player just-in-time before influence/encirclement
+    pub units_by_player_stale: bool,
 }
 
 impl TickContext {
-    /// Build TickContext: scoped Arc extraction + single-pass unit grouping.
-    /// Only clones small data (cities ~20 entries, funds ~12 entries).
+    /// Build TickContext once at Game::new. Populates static fields and does
+    /// initial ECS query for dynamic fields.
+    /// Only clones small data (cities ~20 entries).
     /// Grids (terrain/vision/borders) are NOT cloned — systems use scoped Arc extraction.
-    pub fn build(world: &World, world_entity: hecs::Entity) -> Option<Self> {
+    pub fn build_initial(world: &World, world_entity: hecs::Entity) -> Self {
         // Scoped extraction: only clone what we actually need
-        let (cities, funds, width, height) = {
-            let wb = world.world_data(world_entity)?;
+        let (cities, width, height) = {
+            let wb = world
+                .world_data(world_entity)
+                .expect("world_data must exist for a valid world_entity");
             (
                 wb.cities.cities.clone(),
-                wb.funds.funds.clone(),
                 wb.terrain.width,
                 wb.terrain.height,
             )
         };
         // wb dropped — borrow released
 
-        // Single pass: group entities+positions by player AND build owner_id lookup.
-        // Both structures are built from the same query, so systems like
-        // nearby_enemies and combat can use owner_id_by_entity for O(1) u8
-        // comparison instead of their own &UnitOwner ECS queries.
-        let mut units_by_player: HashMap<String, Vec<UnitHandle>> = HashMap::new();
-        let mut owner_id_by_entity: HashMap<Entity, u8> = HashMap::with_capacity(512);
-        let mut player_id_to_index: HashMap<&str, u8> = HashMap::with_capacity(16);
-        let mut next_id: u8 = 0;
-
-        for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
-            let pid = &owner.player_id;
-            let id = match player_id_to_index.entry(pid.as_str()) {
+        // Populate player_id_to_index and owner_id_by_entity in a single ECS query
+        let mut player_id_to_index: HashMap<String, u8> = HashMap::with_capacity(16);
+        let mut owner_id_by_entity: HashMap<Entity, u8> = HashMap::new();
+        let mut next_player_idx: u8 = 0;
+        for (entity, owner) in world.query::<(Entity, &UnitOwner)>().iter() {
+            let idx = match player_id_to_index.entry(owner.player_id.clone()) {
                 Entry::Occupied(e) => *e.get(),
                 Entry::Vacant(e) => {
-                    let id = next_id;
+                    let id = next_player_idx;
+                    next_player_idx += 1;
                     e.insert(id);
-                    next_id += 1;
                     id
                 }
             };
-            owner_id_by_entity.insert(entity, id);
-            units_by_player
-                .entry(pid.clone())
+            owner_id_by_entity.insert(entity, idx);
+        }
+        debug_assert!(next_player_idx < 255, "too many players");
+
+        Self {
+            world_entity,
+            cities,
+            width,
+            height,
+            units_by_player: HashMap::new(),
+            owner_id_by_entity,
+            player_id_to_index,
+            next_player_idx,
+        }
+    }
+
+    /// Rebuild units_by_player from ECS (positions, entity set).
+    /// Called just-in-time before influence/encirclement when positions have changed.
+    pub fn rebuild_units_by_player(&mut self, world: &World) {
+        let mut new_units: HashMap<String, Vec<UnitHandle>> = HashMap::new();
+
+        for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
+            new_units
+                .entry(owner.player_id.clone())
                 .or_default()
                 .push(UnitHandle {
                     entity,
@@ -224,17 +258,64 @@ impl TickContext {
                 });
         }
 
-        debug_assert!(next_id < 255, "TickContext: too many players (max 255 for u8 owner IDs)");
+        self.units_by_player = new_units;
+    }
 
-        Some(Self {
-            world_entity,
-            cities,
-            funds,
-            width,
-            height,
-            units_by_player,
-            owner_id_by_entity,
-        })
+    /// Combined rebuild of player_id_to_index, owner_id_by_entity, AND units_by_player
+    /// in a single ECS pass. Used by build_full() for benchmarks — not called in the
+    /// tick loop (owner map is updated incrementally; units_by_player is rebuilt lazily).
+    #[cfg(any(test, feature = "microbenchmarks"))]
+    #[allow(dead_code)]
+    pub fn rebuild_both(&mut self, world: &World) {
+        let mut player_id_to_index: HashMap<String, u8> = HashMap::with_capacity(16);
+        let mut owner_id_by_entity: HashMap<Entity, u8> = HashMap::new();
+        let mut new_units: HashMap<String, Vec<UnitHandle>> = HashMap::new();
+        let mut next_player_idx: u8 = 0;
+
+        for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
+            let pid = owner.player_id.clone();
+            let idx = match player_id_to_index.entry(pid.clone()) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let id = next_player_idx;
+                    next_player_idx += 1;
+                    e.insert(id);
+                    id
+                }
+            };
+            owner_id_by_entity.insert(entity, idx);
+            new_units.entry(pid).or_default().push(UnitHandle {
+                entity,
+                pos: (*pos).as_tuple(),
+            });
+        }
+        debug_assert!(next_player_idx < 255, "too many players");
+
+        self.player_id_to_index = player_id_to_index;
+        self.next_player_idx = next_player_idx;
+        self.owner_id_by_entity = owner_id_by_entity;
+        self.units_by_player = new_units;
+    }
+
+    /// Clone cities from world. Called before influence/encirclement if
+    /// city ownership changed.
+    pub fn update_cities(&mut self, world: &World, world_entity: hecs::Entity) {
+        self.cities = {
+            let wb = world
+                .world_data(world_entity)
+                .expect("world_data must exist for a valid world_entity");
+            wb.cities.cities.clone()
+        };
+    }
+
+    /// Full rebuild of all dynamic fields. Used by tests, benchmarks, and as a fallback.
+    /// Equivalent to the old `build()` but returns `Self` directly.
+    #[cfg(any(test, feature = "microbenchmarks"))]
+    #[allow(dead_code)]
+    pub fn build_full(world: &World, world_entity: hecs::Entity) -> Self {
+        let mut ctx = Self::build_initial(world, world_entity);
+        ctx.rebuild_both(world);
+        ctx
     }
 }
 
@@ -300,6 +381,9 @@ impl Game {
             }
         }
 
+        // Build initial TickContext before world is moved into Self
+        let ctx = TickContext::build_initial(&world, world_entity);
+
         Self {
             world,
             world_entity,
@@ -316,6 +400,8 @@ impl Game {
             movement_scratch: systems::movement::MovementScratch::default(),
             last_mover_count: 0,
             last_engaged_pairs: 0,
+            ctx,
+            ctx_dirty: TickContextDirty::default(),
         }
     }
 
@@ -389,13 +475,7 @@ impl Game {
         #[cfg(any(debug_assertions, feature = "debug-overlay"))]
         let guard = DebugSystemGuard::new(&mut self.world, self.world_entity);
 
-        // Build TickContext once per tick
-        let ctx = tick_system!(
-            "tickcontext",
-            &mut self.world,
-            self.world_entity,
-            TickContext::build(&self.world, self.world_entity)
-        );
+        self.ctx_dirty = TickContextDirty::default();
 
         // Economy: only every ECONOMY_TICK_INTERVAL ticks
         if self
@@ -418,13 +498,10 @@ impl Game {
                     stats.funds_earned += amount;
                 }
             }
-            // Clone funds for player update (only every 10 ticks)
-            if let Some(ref wb) = ctx {
-                for (pid, player) in self.players.iter_mut() {
-                    if let Some(f) = wb.funds.get(pid) {
-                        player.funds = *f;
-                    }
-                }
+            // Read funds directly from world for player update
+            for (pid, player) in self.players.iter_mut() {
+                let f = self.world.player_funds(self.world_entity, pid);
+                player.funds = f;
             }
         }
 
@@ -449,10 +526,30 @@ impl Game {
         );
         self.last_mover_count = mover_count;
 
+        // ── AFTER movement: rebuild units_by_player when a consumer needs it ──
+        // Owner map: always current (updated incrementally in recruit_unit).
+        // units_by_player: only rebuild on consumer ticks AND only if positions changed.
+        if mover_count > 0 {
+            self.ctx_dirty.units_by_player_stale = true;
+        }
+        let is_consumer_tick = self
+            .tick
+            .is_multiple_of(super::constants::INFLUENCE_TICK_INTERVAL)
+            || self
+                .tick
+                .is_multiple_of(super::constants::CITY_CAPTURE_TICK_INTERVAL);
+        if is_consumer_tick && self.ctx_dirty.units_by_player_stale {
+            tick_system!("tickcontext", &mut self.world, self.world_entity, {
+                self.ctx.rebuild_units_by_player(&self.world);
+                self.ctx_dirty.units_by_player_stale = false;
+            });
+        }
+
         // NearbyEnemies: brute-force rebuild of enemy adjacency lists.
         // Runs after movement (so positions are current) and before combat.
         // Uses shared TickContext owner lookup instead of its own &UnitOwner query.
-        if let Some(ref ctx) = ctx {
+        {
+            let ctx = &self.ctx;
             tick_system!(
                 "nearby_enemies",
                 &mut self.world,
@@ -462,7 +559,8 @@ impl Game {
         }
 
         // Combat (reads NearbyEnemies, uses shared TickContext for owner lookups)
-        let combat_dead: Vec<hecs::Entity> = if let Some(ref ctx) = ctx {
+        let combat_dead: Vec<hecs::Entity> = {
+            let ctx = &self.ctx;
             tick_system!(
                 "combat",
                 &mut self.world,
@@ -475,8 +573,6 @@ impl Game {
                     ctx
                 )
             )
-        } else {
-            Vec::new()
         };
         // Expose engaged-pair count for benchmark/status reporting.
         self.last_engaged_pairs = self.combat_scratch.engaged_pairs();
@@ -490,27 +586,34 @@ impl Game {
             systems::supply::run(&mut self.world, self.world_entity, &self.settings)
         );
 
-        // City capture
-        tick_system!(
+        // City capture — returns list of city IDs whose ownership changed
+        let cities_changed = tick_system!(
             "city_capture",
             &mut self.world,
             self.world_entity,
             systems::city_capture::run(&mut self.world, self.world_entity, &mut self.player_stats)
         );
+        if !cities_changed.is_empty() {
+            self.ctx_dirty.cities_changed = true;
+        }
 
         // Influence: merged vision + border in one pass (every INFLUENCE_TICK_INTERVAL ticks)
         if self
             .tick
             .is_multiple_of(super::constants::INFLUENCE_TICK_INTERVAL)
         {
-            if let Some(ref ctx) = ctx {
-                tick_system!(
-                    "influence",
-                    &mut self.world,
-                    self.world_entity,
-                    systems::influence::run(&mut self.world, ctx, self.tick)
-                );
+            // Update cities before influence reads them if they changed
+            if self.ctx_dirty.cities_changed {
+                self.ctx.update_cities(&self.world, self.world_entity);
+                self.ctx_dirty.cities_changed = false;
             }
+            let ctx = &self.ctx;
+            tick_system!(
+                "influence",
+                &mut self.world,
+                self.world_entity,
+                systems::influence::run(&mut self.world, ctx, self.tick)
+            );
         }
 
         // Encirclement: only every CITY_CAPTURE_TICK_INTERVAL ticks (strategic, not tactical)
@@ -518,14 +621,18 @@ impl Game {
             .tick
             .is_multiple_of(super::constants::CITY_CAPTURE_TICK_INTERVAL)
         {
-            if let Some(ref ctx) = ctx {
-                tick_system!(
-                    "encirclement",
-                    &mut self.world,
-                    self.world_entity,
-                    systems::encirclement::run(&mut self.world, ctx, self.tick)
-                );
+            // Update cities before encirclement reads them if they changed
+            if self.ctx_dirty.cities_changed {
+                self.ctx.update_cities(&self.world, self.world_entity);
+                self.ctx_dirty.cities_changed = false;
             }
+            let ctx = &self.ctx;
+            tick_system!(
+                "encirclement",
+                &mut self.world,
+                self.world_entity,
+                systems::encirclement::run(&mut self.world, ctx, self.tick)
+            );
         }
 
         // Surrender: only every 30 ticks
@@ -549,16 +656,15 @@ impl Game {
             .chain(surrender_dead)
             .collect();
 
-        tick_system!(
+        let _death_count = tick_system!(
             "death_cleanup",
             &mut self.world,
             self.world_entity,
-            systems::death_cleanup::run(
-                &mut self.world,
-                all_dead,
-                &mut self.entity_reverse,
-            )
+            systems::death_cleanup::run(&mut self.world, all_dead, &mut self.entity_reverse,)
         );
+
+        // Dead entities are despawned from the ECS — stale owner map entries are
+        // harmless since they won't appear in ECS queries.
 
         self.track_unit_losses();
 
@@ -620,6 +726,17 @@ impl Game {
         let unit_id = format!("unit_{}", entity.id());
         self.entity_registry.insert(unit_id.clone(), entity);
         self.entity_reverse.insert(entity, unit_id.clone());
+
+        // Incrementally update the owner map (O(1) insert, no ECS query needed)
+        let player_idx = if let Some(&idx) = self.ctx.player_id_to_index.get(owner) {
+            idx
+        } else {
+            let idx = self.ctx.next_player_idx;
+            self.ctx.next_player_idx += 1;
+            self.ctx.player_id_to_index.insert(owner.to_string(), idx);
+            idx
+        };
+        self.ctx.owner_id_by_entity.insert(entity, player_idx);
 
         if let Some(player) = self.players.get_mut(owner) {
             player.units.push(unit_id.clone());

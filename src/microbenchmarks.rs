@@ -238,6 +238,7 @@ impl MicrobenchmarkResult {
 
 /// Create a valid dummy entity with the given id.
 /// hecs::Entity requires non-zero generation bits (high 32 bits).
+#[allow(dead_code)]
 fn make_dummy_entity(id: u64) -> hecs::Entity {
     hecs::Entity::from_bits((1u64 << 32) | (id & 0xFFFF_FFFF)).unwrap()
 }
@@ -896,7 +897,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 100),
         |f: &mut NearbyEnemiesFixture| {
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
             black_box(f.entity_ids.len());
         },
@@ -912,7 +913,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 200),
         |f: &mut NearbyEnemiesFixture| {
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
             black_box(f.entity_ids.len());
         },
@@ -928,7 +929,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(40, 40, 2, &ut, 500),
         |f: &mut NearbyEnemiesFixture| {
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
             black_box(f.entity_ids.len());
         },
@@ -947,7 +948,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || CombatFixture::new_dense(20, 20, 2, &ut, 100),
         |f: &mut CombatFixture| {
             let mut scratch = crate::game::systems::combat::CombatScratch::new();
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::combat::run(
                 &mut f.world,
                 f.world_entity,
@@ -970,7 +971,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || CombatFixture::new_dense(30, 30, 2, &ut, 400),
         |f: &mut CombatFixture| {
             let mut scratch = crate::game::systems::combat::CombatScratch::new();
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::combat::run(
                 &mut f.world,
                 f.world_entity,
@@ -1047,7 +1048,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || InfluenceFixture::new(30, 30, 2, &ut, 100),
         |f: &mut InfluenceFixture| {
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::influence::run(&mut f.world, &ctx, 1);
             black_box(100);
         },
@@ -1063,7 +1064,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || InfluenceFixture::new(40, 40, 2, &ut, 500),
         |f: &mut InfluenceFixture| {
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::influence::run(&mut f.world, &ctx, 1);
             black_box(500);
         },
@@ -1142,7 +1143,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || EncirclementFixture::new(4, &ut, 100),
         |f: &mut EncirclementFixture| {
-            let ctx = TickContext::build(&f.world, f.world_entity).unwrap();
+            let ctx = TickContext::build_full(&f.world, f.world_entity);
             crate::game::systems::encirclement::run(&mut f.world, &ctx, 1);
             black_box(100);
         },

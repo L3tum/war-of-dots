@@ -13,11 +13,11 @@ pub fn run(
     world: &mut World,
     world_entity: hecs::Entity,
     player_stats: &mut HashMap<String, PlayerGameStats>,
-) {
+) -> Vec<String> {
     // Scoped extraction: cities Vec is small (~20 entries), clone is cheap
     let cities = match world.world_data(world_entity) {
         Some(wb) => wb.cities.cities.clone(),
-        None => return,
+        None => return Vec::new(),
     };
 
     let units: Vec<(String, UnitPosition)> = world
@@ -61,4 +61,7 @@ pub fn run(
             stats.cities_captured += 1;
         }
     }
+
+    // Return the list of city IDs whose ownership changed
+    city_ids_changed.into_iter().map(|(id, _)| id).collect()
 }

@@ -12,11 +12,12 @@ pub fn run(
     world: &mut hecs::World,
     all_dead: Vec<hecs::Entity>,
     entity_reverse: &mut HashMap<hecs::Entity, String>,
-) {
+) -> usize {
     if all_dead.is_empty() {
-        return;
+        return 0;
     }
 
+    let dead_count = all_dead.len();
     let dead_set: std::collections::HashSet<hecs::Entity> = all_dead.iter().copied().collect();
 
     // Clean NearbyEnemies references (single pass, O(total entries) amortized)
@@ -29,6 +30,8 @@ pub fn run(
         entity_reverse.remove(dead);
         world.despawn(*dead).ok();
     }
+
+    dead_count
 }
 
 #[cfg(test)]
@@ -67,11 +70,7 @@ mod tests {
         }
 
         let mut entity_reverse = HashMap::new();
-        run(
-            &mut world,
-            vec![dead1, dead2],
-            &mut entity_reverse,
-        );
+        run(&mut world, vec![dead1, dead2], &mut entity_reverse);
 
         // alive unit's NearbyEnemies should no longer contain dead entities
         let nearby = world.get::<&NearbyEnemies>(alive).unwrap();

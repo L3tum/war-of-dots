@@ -33,12 +33,16 @@ struct CellEntry {
     owner_idx: u8,
 }
 
-/// Coarse spatial grid: 1D array of cell buckets.
+/// Coarse spatial grid: flat-buffer 1D array of cell buckets.
+/// Uses prefix-sum offsets + sizes instead of per-cell Vecs to reduce allocations.
 struct GridIndex {
-    cells: Box<[Vec<CellEntry>]>,
+    entries: Vec<CellEntry>,
+    cell_offsets: Vec<usize>,
+    cell_sizes: Vec<usize>,
     min_x: i32,
     min_y: i32,
     width: usize,
+    height: usize,
 }
 
 impl GridIndex {
@@ -51,34 +55,68 @@ impl GridIndex {
         let mut max_y = i32::MIN;
         for &(_, pos, _, _) in units {
             let c = cell_for(pos);
-            if c.0 < min_x { min_x = c.0; }
-            if c.1 < min_y { min_y = c.1; }
-            if c.0 > max_x { max_x = c.0; }
-            if c.1 > max_y { max_y = c.1; }
+            if c.0 < min_x {
+                min_x = c.0;
+            }
+            if c.1 < min_y {
+                min_y = c.1;
+            }
+            if c.0 > max_x {
+                max_x = c.0;
+            }
+            if c.1 > max_y {
+                max_y = c.1;
+            }
         }
         let width = (max_x - min_x + 2) as usize;
         let height = (max_y - min_y + 2) as usize;
         let total = width * height;
 
-        let mut cells: Vec<Vec<CellEntry>> = vec![Vec::with_capacity(4); total];
+        // Pass 1: count entries per cell
+        let mut cell_sizes = vec![0usize; total];
+        for &(_, pos, _, _) in units {
+            let c = cell_for(pos);
+            let cx = ((c.0 - min_x) as usize).min(width - 1);
+            let cy = ((c.1 - min_y) as usize).min(height - 1);
+            cell_sizes[cy * width + cx] += 1;
+        }
 
+        // Build prefix-sum offsets
+        let mut cell_offsets = vec![0usize; total];
+        for i in 1..total {
+            cell_offsets[i] = cell_offsets[i - 1] + cell_sizes[i - 1];
+        }
+
+        // Pass 2: fill entries in place using a cursor
+        let mut cursor = cell_offsets.clone();
+        let mut entries: Vec<CellEntry> = Vec::with_capacity(units.len());
+        entries.resize_with(units.len(), || CellEntry {
+            entity: Entity::from_bits(1u64 << 32).unwrap(),
+            pos: UnitPosition::default(),
+            owner_idx: 0,
+        });
         for &(e, pos, owner_id, _) in units.iter() {
             let c = cell_for(pos);
             let cx = ((c.0 - min_x) as usize).min(width - 1);
             let cy = ((c.1 - min_y) as usize).min(height - 1);
             let idx = cy * width + cx;
-            cells[idx].push(CellEntry {
+            let slot = cursor[idx];
+            entries[slot] = CellEntry {
                 entity: e,
                 pos,
-                owner_idx: owner_id, // u8 directly — no array index indirection
-            });
+                owner_idx: owner_id,
+            };
+            cursor[idx] += 1;
         }
 
         Self {
-            cells: cells.into_boxed_slice(),
+            entries,
+            cell_offsets,
+            cell_sizes,
             min_x,
             min_y,
             width,
+            height,
         }
     }
 
@@ -87,7 +125,8 @@ impl GridIndex {
         let x = (cx - self.min_x) as isize;
         let y = (cy - self.min_y) as isize;
         let w = self.width as isize;
-        if (0..w).contains(&x) && (0..(self.cells.len() as isize / w)).contains(&y) {
+        let h = self.height as isize;
+        if (0..w).contains(&x) && (0..h).contains(&y) {
             Some((y * w + x) as usize)
         } else {
             None
@@ -111,6 +150,11 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext) {
         .query::<(Entity, &UnitPosition, &UnitFlags)>()
         .iter()
         .filter_map(|(e, pos, flags)| {
+            debug_assert!(
+                ctx.owner_id_by_entity.contains_key(&e),
+                "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                e
+            );
             let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
             Some((e, *pos, owner_id, flags.moved))
         })
@@ -136,7 +180,9 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext) {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 if let Some(idx) = grid.cell_idx(c.0 + dx, c.1 + dy) {
-                    for entry in &grid.cells[idx] {
+                    let start = grid.cell_offsets[idx];
+                    let count = grid.cell_sizes[idx];
+                    for entry in &grid.entries[start..start + count] {
                         if entry.entity == entity {
                             continue;
                         }
@@ -164,7 +210,7 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext) {
             let _ = world.insert(
                 entity,
                 (NearbyEnemies {
-                    entities: enemies.drain(..).collect(),
+                    entities: std::mem::take(&mut enemies),
                     initialized: true,
                 },),
             );
@@ -222,7 +268,7 @@ mod tests {
 
     /// Helper: build TickContext and run the system (used by most tests).
     fn build_ctx_and_run(world: &mut hecs::World, world_entity: hecs::Entity) {
-        let ctx = TickContext::build(world, world_entity).unwrap();
+        let ctx = TickContext::build_full(world, world_entity);
         run(world, &ctx);
     }
 
@@ -235,10 +281,7 @@ mod tests {
 
         let nearby_a = world.get::<&NearbyEnemies>(a).unwrap();
         assert!(nearby_a.initialized);
-        assert!(
-            nearby_a.entities.contains(&b),
-            "A should see enemy B"
-        );
+        assert!(nearby_a.entities.contains(&b), "A should see enemy B");
 
         let nearby_b = world.get::<&NearbyEnemies>(b).unwrap();
         assert!(nearby_b.initialized);
@@ -289,7 +332,7 @@ mod tests {
         let (mut world, world_entity) = setup();
         // Mover at a far distance from anyone.
         let a = make_unit(&mut world, "P1", 0.0, 0.0, true);
-        let b = make_unit(&mut world, "P2", 100.0, 100.0, false);
+        let _b = make_unit(&mut world, "P2", 100.0, 100.0, false);
         build_ctx_and_run(&mut world, world_entity);
 
         assert!(
@@ -302,7 +345,7 @@ mod tests {
     fn stationary_defender_does_not_become_attacker() {
         let (mut world, world_entity) = setup();
         let b = make_unit(&mut world, "P2", 10.5, 10.5, false);
-        let a = make_unit(&mut world, "P1", 10.0, 10.0, true);
+        let _a = make_unit(&mut world, "P1", 10.0, 10.0, true);
         build_ctx_and_run(&mut world, world_entity);
 
         assert!(
@@ -371,20 +414,11 @@ mod tests {
                 label
             );
             assert!(nb.entities.contains(&p2a) && nb.entities.contains(&p2b));
-            assert!(
-                !nb.entities.contains(unit),
-                "{} must not see itself",
-                label
-            );
+            assert!(!nb.entities.contains(unit), "{} must not see itself", label);
         }
         for (unit, label) in [(&p2a, "P2A"), (&p2b, "P2B")] {
             let nb = world.get::<&NearbyEnemies>(*unit).unwrap();
-            assert_eq!(
-                nb.entities.len(),
-                3,
-                "{} should see 3 P1 enemies",
-                label
-            );
+            assert_eq!(nb.entities.len(), 3, "{} should see 3 P1 enemies", label);
         }
     }
 
@@ -402,8 +436,14 @@ mod tests {
         build_ctx_and_run(&mut world, world_entity);
 
         let nearby_a = world.get::<&NearbyEnemies>(a).unwrap();
-        assert!(nearby_a.entities.is_empty(), "far units should not be in NearbyEnemies");
+        assert!(
+            nearby_a.entities.is_empty(),
+            "far units should not be in NearbyEnemies"
+        );
         let nearby_b = world.get::<&NearbyEnemies>(b).unwrap();
-        assert!(nearby_b.entities.is_empty(), "far units should not be in NearbyEnemies");
+        assert!(
+            nearby_b.entities.is_empty(),
+            "far units should not be in NearbyEnemies"
+        );
     }
 }

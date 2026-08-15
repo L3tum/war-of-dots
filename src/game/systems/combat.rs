@@ -199,6 +199,11 @@ pub fn run(
             stats.men > 0.0 && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
         })
         .filter_map(|(e, pos, flags, stats, nearby)| {
+            debug_assert!(
+                ctx.owner_id_by_entity.contains_key(&e),
+                "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                e
+            );
             let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
             Some((e, *pos, owner_id, *stats, *flags, nearby.clone()))
         })
@@ -250,7 +255,14 @@ pub fn run(
             // no per-pair ECS borrow + String comparison).
             let same_owner = match ctx.owner_id_by_entity.get(&entity2) {
                 Some(other_id) => *owner1 == *other_id,
-                None => continue,
+                None => {
+                    debug_assert!(
+                        false,
+                        "entity {:?} missing from owner_id_by_entity during same-owner check",
+                        entity2
+                    );
+                    continue;
+                }
             };
             if same_owner {
                 scratch.pairs_same_owner += 1;
@@ -658,9 +670,15 @@ mod tests {
         }
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         assert_eq!(
             scratch.engaged_pairs(),
@@ -678,9 +696,15 @@ mod tests {
         let _a = make_unit(&mut world, "P1", 10.0, 10.0, 0.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
         assert!(
             dead.is_empty(),
             "0-men unit must not be processed by combat"
@@ -706,9 +730,15 @@ mod tests {
         let c = make_unit(&mut world, "P3", 10.0, 10.0, 1000.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let men_of = |world: &World, e: hecs::Entity| {
             world
@@ -740,9 +770,15 @@ mod tests {
         let d = make_unit(&mut world, "P2", 10.0, 10.0, 1000.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let d_men = world.get::<&UnitStats>(d).map(|s| s.men).unwrap();
         // With 2+ hits, defender should be well below 990 (each hit ~5 dmg).
@@ -771,9 +807,15 @@ mod tests {
         let defender = make_unit(&mut world, "P2", 10.0, 10.0, 50.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let defender_dead = dead.iter().any(|e| e.id() == defender.id());
         assert!(
@@ -800,9 +842,15 @@ mod tests {
         let _attacker2 = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let defender_eq = world
             .get::<&UnitEquipment>(defender)
@@ -846,8 +894,14 @@ mod tests {
         let d_full = make_unit_with_equipment(&mut world, "P2", 10.5, 10.5, 100.0, rifles(10));
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
-        let _ = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let ctx = TickContext::build_full(&world, world_entity);
+        let _ = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
         let dmg_full = 100.0 - world.get::<&UnitStats>(d_full).unwrap().men;
 
         // Scenario B: attacker under-supplied (0/10), identical defender.
@@ -856,8 +910,14 @@ mod tests {
         let d_deprived = make_unit_with_equipment(&mut world2, "P2", 10.5, 10.5, 100.0, rifles(10));
         populate_nearby_enemies(&mut world2);
         let mut scratch2 = CombatScratch::new();
-        let ctx2 = TickContext::build(&world2, world_entity2).unwrap();
-        let _ = run(&mut world2, world_entity2, &mut scratch2, &test_settings(), &ctx2);
+        let ctx2 = TickContext::build_full(&world2, world_entity2);
+        let _ = run(
+            &mut world2,
+            world_entity2,
+            &mut scratch2,
+            &test_settings(),
+            &ctx2,
+        );
         let dmg_deprived = 100.0 - world2.get::<&UnitStats>(d_deprived).unwrap().men;
 
         assert!(
@@ -875,9 +935,15 @@ mod tests {
         let unit = make_unit(&mut world, "P1", 10.0, 10.0, 1000.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let flags = world.get::<&UnitFlags>(unit).unwrap();
         assert!(
@@ -928,9 +994,15 @@ mod tests {
         let defender = make_unit(&mut world, "P2", 10.0, 11.0, 1000.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let a_men = world.get::<&UnitStats>(attacker).map(|s| s.men).unwrap();
         let d_men = world.get::<&UnitStats>(defender).map(|s| s.men).unwrap();
@@ -959,9 +1031,15 @@ mod tests {
         let defender = make_unit(&mut world, "P2", 10.0, 10.0, 1000.0);
         populate_nearby_enemies(&mut world);
         let mut scratch = CombatScratch::new();
-        let ctx = TickContext::build(&world, world_entity).unwrap();
+        let ctx = TickContext::build_full(&world, world_entity);
 
-        let _dead = run(&mut world, world_entity, &mut scratch, &test_settings(), &ctx);
+        let _dead = run(
+            &mut world,
+            world_entity,
+            &mut scratch,
+            &test_settings(),
+            &ctx,
+        );
 
         let a_stats = world.get::<&UnitStats>(attacker).unwrap();
         let d_stats = world.get::<&UnitStats>(defender).unwrap();
