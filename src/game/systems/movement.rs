@@ -39,6 +39,7 @@ pub fn run(
     world_entity: hecs::Entity,
     settings: &GameSettings,
     scratch: &mut MovementScratch,
+    unit_types_index: &HashMap<String, usize>,
 ) -> usize {
     // Scratch is filled by the apply loop below; clear the previous tick's
     // records up front so a fresh population happens every tick.
@@ -60,13 +61,8 @@ pub fn run(
         None => return 0,
     };
 
-    // Precompute unit-type lookup (name -> speed) once per tick instead of a linear
-    // scan per unit per tick.
-    let unit_type_speeds: HashMap<&str, f32> = settings
-        .unit_types
-        .iter()
-        .map(|ut| (ut.name.as_str(), ut.speed))
-        .collect();
+    // Unit-type speed is resolved via the cached `unit_types_index` (name -> index
+    // into `settings.unit_types`) built once per `Game` — no per-tick HashMap build.
     let t1 = Instant::now();
 
     // Phase 1: query all components, compute movement changes
@@ -92,7 +88,7 @@ pub fn run(
                 stats,
                 equipment,
                 &terrain,
-                &unit_type_speeds,
+                unit_types_index,
                 settings,
             )
             .map(|change| (entity, change))
@@ -151,7 +147,7 @@ pub fn run(
     mover_count
 }
 
-#[allow(clippy::too_many_arguments)] // Pure per-unit computation: pos/path/components + precomputed lookup/settings
+#[allow(clippy::too_many_arguments)] // Pure per-unit computation: pos/path/components + cached unit-type index/settings
 fn compute_movement(
     pos: UnitPosition,
     path: &UnitPath,
@@ -159,7 +155,7 @@ fn compute_movement(
     stats: &UnitStats,
     equipment: &UnitEquipment,
     terrain: &Arc<Vec<Vec<Terrain>>>,
-    unit_type_speeds: &HashMap<&str, f32>,
+    unit_types_index: &HashMap<String, usize>,
     settings: &GameSettings,
 ) -> Option<MovementChange> {
     let (nx, ny) = path.path.first()?;
@@ -167,10 +163,10 @@ fn compute_movement(
     let dy = ny - pos.y;
     let dist = (dx * dx + dy * dy).sqrt();
 
-    // O(1) lookup instead of a linear scan over settings.unit_types per unit.
-    let unit_type_speed = unit_type_speeds
-        .get(utype.name.as_str())
-        .copied()
+    // O(1) lookup via the cached index into settings.unit_types (no per-tick map).
+    let unit_type_speed = unit_types_index
+        .get(&utype.name)
+        .map(|&i| settings.unit_types[i].speed)
         .unwrap_or(1.0);
 
     let current_terrain = terrain
@@ -244,12 +240,14 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Build the name -> speed lookup map passed to compute_movement (mirrors run()).
-    fn speeds_map(settings: &GameSettings) -> HashMap<&str, f32> {
+    /// Build the name -> index lookup passed to compute_movement (mirrors the
+    /// cached `Game.unit_types_index` that `run()` receives).
+    fn ut_index(settings: &GameSettings) -> HashMap<String, usize> {
         settings
             .unit_types
             .iter()
-            .map(|ut| (ut.name.as_str(), ut.speed))
+            .enumerate()
+            .map(|(i, ut)| (ut.name.clone(), i))
             .collect()
     }
 
@@ -378,7 +376,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
-            &speeds_map(&settings),
+            &ut_index(&settings),
             &settings,
         );
         assert!(result.is_none());
@@ -417,7 +415,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
-            &speeds_map(&settings),
+            &ut_index(&settings),
             &settings,
         );
         assert!(change.is_some());
@@ -462,7 +460,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
-            &speeds_map(&settings),
+            &ut_index(&settings),
             &settings,
         );
         assert!(change.is_some());
@@ -508,7 +506,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
-            &speeds_map(&settings),
+            &ut_index(&settings),
             &settings,
         );
         assert!(change.is_some());
@@ -550,7 +548,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
-            &speeds_map(&settings),
+            &ut_index(&settings),
             &settings,
         );
         assert!(change.is_some());

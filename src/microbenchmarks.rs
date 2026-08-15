@@ -904,6 +904,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &settings,
                 &mut scratch,
+                &ut_index,
             );
             black_box(scratch.movers.len());
         },
@@ -925,6 +926,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &settings,
                 &mut scratch,
+                &ut_index,
             );
             black_box(scratch.movers.len());
         },
@@ -946,6 +948,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &settings,
                 &mut scratch,
+                &ut_index,
             );
             black_box(scratch.movers.len());
         },

@@ -537,6 +537,7 @@ impl Game {
                 self.world_entity,
                 &self.settings,
                 &mut self.movement_scratch,
+                &self.unit_types_index,
             )
         );
         self.last_mover_count = mover_count;
