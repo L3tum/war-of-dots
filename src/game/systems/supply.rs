@@ -12,19 +12,67 @@
 
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
+
 use crate::game::components::*;
-use crate::game::economy::UnitType;
 use crate::game::game::GameSettings;
+use crate::game::game::TickContext;
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 
+/// Pre-allocated scratch buffers for the supply+attrition system, `.clear()`'d
+/// each tick with capacity preserved. Owned by `Game` and passed by `&mut` into
+/// `run()`. Replaces the old per-tick `Vec<Change>` + `HashMap` locals so the
+/// single mutable query can mutate entities in place without a two-phase apply.
+pub struct SupplyScratch {
+    /// Per-player manpower deducted this tick, indexed by player index (u8).
+    pub mp_cost: Vec<u32>,
+    /// Per-player funds spent this tick, indexed by player index (u8).
+    pub fund_cost: Vec<u32>,
+    /// Units that reached 0 men this tick (for death cleanup). Kept inline on
+    /// the stack for the common case of a handful of deaths (SmallVec), so a
+    /// typical tick does no heap allocation for it.
+    pub dead: SmallVec<[hecs::Entity; 8]>,
+    /// Reusable per-slot delivery plan buffer for `plan_delivery_into`. Most
+    /// units carry 0-2 equipment slots, so the plan stays inline (SmallVec).
+    pub delivery: SmallVec<[(usize, u32); 4]>,
+}
+
+impl SupplyScratch {
+    pub fn new() -> Self {
+        Self {
+            mp_cost: Vec::new(),
+            fund_cost: Vec::new(),
+            dead: SmallVec::new(),
+            delivery: SmallVec::new(),
+        }
+    }
+
+    /// Clear all collections but preserve capacity for reuse across ticks.
+    /// The dense cost vectors are zeroed (not truncated) so they stay sized for
+    /// `resize()` in `run()` — which is a no-op when the player count is
+    /// unchanged, so they must be explicitly reset here each tick.
+    pub fn clear(&mut self) {
+        self.dead.clear();
+        self.delivery.clear();
+        self.mp_cost.fill(0);
+        self.fund_cost.fill(0);
+    }
+}
+
+impl Default for SupplyScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Cost + per-slot delivery plan to restock one unit's equipment toward its
-/// supply buffer, capped at `equipment.supply_rate` items per tick.
-/// Returns ([(slot_idx, items_to_add)], total_cost).
-fn plan_delivery(equipment: &UnitEquipment) -> (Vec<(usize, u32)>, u32) {
+/// supply buffer, capped at `equipment.supply_rate` items per tick. Writes the
+/// plan into `out` (cleared first) and returns the total cost.
+fn plan_delivery_into(equipment: &UnitEquipment, out: &mut SmallVec<[(usize, u32); 4]>) -> u32 {
     let buffer = (100 + equipment.supply_buffer_percent) as f32 / 100.0;
     let mut remaining = equipment.supply_rate;
-    let mut plan: Vec<(usize, u32)> = Vec::new();
+    out.clear();
     let mut cost: u32 = 0;
     for (i, (eq, max_eq)) in equipment
         .equipment
@@ -42,11 +90,11 @@ fn plan_delivery(equipment: &UnitEquipment) -> (Vec<(usize, u32)>, u32) {
         let add = (target - eq.count).min(remaining);
         remaining -= add;
         if add > 0 {
-            plan.push((i, add));
+            out.push((i, add));
             cost += (add as f32 * max_eq.cost_per_item).ceil() as u32;
         }
     }
-    (plan, cost)
+    cost
 }
 
 /// Equipment ratio: carried / required (>= 1.0 when buffered/fully supplied).
@@ -78,146 +126,156 @@ pub fn run(
     world: &mut World,
     world_entity: hecs::Entity,
     settings: &GameSettings,
-) -> Vec<hecs::Entity> {
-    let unit_types_by_name: HashMap<&str, &UnitType> = settings
-        .unit_types
-        .iter()
-        .map(|ut| (ut.name.as_str(), ut))
-        .collect();
+    scratch: &mut SupplyScratch,
+    ctx: &TickContext,
+    unit_types_index: &HashMap<String, usize>,
+) -> SmallVec<[hecs::Entity; 8]> {
+    // Clear scratch for reuse (capacity preserved).
+    scratch.clear();
+
+    // `unit_types_index` (name -> index into `settings.unit_types`) is built once
+    // per `Game`; no per-tick HashMap build here. The per-unit lookup indexes
+    // straight into `settings.unit_types`.
     let recruitment_rate = settings.recruitment_rate;
 
-    // Snapshot each player's global pools (manpower + funds) for FCFS gating.
+    // Snapshot each player's global pools (manpower + funds) into dense
+    // Vec<u32> indexed by player index (u8 from TickContext), for FCFS gating.
+    // The scoped block drops the hecs::Ref immutable borrow so the query below
+    // can take &mut component references.
+    let id_by_index: Vec<String> = {
+        let mut v: Vec<String> = vec![String::new(); ctx.next_player_idx as usize];
+        for (pid, idx) in ctx.player_id_to_index.iter() {
+            v[*idx as usize] = pid.clone();
+        }
+        v
+    };
     let (remaining_mp0, remaining_funds0) = {
         let wb = match world.world_data(world_entity) {
             Some(wb) => wb,
-            None => return Vec::new(),
+            None => return SmallVec::new(),
         };
-        (wb.funds.manpower.clone(), wb.funds.funds.clone())
+        let n = ctx.next_player_idx as usize;
+        let mut mp = vec![0u32; n];
+        let mut funds = vec![0u32; n];
+        for (i, id) in id_by_index.iter().enumerate() {
+            mp[i] = wb.funds.manpower.get(id).copied().unwrap_or(0);
+            funds[i] = wb.funds.funds.get(id).copied().unwrap_or(0);
+        }
+        (mp, funds)
     };
     let mut remaining_mp = remaining_mp0;
     let mut remaining_funds = remaining_funds0;
+    // Per-player cost accumulators indexed by player index (no String hashing).
+    scratch.mp_cost.resize(remaining_mp.len(), 0);
+    scratch.fund_cost.resize(remaining_funds.len(), 0);
 
-    // Collected net changes (attrition + supply applied here), applied once.
-    // (entity, new_stats, new_equipment, new_water_transition)
-    type Change = (
-        hecs::Entity,
-        UnitStats,
-        Option<UnitEquipment>,
-        Option<UnitWaterTransition>,
-    );
-    let mut changes: Vec<Change> = Vec::new();
-    let mut mp_cost: HashMap<String, u32> = HashMap::new();
-    let mut fund_cost: HashMap<String, u32> = HashMap::new();
-
-    // SINGLE PASS over every unit.
-    for (entity, utype, owner, stats, equipment, flags, wt) in world
+    // SINGLE PASS over every unit, mutating each entity's components in place.
+    // No read-then-write staging: hecs permits one &mut per distinct component
+    // type in a query, so all three writes are applied immediately (no
+    // Vec<Change> buffer, no per-entity query_one_mut, no full clones).
+    for (entity, utype, _owner, flags, stats, equipment, wt) in world
         .query::<(
             hecs::Entity,
             &UnitTypeId,
             &UnitOwner,
-            &UnitStats,
-            &UnitEquipment,
             &UnitFlags,
-            &UnitWaterTransition,
+            &mut UnitStats,
+            &mut UnitEquipment,
+            &mut UnitWaterTransition,
         )>()
         .iter()
     {
-        let pid = &owner.player_id;
+        // Dense owner index from TickContext (replaces per-unit String hashing
+        // and pid.clone()). None if this entity is absent from the owner map or
+        // out of range — in which case it simply draws no supply (pools empty).
+        let owner_idx = ctx
+            .owner_id_by_entity
+            .get(&entity)
+            .copied()
+            .map(|i| i as usize)
+            .filter(|&i| i < remaining_funds.len());
         // Dead-waiting-for-surrender units are not mutated here.
         if stats.men <= 0.0 {
             continue;
         }
-        let base_attrition = unit_types_by_name
-            .get(utype.name.as_str())
-            .map(|u| u.base_attrition)
-            .unwrap_or(1.0);
+        let ut = unit_types_index.get(&utype.name).map(|&i| &settings.unit_types[i]);
+        let base_attrition = ut.map(|u| u.base_attrition).unwrap_or(1.0);
 
-        let mut new_stats = *stats;
-        let mut new_equipment: Option<UnitEquipment> = None;
-        let mut new_wt: Option<UnitWaterTransition> = None;
-        let mut changed = false;
+        // IMPORTANT: `ratio` is computed from the PRE-wear, untouched equipment,
+        // matching the original (which read the immutable &UnitEquipment). It
+        // drives both the men-drain multiplier and the organisation malus, so it
+        // must be captured before wear/delivery mutate the counts below.
+        let ratio = equipment_ratio(equipment);
 
         // Attrition — water: org drain + boat supply consumption.
         if flags.on_water && !wt.embarking && !wt.disembarking {
-            if new_stats.organisation > 0.0 {
-                new_stats.organisation = (new_stats.organisation - 0.03).max(0.0);
-                changed = true;
+            if stats.organisation > 0.0 {
+                stats.organisation = (stats.organisation - 0.03).max(0.0);
             }
             if !wt.boat_supply.is_empty() {
-                let mut wtc = (*wt).clone();
                 let drain = (base_attrition * 2.0).max(1.0);
-                for b in wtc.boat_supply.iter_mut() {
+                for b in wt.boat_supply.iter_mut() {
                     if b.count > 0 {
                         b.count = b.count.saturating_sub(drain.ceil() as u32);
                     }
                 }
-                if wtc.boat_supply.iter().map(|e| e.count).sum::<u32>() == 0 {
-                    wtc.boat_supply.clear();
-                    wtc.max_boat_supply.clear();
+                if wt.boat_supply.iter().map(|e| e.count).sum::<u32>() == 0 {
+                    wt.boat_supply.clear();
+                    wt.max_boat_supply.clear();
                 }
-                new_wt = Some(wtc);
-                changed = true;
             }
         }
 
         // Attrition — equipment wear (1 item/tick per stocked slot; applies to
-        // everyone, even encircled). Then Supply — refill toward the supply
-        // buffer (capped by supply_rate, gated on funds, non-encircled only).
-        let mut eq_copy = (*equipment).clone();
-        let mut eq_changed = false;
-        for eq in eq_copy.equipment.iter_mut() {
+        // everyone, even encircled).
+        for eq in equipment.equipment.iter_mut() {
             if eq.count > 0 {
                 eq.count = eq.count.saturating_sub(1);
-                eq_changed = true;
             }
         }
-        let (delivery, cost) = plan_delivery(&eq_copy);
-        let mut delivered = false;
+
+        // Supply — refill toward the supply buffer (capped by supply_rate,
+        // gated on funds, non-encircled only). Plan reuses the scratch buffer.
+        let cost = plan_delivery_into(equipment, &mut scratch.delivery);
         if cost > 0 && !flags.encircled {
-            let avail = remaining_funds.get(pid).copied().unwrap_or(0);
-            if avail >= cost {
-                if let Some(f) = remaining_funds.get_mut(pid) {
-                    *f -= cost;
-                }
-                for (i, add) in delivery {
-                    if let Some(e) = eq_copy.equipment.get_mut(i) {
-                        e.count += add;
+            if let Some(oi) = owner_idx {
+                let avail = remaining_funds[oi];
+                if avail >= cost {
+                    remaining_funds[oi] -= cost;
+                    for (i, add) in scratch.delivery.iter() {
+                        if let Some(e) = equipment.equipment.get_mut(*i) {
+                            e.count += add;
+                        }
                     }
+                    scratch.fund_cost[oi] += cost;
                 }
-                *fund_cost.entry(pid.clone()).or_insert(0) += cost;
-                delivered = true;
             }
-        }
-        if eq_changed || delivered {
-            new_equipment = Some(eq_copy);
-            changed = true;
         }
 
         // Men: attrition drain (base 1/600, scaled 2x..10x when under-supplied)
         // minus supply gain at `recruitment_rate` from the manpower pool.
-        let ratio = equipment_ratio(equipment);
         let mult = if ratio < 1.0 { 10.0 - 8.0 * ratio } else { 1.0 };
         let drain = (1.0 / 600.0) * mult;
         let mut men_gain = 0.0;
-        if !flags.encircled && new_stats.men < new_stats.max_men {
-            let gain = recruitment_rate.min(new_stats.max_men - new_stats.men);
+        if !flags.encircled && stats.men < stats.max_men {
+            let gain = recruitment_rate.min(stats.max_men - stats.men);
             if gain > 0.0 {
-                let avail = remaining_mp.get(pid).copied().unwrap_or(0) as f32;
-                if avail >= gain {
-                    if let Some(mp) = remaining_mp.get_mut(pid) {
-                        *mp -= gain as u32;
+                if let Some(oi) = owner_idx {
+                    let avail = remaining_mp[oi] as f32;
+                    if avail >= gain {
+                        remaining_mp[oi] -= gain as u32;
+                        men_gain = gain;
+                        scratch.mp_cost[oi] += gain as u32;
                     }
-                    men_gain = gain;
-                    *mp_cost.entry(pid.clone()).or_insert(0) += gain as u32;
                 }
             }
         }
-        let new_men = (new_stats.men - drain + men_gain)
-            .max(0.0)
-            .min(new_stats.max_men);
-        if (new_men - new_stats.men).abs() > f32::EPSILON {
-            new_stats.men = new_men;
-            changed = true;
+        let new_men = (stats.men - drain + men_gain).max(0.0).min(stats.max_men);
+        if (new_men - stats.men).abs() > f32::EPSILON {
+            stats.men = new_men;
+        }
+        if stats.men <= 0.0 {
+            scratch.dead.push(entity);
         }
 
         // Organisation recovery (merged from reinforce.rs)
@@ -229,62 +287,38 @@ pub fn run(
             } else {
                 supply_pct / 50.0
             };
-            let unit_reinforce_rate = unit_types_by_name
-                .get(utype.name.as_str())
-                .map(|u| u.reinforcement_rate)
-                .unwrap_or(5.0);
+            let unit_reinforce_rate = ut.map(|u| u.reinforcement_rate).unwrap_or(5.0);
             let reinforce = unit_reinforce_rate * malus;
-            let new_org = (new_stats.organisation + reinforce).min(new_stats.max_organisation);
-            if (new_org - new_stats.organisation).abs() > f32::EPSILON {
-                new_stats.organisation = new_org;
-                changed = true;
+            let new_org = (stats.organisation + reinforce).min(stats.max_organisation);
+            if (new_org - stats.organisation).abs() > f32::EPSILON {
+                stats.organisation = new_org;
             }
-        }
-
-        if changed {
-            changes.push((entity, new_stats, new_equipment, new_wt));
         }
     }
 
-    // Phase 2: deduct from global pools (one write per player).
+    // Deduct from global pools (one write per player).
     {
         let wb = match world.world_data_mut(world_entity) {
             Some(wb) => wb,
-            None => return Vec::new(),
+            None => return SmallVec::new(),
         };
-        for (pid, amount) in mp_cost {
-            if let Some(mp) = wb.funds.manpower.get_mut(&pid) {
-                *mp = mp.saturating_sub(amount);
+        for (i, amount) in scratch.mp_cost.iter().enumerate() {
+            if *amount > 0 {
+                if let Some(mp) = wb.funds.manpower.get_mut(&id_by_index[i]) {
+                    *mp = mp.saturating_sub(*amount);
+                }
             }
         }
-        for (pid, amount) in fund_cost {
-            if let Some(funds) = wb.funds.funds.get_mut(&pid) {
-                *funds = funds.saturating_sub(amount);
+        for (i, amount) in scratch.fund_cost.iter().enumerate() {
+            if *amount > 0 {
+                if let Some(funds) = wb.funds.funds.get_mut(&id_by_index[i]) {
+                    *funds = funds.saturating_sub(*amount);
+                }
             }
         }
     }
 
-    // Phase 3: apply every unit's net change once; collect dead.
-    let mut dead = Vec::new();
-    for (entity, new_stats, new_eq, new_wt) in changes {
-        if let Ok((ms,)) = world.query_one_mut::<(&mut UnitStats,)>(entity) {
-            *ms = new_stats;
-        }
-        if let Some(eq) = new_eq {
-            if let Ok((me,)) = world.query_one_mut::<(&mut UnitEquipment,)>(entity) {
-                *me = eq;
-            }
-        }
-        if let Some(wt) = new_wt {
-            if let Ok((mwt,)) = world.query_one_mut::<(&mut UnitWaterTransition,)>(entity) {
-                *mwt = wt;
-            }
-        }
-        if new_stats.men <= 0.0 {
-            dead.push(entity);
-        }
-    }
-    dead
+    std::mem::take(&mut scratch.dead)
 }
 
 #[cfg(test)]
@@ -294,6 +328,7 @@ mod tests {
     use crate::game::components::{UnitTypeId, UnitWaterTransition};
     use crate::game::economy::City;
     use crate::game::game::GameSettings;
+    use crate::game::game::TickContext;
     use crate::game::unit::Equipment;
     use crate::game::unit::Terrain;
 
@@ -399,6 +434,19 @@ mod tests {
 
     /// Supply delivers up to supply_rate items per tick. Starting at 4 rifles,
     /// attrition wears 1 and supply replaces up to 5, so the unit visibly gains.
+    /// Build a fresh TickContext and run the supply system once.
+    fn run_tick(world: &mut World, world_entity: hecs::Entity, settings: &GameSettings) {
+        let ctx = TickContext::build_full(world, world_entity);
+        let ut_index: HashMap<String, usize> = settings
+            .unit_types
+            .iter()
+            .enumerate()
+            .map(|(i, ut)| (ut.name.clone(), i))
+            .collect();
+        let mut s = SupplyScratch::new();
+        let _ = run(world, world_entity, settings, &mut s, &ctx, &ut_index);
+    }
+
     #[test]
     fn supply_refills_equipment_at_rate_charged_to_funds() {
         let (mut world, world_entity, settings) = make_world(100_000);
@@ -407,7 +455,7 @@ mod tests {
         // Supply: gap to target is 8, capped by supply_rate=5 → delivers 5 → 8.
         let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 4, 10);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
         assert_eq!(
@@ -435,7 +483,7 @@ mod tests {
         // Attrition: 11 → 10. Supply: refills 1 → 11.
         let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 11, 10);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
         assert_eq!(
@@ -466,7 +514,7 @@ mod tests {
         // 0 equipment — if supply worked, it would deliver 1 item.
         let unit = spawn_unit_with_equipment(&mut world, flags, 0, 10);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
         assert_eq!(
@@ -492,7 +540,7 @@ mod tests {
                                                                  // 5/10 rifles. Attrition: 5 → 4. Supply blocked (no funds).
         let unit = spawn_unit_with_equipment(&mut world, UnitFlags::default(), 5, 10);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let eq = world.get::<&UnitEquipment>(unit).unwrap();
         assert_eq!(
@@ -519,7 +567,7 @@ mod tests {
         let unit =
             spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 10, 10, 50.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
@@ -536,7 +584,7 @@ mod tests {
         // 5/10 rifles = 50% supply => malus=1.0
         let unit = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 5, 10, 50.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
@@ -553,7 +601,7 @@ mod tests {
         // 3/10 rifles = 30% supply => malus=0.6 => 5*0.6=3.0
         let unit = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 3, 10, 50.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
@@ -569,7 +617,7 @@ mod tests {
         let unit =
             spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 10, 10, 100.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
@@ -588,7 +636,7 @@ mod tests {
         };
         let unit = spawn_unit_with_equipment_and_org(&mut world, flags, 10, 10, 50.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
@@ -607,7 +655,7 @@ mod tests {
         };
         let unit = spawn_unit_with_equipment_and_org(&mut world, flags, 10, 10, 50.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
@@ -623,12 +671,55 @@ mod tests {
         let (mut world, world_entity, settings) = make_world(100_000);
         let unit = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 0, 10, 50.0);
 
-        run(&mut world, world_entity, &settings);
+        run_tick(&mut world, world_entity, &settings);
 
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
             (stats.organisation - 50.0).abs() < 0.01,
             "zero supply gives zero org recovery"
+        );
+    }
+
+    /// Regression: `Game` holds one `SupplyScratch` reused every tick. The dense
+    /// per-player cost vectors must be zeroed each tick — `Vec::resize` is a
+    /// no-op when the player count is unchanged, so sizing alone would leave the
+    /// previous tick's totals and compound the deduction (which exhausted the
+    /// global pools and killed units far faster than the original code).
+    #[test]
+    fn supply_cost_accumulators_reset_between_ticks() {
+        let (mut world, world_entity, settings) = make_world(1_000_000);
+        let u = spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 10, 10, 50.0);
+        // Keep men well below max so the unit draws exactly 1 manpower
+        // (recruitment_rate) on every tick.
+        let (s,) = world.query_one_mut::<(&mut UnitStats,)>(u).unwrap();
+        s.men = 100.0;
+        s.max_men = 1000.0;
+
+        let manpower = |w: &World, we: hecs::Entity| -> u32 {
+            w.world_data(we).unwrap().funds.manpower.get("P1").copied().unwrap()
+        };
+
+        let mut scratch = SupplyScratch::new();
+        let start = manpower(&world, world_entity);
+        let ut_index: HashMap<String, usize> = settings
+            .unit_types
+            .iter()
+            .enumerate()
+            .map(|(i, ut)| (ut.name.clone(), i))
+            .collect();
+
+        // Two ticks on the SAME scratch (mirrors Game's persistent scratch).
+        let ctx = TickContext::build_full(&world, world_entity);
+        let _ = run(&mut world, world_entity, &settings, &mut scratch, &ctx, &ut_index);
+        let ctx2 = TickContext::build_full(&world, world_entity);
+        let _ = run(&mut world, world_entity, &settings, &mut scratch, &ctx2, &ut_index);
+
+        let end = manpower(&world, world_entity);
+        // 2 ticks × 1 manpower = 2. With the carry-over bug it would be 3.
+        assert_eq!(
+            start - end,
+            2,
+            "per-player cost accumulators compounded across ticks (must reset each tick)"
         );
     }
 }

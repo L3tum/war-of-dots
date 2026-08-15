@@ -480,6 +480,9 @@ impl CombatFixture {
 struct SupplyFixture {
     world: World,
     world_entity: hecs::Entity,
+    /// Owner/pool context, built once in `new()` (un-timed setup) so the
+    /// benchmark measures `supply::run` alone, not `TickContext::build_full`.
+    ctx: TickContext,
 }
 
 impl SupplyFixture {
@@ -492,9 +495,11 @@ impl SupplyFixture {
     ) -> Self {
         let (mut world, world_entity) = make_world(width, height, num_players);
         spawn_n_units(&mut world, world_entity, unit_type, count);
+        let ctx = TickContext::build_full(&world, world_entity);
         Self {
             world,
             world_entity,
+            ctx,
         }
     }
 }
@@ -823,6 +828,14 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
     let mut results = Vec::new();
     let ut = bench_unit_type();
     let settings = bench_settings();
+    // Unit-type name -> index, built once (mirrors what `Game` caches) so
+    // `supply::run` doesn't rebuild the map every iteration.
+    let ut_index: std::collections::HashMap<String, usize> = settings
+        .unit_types
+        .iter()
+        .enumerate()
+        .map(|(i, ut)| (ut.name.clone(), i))
+        .collect();
 
     // --- Movement ---
 
@@ -955,6 +968,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &mut scratch,
                 &settings,
                 &ctx,
+                &ut_index,
             );
             black_box(scratch.engaged_pairs());
         },
@@ -978,6 +992,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &mut scratch,
                 &settings,
                 &ctx,
+                &ut_index,
             );
             black_box(scratch.engaged_pairs());
         },
@@ -995,7 +1010,15 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || SupplyFixture::new(30, 30, 2, &ut, 200),
         |f: &mut SupplyFixture| {
-            crate::game::systems::supply::run(&mut f.world, f.world_entity, &settings);
+            let mut scratch = crate::game::systems::supply::SupplyScratch::new();
+            crate::game::systems::supply::run(
+                &mut f.world,
+                f.world_entity,
+                &settings,
+                &mut scratch,
+                &f.ctx,
+                &ut_index,
+            );
             black_box(200);
         },
     );
@@ -1010,7 +1033,15 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || SupplyFixture::new(40, 40, 2, &ut, 500),
         |f: &mut SupplyFixture| {
-            crate::game::systems::supply::run(&mut f.world, f.world_entity, &settings);
+            let mut scratch = crate::game::systems::supply::SupplyScratch::new();
+            crate::game::systems::supply::run(
+                &mut f.world,
+                f.world_entity,
+                &settings,
+                &mut scratch,
+                &f.ctx,
+                &ut_index,
+            );
             black_box(500);
         },
     );

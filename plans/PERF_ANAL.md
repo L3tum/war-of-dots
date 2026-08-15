@@ -365,6 +365,56 @@ for (entity, (pos, owner, stats, flags, nearby)) in world.query::<...>().iter() 
 
 **Risk:** Low — this is a mechanical refactor. Systems that need random access (combat) or need to collect changes for mutation (movement, supply) cannot do this and should be excluded.
 
+### Priority 7: Reusable `unit_types_index` pattern (APPLIED to supply + combat; backlog for other systems)
+
+**What it is:** Several systems did a per-tick `HashMap` build keyed on unit-type name
+(`HashMap<&str, &UnitType>` / `HashMap<&str, f32>`) just to turn a unit's `UnitTypeId.name`
+into config fields. That rebuild is pointless — `Game.settings.unit_types` is fixed for the
+lifetime of a `Game`. The fix is a **dense index built once** and threaded into each system:
+
+```rust
+// Game::new (built once, before `settings` is moved into Self):
+let unit_types_index: HashMap<String, usize> = settings
+    .unit_types
+    .iter()
+    .enumerate()
+    .map(|(i, ut)| (ut.name.clone(), i))
+    .collect();
+```
+
+Each system's `run()` then takes `unit_types_index: &HashMap<String, usize>` and indexes
+straight into `settings.unit_types[i]` per unit — no per-tick map build:
+
+```rust
+let ut = unit_types_index.get(&utype.name).map(|&i| &settings.unit_types[i]);
+let rate = ut.map(|u| u.fighting_attrition).unwrap_or(1.0); // or .speed / .base_attrition / ...
+```
+
+**Status:**
+- ✅ **APPLIED — `supply.rs`** (`run()` takes the index; per-unit `base_attrition` /
+  `reinforcement_rate` / max-org lookups). Replaced the per-tick `HashMap<&str,&UnitType>`.
+- ✅ **APPLIED — `combat.rs`** (`run()` takes the index; per-engagement `fighting_attrition`
+  lookup, ~O(N×K) in the hot loop). Replaced the per-tick `HashMap<&str,&UnitType>`.
+- ⬜ **NEXT CANDIDATE — `movement.rs`** builds `unit_type_speeds: HashMap<&str, f32>` every
+  tick (line ~65). Thread the same index through and use `settings.unit_types[i].speed`.
+
+**Perf note:** In isolation this is **perf-flat** — a 3-entry `HashMap` build per tick is
+already tiny and the microbenchmark showed no measurable delta (see
+`implementation-report-20260814-090000.md`). It is worth doing **opportunistically** as part
+of touching a system (it's a strict simplification, removes per-tick allocation, and shrinks
+the per-unit lookup), **not** as a standalone optimization. Keep it in mind when revisiting
+any system that currently builds a per-tick name-keyed map.
+
+**Safety invariant (why the cached index can't go stale):** `Game.settings` is a **private**
+field, written only in `Game::new`, and only ever read afterward (`fn settings(&self)` returns
+`&GameSettings`; there is no `&mut self.settings` and no reassignment). So
+`settings.unit_types` is immutable for a `Game`'s lifetime and the index stays valid. Every
+`run()` call site pairs the index with the same `settings` it was built from. (If `Game`
+ever gains a `set_unit_types`-style mutator, the index must be rebuilt in it.)
+
+**Microbenchmark plumbing note:** `microbenchmarks.rs::bench_systems()` builds the index once
+in un-timed setup and passes it to both the supply and combat closures, mirroring `Game`.
+
 ### What NOT to do
 
 - **Don't add `PreparedQuery`** — adds code complexity for nanosecond savings

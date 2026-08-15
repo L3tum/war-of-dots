@@ -33,6 +33,7 @@ crossterm = "0.28"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 hecs = "0.11"
 subtle = "2"
+smallvec = "1"
 
 [features]
 default = []

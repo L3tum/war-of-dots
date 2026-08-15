@@ -6,7 +6,6 @@
 //! and re-fetched on each engagement.
 
 use crate::game::components::*;
-use crate::game::economy::UnitType;
 use crate::game::game::GameSettings;
 use crate::game::game::TickContext;
 use crate::game::world_ext::WorldExt;
@@ -148,17 +147,14 @@ pub fn run(
     scratch: &mut CombatScratch,
     settings: &GameSettings,
     ctx: &TickContext,
+    unit_types_index: &HashMap<String, usize>,
 ) -> Vec<hecs::Entity> {
     // Clear scratch for reuse (capacity preserved)
     scratch.clear();
 
-    // Precompute unit-type lookup (name -> &UnitType) once per tick so per-engagement
-    // attrition lookups are O(1). Mirrors the pattern in attrition.rs.
-    let unit_types_by_name: HashMap<&str, &UnitType> = settings
-        .unit_types
-        .iter()
-        .map(|ut| (ut.name.as_str(), ut))
-        .collect();
+    // Unit-type lookup uses `unit_types_index` (name -> index into
+    // `settings.unit_types`), built once per `Game` — no per-tick HashMap build.
+    // Per-engagement attrition lookups index straight into `settings.unit_types`.
 
     // Scoped Arc extraction: drops hecs::Ref borrow immediately, only clones terrain Arc (24 bytes)
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
@@ -369,18 +365,18 @@ pub fn run(
             let d_men = (s2.men - dmg_to_defender).max(0.0);
 
             // Fetch both units' unit-type configs for attrition rates. Uses the
-            // precomputed HashMap so this is O(1) per engagement.
+            // cached index so this is O(1) per engagement.
             let (a_attr_rate, d_attr_rate) = {
                 let a_rate = world
                     .get::<&UnitTypeId>(*entity1)
                     .ok()
-                    .and_then(|ut| unit_types_by_name.get(ut.name.as_str()))
+                    .and_then(|ut| unit_types_index.get(&ut.name).map(|&i| &settings.unit_types[i]))
                     .map(|ut| ut.fighting_attrition)
                     .unwrap_or(1.0);
                 let d_rate = world
                     .get::<&UnitTypeId>(entity2)
                     .ok()
-                    .and_then(|ut| unit_types_by_name.get(ut.name.as_str()))
+                    .and_then(|ut| unit_types_index.get(&ut.name).map(|&i| &settings.unit_types[i]))
                     .map(|ut| ut.fighting_attrition)
                     .unwrap_or(1.0);
                 (a_rate, d_rate)
@@ -496,6 +492,18 @@ mod tests {
     use crate::config::CityUpgradeSettings;
     use crate::game::game::TickContext;
     use crate::game::unit::{Equipment, Terrain};
+
+    /// Unit-type name -> index into `test_settings().unit_types`, used for
+    /// `run`'s cached-index param. `test_settings()` is deterministic, so
+    /// this matches any `&test_settings()` value passed to `run`.
+    fn ut_index() -> HashMap<String, usize> {
+        test_settings()
+            .unit_types
+            .iter()
+            .enumerate()
+            .map(|(i, ut)| (ut.name.clone(), i))
+            .collect()
+    }
 
     fn make_world() -> (World, hecs::Entity) {
         let mut world = World::new();
@@ -678,6 +686,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         assert_eq!(
@@ -704,6 +713,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
         assert!(
             dead.is_empty(),
@@ -738,6 +748,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let men_of = |world: &World, e: hecs::Entity| {
@@ -778,6 +789,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let d_men = world.get::<&UnitStats>(d).map(|s| s.men).unwrap();
@@ -815,6 +827,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let defender_dead = dead.iter().any(|e| e.id() == defender.id());
@@ -850,6 +863,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let defender_eq = world
@@ -901,6 +915,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
         let dmg_full = 100.0 - world.get::<&UnitStats>(d_full).unwrap().men;
 
@@ -917,6 +932,7 @@ mod tests {
             &mut scratch2,
             &test_settings(),
             &ctx2,
+            &ut_index(),
         );
         let dmg_deprived = 100.0 - world2.get::<&UnitStats>(d_deprived).unwrap().men;
 
@@ -943,6 +959,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let flags = world.get::<&UnitFlags>(unit).unwrap();
@@ -1002,6 +1019,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let a_men = world.get::<&UnitStats>(attacker).map(|s| s.men).unwrap();
@@ -1039,6 +1057,7 @@ mod tests {
             &mut scratch,
             &test_settings(),
             &ctx,
+            &ut_index(),
         );
 
         let a_stats = world.get::<&UnitStats>(attacker).unwrap();

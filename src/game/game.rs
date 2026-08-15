@@ -100,6 +100,11 @@ pub struct Game {
     entity_reverse: HashMap<hecs::Entity, String>,
     /// Pre-allocated combat scratch, cleared and reused each tick.
     combat_scratch: systems::combat::CombatScratch,
+    /// Pre-allocated supply/attrition scratch, cleared and reused each tick.
+    supply_scratch: systems::supply::SupplyScratch,
+    /// Unit-type name -> index into `settings.unit_types`, built once at
+    /// `Game::new` so the supply system does not rebuild the map every tick.
+    unit_types_index: HashMap<String, usize>,
     /// Pre-allocated movement scratch, cleared and reused each tick. Holds the
     /// mover records that movement system uses.
     movement_scratch: systems::movement::MovementScratch,
@@ -383,11 +388,20 @@ impl Game {
 
         // Build initial TickContext before world is moved into Self
         let ctx = TickContext::build_initial(&world, world_entity);
+        // Cache unit-type name -> index once (settings is moved into Self below,
+        // so build the map first). Supply indexes straight into settings.unit_types.
+        let unit_types_index: HashMap<String, usize> = settings
+            .unit_types
+            .iter()
+            .enumerate()
+            .map(|(i, ut)| (ut.name.clone(), i))
+            .collect();
 
         Self {
             world,
             world_entity,
             settings,
+            unit_types_index,
             players,
             tick: 0,
             running: false,
@@ -397,6 +411,7 @@ impl Game {
             entity_registry: HashMap::new(),
             entity_reverse: HashMap::new(),
             combat_scratch: systems::combat::CombatScratch::new(),
+            supply_scratch: systems::supply::SupplyScratch::new(),
             movement_scratch: systems::movement::MovementScratch::default(),
             last_mover_count: 0,
             last_engaged_pairs: 0,
@@ -570,7 +585,8 @@ impl Game {
                     self.world_entity,
                     &mut self.combat_scratch,
                     &self.settings,
-                    ctx
+                    ctx,
+                    &self.unit_types_index
                 )
             )
         };
@@ -583,7 +599,14 @@ impl Game {
             "supply",
             &mut self.world,
             self.world_entity,
-            systems::supply::run(&mut self.world, self.world_entity, &self.settings)
+            systems::supply::run(
+                &mut self.world,
+                self.world_entity,
+                &self.settings,
+                &mut self.supply_scratch,
+                &self.ctx,
+                &self.unit_types_index,
+            )
         );
 
         // City capture — returns list of city IDs whose ownership changed
