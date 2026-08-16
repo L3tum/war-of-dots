@@ -12,7 +12,6 @@ use crate::game::game::TickContext;
 use crate::game::systems::influence::NONE;
 use crate::game::world_ext::WorldExt;
 use hecs::World;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
@@ -29,24 +28,22 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
     let wusize = w as usize;
     let grid_size = wusize * (h as usize);
 
-    // Map player IDs to indices 0..N (still needed for the flag-setting loop).
-    // Sort for deterministic index assignment + tie-breaking (the underlying
-    // units_by_player HashMap has process-random iteration order).
+    // Map player IDs to indices 0..N by enumeration (still needed for the
+    // flag-setting loop). Sort for deterministic index assignment + tie-breaking
+    // (the underlying units_by_player HashMap has process-random iteration order).
+    // The index is the sorted position — must stay in lockstep with
+    // `influence::run`, which builds the territory grid the same way.
     let mut players: Vec<&String> = ctx.units_by_player.keys().collect();
     players.sort();
     let nplayers = players.len();
-    let player_to_idx: HashMap<&str, u8> = players
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.as_str(), i as u8))
-        .collect();
 
-    // Collect all cities by player index for seeding
+    // Collect all cities by player index for seeding. nplayers is tiny, so a
+    // linear `position` lookup beats building a HashMap for it.
     let mut cities_by_player: Vec<Vec<(i32, i32)>> = vec![Vec::new(); nplayers];
     for c in &ctx.cities {
         if let Some(owner) = &c.owner {
-            if let Some(&idx) = player_to_idx.get(owner.as_str()) {
-                cities_by_player[idx as usize].push((c.position.0 as i32, c.position.1 as i32));
+            if let Some(idx) = players.iter().position(|p| p.as_str() == owner.as_str()) {
+                cities_by_player[idx].push((c.position.0 as i32, c.position.1 as i32));
             }
         }
     }
@@ -88,8 +85,8 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
     }
 
     // Now mark unit encirclement flags: dominated but not safe
-    for player_id in &players {
-        let player_idx = *player_to_idx.get(player_id.as_str()).unwrap();
+    for (player_idx, player_id) in players.iter().enumerate() {
+        let player_idx = player_idx as u8;
         let entities = &ctx.units_by_player[*player_id];
         for handle in entities {
             let xi = handle.pos.0 as i32;

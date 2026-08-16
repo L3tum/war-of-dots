@@ -1701,8 +1701,8 @@ mod tests {
                 .world
                 .world_data(game.world_entity)
                 .unwrap()
-                .borders
-                .grids,
+                .territory
+                .grid,
         ) as *const ();
 
         for _ in 0..3 {
@@ -1720,8 +1720,8 @@ mod tests {
                     .world
                     .world_data(game.world_entity)
                     .unwrap()
-                    .borders
-                    .grids,
+                    .territory
+                    .grid,
             ) as *const (),
             ptr_3,
             "clean tick must not replace the grid Arc"

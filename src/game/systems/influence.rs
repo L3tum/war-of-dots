@@ -58,19 +58,39 @@ fn circle_spans() -> &'static Vec<Vec<(i32, i32, i32)>> {
 }
 
 /// Pre-allocated scratch for influence, owned by `Game` (SupplyScratch pattern).
-/// `city_positions` is the per-player filtered city list (typically ≤ 20
-/// entries), `.clear()`'d per player with capacity preserved.
+/// Buffers are sized once (see `ensure`) and reused across dirty ticks; the
+/// per-tick reset is a cheap `fill()` memset instead of a fresh allocation.
+/// - `city_positions`: per-player filtered city list (typically ≤ 20 entries).
+/// - `player_influence`: one reused per-player influence buffer (folded straight
+///   into the running territory, never stored per player).
+/// - `territory` / `territory_max`: running dominant-player + max-influence
+///   accumulators for the per-player territory fold.
 pub struct InfluenceScratch {
     pub city_positions: Vec<(f32, f32)>,
+    pub player_influence: Vec<u16>,
+    pub territory: Vec<u8>,
+    pub territory_max: Vec<u16>,
 }
 impl InfluenceScratch {
     pub fn new() -> Self {
         Self {
             city_positions: Vec::new(),
+            player_influence: Vec::new(),
+            territory: Vec::new(),
+            territory_max: Vec::new(),
         }
     }
-    pub fn clear(&mut self) {
-        self.city_positions.clear();
+    /// Grow the per-tick buffers to `grid_size` once (no-op when already sized).
+    fn ensure(&mut self, grid_size: usize) {
+        if self.player_influence.len() != grid_size {
+            self.player_influence.resize(grid_size, 0);
+        }
+        if self.territory.len() != grid_size {
+            self.territory.resize(grid_size, NONE);
+        }
+        if self.territory_max.len() != grid_size {
+            self.territory_max.resize(grid_size, 0);
+        }
     }
 }
 impl Default for InfluenceScratch {
@@ -87,13 +107,58 @@ fn add_influence(grid: &mut [u16], idx: usize, delta: u16) {
     grid[idx] = grid[idx].saturating_add(delta);
 }
 
-/// Compute vision and influence grids for a single player.
+/// Stamp one Euclidean circle (from the precomputed `circle_spans` table) into
+/// the vision and influence grids centred on cell `(cx, cy)`. The per-cell
+/// x-bounds check is hoisted: each row's valid x-range is clamped to the map
+/// once per row, so the inner loop is straight-line index math. The written cell
+/// set is identical to the per-cell `(0..w).contains(&x)` test it replaces
+/// (`x ∈ [cx+dx_start, cx+dx_end] ∧ x ∈ [0, w)` = `x ∈ [max(lo), min(hi)]`).
+#[inline]
+#[allow(clippy::too_many_arguments)] // circle params + 2 output buffers + dims
+fn stamp_circle(
+    vision: &mut [bool],
+    influence: &mut [u16],
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    weight: u16,
+    w: usize,
+    h: usize,
+) {
+    let spans = circle_spans().get(radius as usize).unwrap();
+    for &(dy, dx_start, dx_end) in spans {
+        let y = cy + dy;
+        if y < 0 || y >= h as i32 {
+            continue;
+        }
+        let y_off = (y as usize) * w;
+        // Clamp the row's x-range to the map, in i32 space (so a zero-width map
+        // yields lo > hi rather than a bogus usize range). lo ≥ 0 and hi ≤ w-1,
+        // so every written idx is in bounds.
+        let lo = (cx + dx_start).max(0);
+        let hi = (cx + dx_end).min(w as i32 - 1);
+        if lo > hi {
+            continue;
+        }
+        for x in lo..=hi {
+            let idx = y_off + (x as usize);
+            vision[idx] = true;
+            add_influence(influence, idx, weight);
+        }
+    }
+}
+
+/// Compute vision and influence for a single player.
 /// Pure (no world access); takes only references so it stays unit-testable.
 /// Vision and influence share one circle per source (unit or city); `settings`
 /// supplies the per-source weight and the circle radii.
-#[allow(clippy::too_many_arguments)] // Pure per-player projection: scratch/terrain/sources/settings + dims
+///
+/// Influence is written into the caller's reused `influence` buffer (reset to
+/// zero here) and folded into the territory by the caller; vision is returned
+/// as a fresh `Vec<bool>` because it must be published (owned) each dirty tick.
+#[allow(clippy::too_many_arguments)] // Pure per-player projection: sources/settings/dims + 2 output buffers
 fn compute_player(
-    scratch: &mut InfluenceScratch,
+    city_positions: &mut Vec<(f32, f32)>,
     terrain: &Arc<Vec<Vec<Terrain>>>,
     player_id: &str,
     units: &[UnitHandle],
@@ -101,26 +166,23 @@ fn compute_player(
     settings: &InfluenceSettings,
     w: i32,
     h: i32,
-) -> (Vec<bool>, Vec<u16>) {
+    influence: &mut [u16],
+) -> Vec<bool> {
     let w_usize = w as usize;
     let grid_size = w_usize * (h as usize);
 
-    // Fresh, zeroed per player — zeroing is guaranteed by the initializers.
-    // (Recycled buffers would retain stale vision/influence cells.)
+    // Vision is published fresh each tick; influence reuses the caller buffer.
     let mut vision_grid = vec![false; grid_size];
-    let mut influence_grid = vec![0u16; grid_size];
+    influence.fill(0);
 
     // Unit loop — a single circle pass writes both vision and influence.
     for handle in units {
         let (ux_f, uy_f) = handle.pos;
-        let ux_i = ux_f as i32;
-        let uy_i = uy_f as i32;
 
-        // Hills extend the circle radius (both vision and influence).
-        // The `.clamp(0, …)` lower bound guards against a playtest setting a
-        // negative radius in config (would otherwise wrap `as usize` and
-        // panic on the span lookup); the upper bound caps to the precomputed
-        // span table.
+        // Hills extend the circle radius (both vision and influence). The lower
+        // `.clamp(0, …)` guard defends against a negative configured radius (would
+        // otherwise wrap `as usize` and panic on the span lookup); the upper bound
+        // caps to the precomputed span table.
         let radius = ((settings.unit_radius
             * match terrain
                 .get(ux_f as usize)
@@ -131,60 +193,71 @@ fn compute_player(
             }) as i32)
             .clamp(0, MAX_RADIUS);
 
-        for &(dy, dx_start, dx_end) in circle_spans().get(radius as usize).unwrap() {
-            let y = uy_i + dy;
-            if (0..h).contains(&y) {
-                let y_off = (y as usize) * w_usize;
-                for dx in dx_start..=dx_end {
-                    let x = ux_i + dx;
-                    if (0..w).contains(&x) {
-                        let idx = y_off + (x as usize);
-                        vision_grid[idx] = true;
-                        add_influence(&mut influence_grid, idx, settings.unit_weight);
-                    }
-                }
-            }
-        }
+        stamp_circle(
+            &mut vision_grid,
+            influence,
+            ux_f as i32,
+            uy_f as i32,
+            radius,
+            settings.unit_weight,
+            w_usize,
+            h as usize,
+        );
     }
 
     // City loop — same single-circle shape, configured radius/weight, no
     // terrain modifier.
     let city_radius =
         ((settings.unit_radius * settings.city_radius_multiplier) as i32).clamp(0, MAX_RADIUS);
-    scratch.city_positions.clear();
+    city_positions.clear();
     for c in cities {
         if c.owner.as_deref() == Some(player_id) {
-            scratch.city_positions.push(c.position);
+            city_positions.push(c.position);
         }
     }
-    for &(cx, cy) in &scratch.city_positions {
-        let (cx_i, cy_i) = (cx as i32, cy as i32);
-        for &(dy, dx_start, dx_end) in circle_spans().get(city_radius as usize).unwrap() {
-            let y = cy_i + dy;
-            if (0..h).contains(&y) {
-                let y_off = (y as usize) * w_usize;
-                for dx in dx_start..=dx_end {
-                    let x = cx_i + dx;
-                    if (0..w).contains(&x) {
-                        let idx = y_off + (x as usize);
-                        vision_grid[idx] = true;
-                        add_influence(&mut influence_grid, idx, settings.city_weight);
-                    }
-                }
-            }
-        }
+    for &(cx, cy) in city_positions.iter() {
+        stamp_circle(
+            &mut vision_grid,
+            influence,
+            cx as i32,
+            cy as i32,
+            city_radius,
+            settings.city_weight,
+            w_usize,
+            h as usize,
+        );
     }
 
-    (vision_grid, influence_grid)
+    vision_grid
 }
 
 /// Sentinel for "no player has influence at this cell."
 pub(crate) const NONE: u8 = 255;
 
+/// Fold one player's influence grid into the running territory accumulators:
+/// a cell is claimed by this player only on a strict influence `>` (a running
+/// max), so the lowest-sorted player wins ties. Shared by `build_territory_grid`
+/// (unit tests) and the fused per-player fold in `run()` — single source of the
+/// fold logic.
+#[inline]
+fn fold_influence_into(dominant: &mut [u8], max_inf: &mut [u16], grid: &[u16], idx: u8) {
+    for i in 0..dominant.len() {
+        if grid[i] > max_inf[i] {
+            max_inf[i] = grid[i];
+            dominant[i] = idx;
+        }
+    }
+}
+
 /// Compute the territory grid: which player has the highest influence at each
 /// cell. Players iterated in sorted order; strict `>` means the lowest-sorted
 /// ID wins ties. Returns `Vec<u8>` — player index or `NONE` (255) where no
 /// player has influence.
+///
+/// Production `run()` folds each player straight into the running territory
+/// (see `fold_influence_into`); this standalone batch version exists for the
+/// unit tests that exercise the fold on a ready-made set of per-player grids.
+#[cfg(test)]
 pub(crate) fn build_territory_grid(
     border_grids: &HashMap<String, Vec<u16>>,
     player_to_idx: &HashMap<&str, u8>,
@@ -198,19 +271,11 @@ pub(crate) fn build_territory_grid(
     for player_id in player_ids {
         let idx = *player_to_idx.get(player_id).unwrap();
         if let Some(grid) = border_grids.get(player_id) {
-            for i in 0..grid_size {
-                if grid[i] > max_inf[i] {
-                    max_inf[i] = grid[i];
-                    dominant[i] = idx;
-                }
-            }
+            fold_influence_into(&mut dominant, &mut max_inf, grid, idx);
         }
     }
-    for i in 0..grid_size {
-        if max_inf[i] == 0 {
-            dominant[i] = NONE;
-        }
-    }
+    // Cells no player reached stay `NONE`: `max_inf` only ever increases, so
+    // `max_inf[i] == 0` ⟹ `dominant[i]` was never written (its init value).
     dominant
 }
 
@@ -237,16 +302,27 @@ pub fn run(
 
     let w = ctx.width as i32;
     let h = ctx.height as i32;
+    let grid_size = (w * h) as usize;
 
-    // Compute per player directly from ctx (positions carried by UnitHandle),
-    // inserting finished grids into the output maps by value — no intermediate
-    // position Vecs, no per-player grid clones, no id to_string().
-    let mut updated_vision: HashMap<String, Vec<bool>> = HashMap::new();
-    let mut updated_border: HashMap<String, Vec<u16>> = HashMap::new();
+    // Sorted player order: deterministic tie-break, and the enumeration index
+    // MUST match `encirclement.rs` (which sorts `units_by_player` keys and
+    // enumerates) or encirclement would flag the wrong player.
+    let mut sorted_players: Vec<&String> = ctx.units_by_player.keys().collect();
+    sorted_players.sort();
 
-    for (player_id, units) in &ctx.units_by_player {
-        let (vision, influence) = compute_player(
-            scratch,
+    // Size scratch buffers once; reset the territory accumulators for this run.
+    scratch.ensure(grid_size);
+    scratch.territory.fill(NONE);
+    scratch.territory_max.fill(0);
+
+    let mut updated_vision: HashMap<String, Vec<bool>> =
+        HashMap::with_capacity(sorted_players.len());
+
+    for (idx, &player_id) in sorted_players.iter().enumerate() {
+        let units = ctx.units_by_player.get(player_id).unwrap();
+        // Compute into the reused scratch buffers (disjoint field borrows).
+        let vision = compute_player(
+            &mut scratch.city_positions,
             &terrain_grid,
             player_id,
             units,
@@ -254,29 +330,25 @@ pub fn run(
             settings,
             w,
             h,
+            &mut scratch.player_influence,
+        );
+        // A1: fold this player's influence straight into the running territory
+        // (index = sorted position), then discard the buffer.
+        fold_influence_into(
+            &mut scratch.territory,
+            &mut scratch.territory_max,
+            &scratch.player_influence,
+            idx as u8,
         );
         updated_vision.insert(player_id.clone(), vision);
-        updated_border.insert(player_id.clone(), influence);
     }
-    scratch.clear(); // release the per-player city list contents (capacity kept)
 
-    // Build territory grid from per-player influence (sorted keys for deterministic ties)
-    let mut sorted_players: Vec<&String> = updated_border.keys().collect();
-    sorted_players.sort();
-    let player_to_idx: HashMap<&str, u8> = sorted_players
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.as_str(), i as u8))
-        .collect();
-
-    let grid_size = (w * h) as usize;
-    let territory = build_territory_grid(&updated_border, &player_to_idx, grid_size);
-
-    // Write to world
+    // Publish. `borders.grids` is production-dead (only `#[cfg(test)]` reads it)
+    // and is no longer written; the per-player influence grids are folded above
+    // and discarded. Territory is cloned into a fresh Arc since the world owns it.
     if let Some(wb) = world.world_data_mut(ctx.world_entity) {
         wb.vision.grids = Arc::new(updated_vision);
-        wb.borders.grids = Arc::new(updated_border);
-        wb.territory.grid = Arc::new(territory);
+        wb.territory.grid = Arc::new(scratch.territory.clone());
     }
 }
 
@@ -336,10 +408,11 @@ mod tests {
         cities: &[City],
         terrain: &Arc<Vec<Vec<Terrain>>>,
     ) -> (Vec<bool>, Vec<u16>) {
-        let mut scratch = InfluenceScratch::new();
+        let mut city_positions = Vec::new();
+        let mut influence = vec![0u16; (W * H) as usize];
         let units: Vec<UnitHandle> = units.iter().map(|&p| unit(p)).collect();
-        compute_player(
-            &mut scratch,
+        let vision = compute_player(
+            &mut city_positions,
             terrain,
             "player_0",
             &units,
@@ -347,7 +420,9 @@ mod tests {
             &InfluenceSettings::default(),
             W,
             H,
-        )
+            &mut influence,
+        );
+        (vision, influence)
     }
 
     fn idx(x: i32, y: i32) -> usize {
@@ -448,23 +523,32 @@ mod tests {
         let settings = InfluenceSettings::default();
         let mut scratch = InfluenceScratch::new();
         run(&mut world, &ctx, 1, &mut scratch, true, &settings);
-        let (grids_ptr, vision_snapshot, border_snapshot, territory_ptr) = {
+        let (vision_ptr, vision_snapshot, territory_ptr) = {
             let wb = world.world_data(world_entity).unwrap();
             (
-                Arc::as_ptr(&wb.borders.grids) as *const (),
+                Arc::as_ptr(&wb.vision.grids) as *const (),
                 wb.vision.grids.clone(),
-                wb.borders.grids.clone(),
                 Arc::as_ptr(&wb.territory.grid) as *const (),
             )
         };
+        // Sanity: the dirty run actually produced non-empty vision and a
+        // non-trivial territory grid (a unit's r5 circle is not all NONE).
+        assert!(vision_snapshot["player_0"].iter().any(|&v| v));
+        assert!(world
+            .world_data(world_entity)
+            .unwrap()
+            .territory
+            .grid
+            .iter()
+            .any(|&v| v != NONE));
 
         // Clean tick: must early-return without touching the stored Arcs.
         run(&mut world, &ctx, 2, &mut scratch, false, &settings);
         let wb = world.world_data(world_entity).unwrap();
         assert_eq!(
-            Arc::as_ptr(&wb.borders.grids) as *const (),
-            grids_ptr,
-            "skip must not replace the grid Arc"
+            Arc::as_ptr(&wb.vision.grids) as *const (),
+            vision_ptr,
+            "skip must not replace the vision Arc"
         );
         assert_eq!(
             Arc::as_ptr(&wb.territory.grid) as *const (),
@@ -472,9 +556,6 @@ mod tests {
             "skip must not replace the territory grid Arc"
         );
         assert_eq!(&*wb.vision.grids, &*vision_snapshot);
-        assert_eq!(&*wb.borders.grids, &*border_snapshot);
-        // Sanity: the dirty run actually produced non-empty grids
-        assert!(!border_snapshot["player_0"].iter().all(|&v| v == 0));
     }
 
     #[test]
@@ -617,5 +698,43 @@ mod tests {
         assert!(seen.contains(&0));
         assert!(seen.contains(&1));
         assert!(seen.contains(&NONE));
+    }
+
+    #[test]
+    fn circle_pass_edge_cells() {
+        // A unit at the map corner (0,0) is clipped by the map bounds. Compare
+        // the stamped circle against a naive per-cell `dx^2+dy^2 <= r^2` reference
+        // (the `circle_spans` table and this test use the same integer rule, so
+        // any off-by-one in the hoisted per-row x-clamp in `stamp_circle` shows up).
+        let (vision, _) = compute(&[(0.0, 0.0)], &[], &terrain());
+        let r: i32 = 5;
+        for y in 0..H {
+            for x in 0..W {
+                let dx = x;
+                let dy = y;
+                let expected = (dx * dx + dy * dy) <= r * r;
+                assert_eq!(vision[idx(x, y)], expected, "cell ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn territory_fold_zero_stays_none() {
+        // Folding an all-zero influence grid into a fresh accumulator must leave
+        // every cell NONE (guards the removed "reset to NONE" second pass in the
+        // fused fold path). A real grid then claims exactly its own cells.
+        let grid_size = (W * H) as usize;
+        let zero = vec![0u16; grid_size];
+        let mut dominant = vec![NONE; grid_size];
+        let mut max_inf = vec![0u16; grid_size];
+        fold_influence_into(&mut dominant, &mut max_inf, &zero, 0);
+        assert!(dominant.iter().all(|&v| v == NONE));
+
+        let (_, inf) = compute(&[(20.0, 20.0)], &[], &terrain());
+        let mut dominant = vec![NONE; grid_size];
+        let mut max_inf = vec![0u16; grid_size];
+        fold_influence_into(&mut dominant, &mut max_inf, &inf, 7);
+        assert_eq!(dominant[idx(20, 20)], 7);
+        assert_eq!(dominant[idx(26, 20)], NONE);
     }
 }
