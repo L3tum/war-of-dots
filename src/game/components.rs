@@ -166,6 +166,22 @@ impl Default for BorderGrids {
     }
 }
 
+/// Derived territory grid: which player dominates each cell.
+/// Flat 1D Vec<u8> indexed [y * width + x].
+/// Value is player index (0..N) or 255 (NONE = no influence).
+/// Computed by influence::run(); read by encirclement and the wire protocol.
+#[derive(Debug, Clone)]
+pub struct TerritoryGrid {
+    pub grid: Arc<Vec<u8>>,
+}
+impl Default for TerritoryGrid {
+    fn default() -> Self {
+        Self {
+            grid: Arc::new(Vec::new()),
+        }
+    }
+}
+
 /// All cities in the game.
 #[derive(Debug, Clone)]
 pub struct CityData {
@@ -192,6 +208,7 @@ pub struct WorldBundle {
     pub terrain: TerrainGrid,
     pub vision: VisionGrids,
     pub borders: BorderGrids,
+    pub territory: TerritoryGrid,
     pub cities: CityData,
     pub funds: EconomyFunds,
     pub city_upgrades: CityUpgradeData,
@@ -220,6 +237,7 @@ impl WorldBundle {
             borders: BorderGrids {
                 grids: Arc::new(HashMap::new()),
             },
+            territory: TerritoryGrid::default(),
             cities: CityData { cities: Vec::new() },
             funds: EconomyFunds {
                 funds,

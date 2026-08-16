@@ -1,12 +1,13 @@
 //! InfluenceSystem — merged vision + border influence computation.
 //!
-//! Uses circle projection from units and cities. Computes both binary
-//! visibility and weighted influence in one inner loop per source.
+//! Uses a single Euclidean circle per source (unit or city), precomputed as
+//! circle spans. One span pass per source writes both binary visibility and
+//! weighted influence into the same cells — vision and influence always
+//! share a radius. Hill units use a larger circle (radius × the hill
+//! multiplier), which extends both vision and influence together.
 //!
-//! Where the vision square is fully contained in the influence circle
-//! (flat units, cities) both are written in the same span pass. Hill
-//! units (extended vision radius) keep the original two-pass projection
-//! so their (larger) vision shape is preserved exactly.
+//! After the per-player grids, influence is compared across players to build
+//! the territory grid (dominant player per cell, or NONE).
 //!
 //! Sequential by design: Rayon was tried at multiple granularities and
 //! rejected — per-player work (~0.1 ms) is below dispatch breakeven.
@@ -16,19 +17,18 @@
 //! (including all per-player grid allocations) is skipped.
 
 use crate::game::economy::City;
-use crate::game::game::{TickContext, UnitHandle};
+use crate::game::game::{InfluenceSettings, TickContext, UnitHandle};
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-/// Radius for unit influence projection.
-const UNIT_INFLUENCE_RADIUS: f32 = 5.0;
-/// Multiplier for city radii (cities project farther).
-const CITY_RADIUS_MULTIPLIER: f32 = 1.5;
-/// Max radius we need spans for (city influence = 5 × 1.5 = 7.5, round up).
-const MAX_RADIUS: i32 = 8;
+/// Max radius we need spans for (hill unit = 5 × 2.0 = 10 with default settings).
+/// Radii are configurable via `InfluenceSettings`; the span lookup clamps with
+/// `.min(MAX_RADIUS)` so a playtest that pushes a radius past this degrades to
+/// the largest precomputed span instead of panicking.
+const MAX_RADIUS: i32 = 10;
 
 /// Precomputed circle spans: for each radius r, array of (dy, dx_start, dx_end).
 /// Each row tells you which columns to touch at that row offset from center.
@@ -79,8 +79,9 @@ impl Default for InfluenceScratch {
     }
 }
 
-/// Saturating influence write — units `+1`, cities `+5`. `u16` caps absurd
-/// stacks at 65,535; only strict-`>` ordering is consumed in-game.
+/// Saturating influence write — adds `delta` (the configured per-source
+/// weight). `u16` caps absurd stacks at 65,535; only strict-`>` ordering is
+/// consumed in-game.
 #[inline]
 fn add_influence(grid: &mut [u16], idx: usize, delta: u16) {
     grid[idx] = grid[idx].saturating_add(delta);
@@ -88,12 +89,16 @@ fn add_influence(grid: &mut [u16], idx: usize, delta: u16) {
 
 /// Compute vision and influence grids for a single player.
 /// Pure (no world access); takes only references so it stays unit-testable.
+/// Vision and influence share one circle per source (unit or city); `settings`
+/// supplies the per-source weight and the circle radii.
+#[allow(clippy::too_many_arguments)] // Pure per-player projection: scratch/terrain/sources/settings + dims
 fn compute_player(
     scratch: &mut InfluenceScratch,
     terrain: &Arc<Vec<Vec<Terrain>>>,
     player_id: &str,
     units: &[UnitHandle],
     cities: &[City],
+    settings: &InfluenceSettings,
     w: i32,
     h: i32,
 ) -> (Vec<bool>, Vec<u16>) {
@@ -105,107 +110,65 @@ fn compute_player(
     let mut vision_grid = vec![false; grid_size];
     let mut influence_grid = vec![0u16; grid_size];
 
-    // Precomputed circle spans for influence radius
-    let i_radius = UNIT_INFLUENCE_RADIUS as i32;
-
-    // Combined unit loop — vision + influence in one pass where the vision
-    // square is contained in the influence circle (flat units: r3 ⊆ r5).
+    // Unit loop — a single circle pass writes both vision and influence.
     for handle in units {
         let (ux_f, uy_f) = handle.pos;
-
-        // Terrain modifier for vision (hills extend range)
-        let terrain_mod = match terrain.get(ux_f as usize).and_then(|r| r.get(uy_f as usize)) {
-            Some(Terrain::Hills) => 2.0,
-            _ => 1.0,
-        };
-
-        let v_radius = (crate::game::constants::VISION_RADIUS * terrain_mod) as i32;
         let ux_i = ux_f as i32;
         let uy_i = uy_f as i32;
 
-        if v_radius <= i_radius {
-            // Fold: vision square ⊆ influence circle — one span pass writes
-            // both. Vision keeps its original SQUARE shape: only cells within
-            // Chebyshev `v_radius` (a subset of this circle span) get marked.
-            for &(dy, dx_start, dx_end) in circle_spans().get(i_radius as usize).unwrap() {
-                let y = uy_i + dy;
-                if (0..h).contains(&y) {
-                    let y_off = (y as usize) * w_usize;
-                    let in_vision_row = dy.abs() <= v_radius;
-                    for dx in dx_start..=dx_end {
-                        let x = ux_i + dx;
-                        if (0..w).contains(&x) {
-                            let idx = y_off + (x as usize);
-                            if in_vision_row && dx.abs() <= v_radius {
-                                vision_grid[idx] = true;
-                            }
-                            add_influence(&mut influence_grid, idx, 1);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Hill units: vision square (r6) exceeds the influence circle (r5) —
-            // keep the original two passes so the hill vision shape is unchanged.
-            // Vision (square): iterate bounding box, Chebyshev distance
-            for dy in -v_radius..=v_radius {
-                let y = uy_i + dy;
-                if (0..h).contains(&y) {
-                    let y_off = (y as usize) * w_usize;
-                    for dx in -v_radius..=v_radius {
-                        let x = ux_i + dx;
-                        if (0..w).contains(&x) {
-                            vision_grid[y_off + (x as usize)] = true;
-                        }
-                    }
-                }
-            }
-            // Influence (circle): use precomputed spans to skip corners
-            for &(dy, dx_start, dx_end) in circle_spans().get(i_radius as usize).unwrap() {
-                let y = uy_i + dy;
-                if (0..h).contains(&y) {
-                    let y_off = (y as usize) * w_usize;
-                    for dx in dx_start..=dx_end {
-                        let x = ux_i + dx;
-                        if (0..w).contains(&x) {
-                            add_influence(&mut influence_grid, y_off + (x as usize), 1);
-                        }
+        // Hills extend the circle radius (both vision and influence).
+        // The `.clamp(0, …)` lower bound guards against a playtest setting a
+        // negative radius in config (would otherwise wrap `as usize` and
+        // panic on the span lookup); the upper bound caps to the precomputed
+        // span table.
+        let radius = ((settings.unit_radius
+            * match terrain
+                .get(ux_f as usize)
+                .and_then(|r| r.get(uy_f as usize))
+            {
+                Some(Terrain::Hills) => settings.hill_radius_multiplier,
+                _ => 1.0,
+            }) as i32)
+            .clamp(0, MAX_RADIUS);
+
+        for &(dy, dx_start, dx_end) in circle_spans().get(radius as usize).unwrap() {
+            let y = uy_i + dy;
+            if (0..h).contains(&y) {
+                let y_off = (y as usize) * w_usize;
+                for dx in dx_start..=dx_end {
+                    let x = ux_i + dx;
+                    if (0..w).contains(&x) {
+                        let idx = y_off + (x as usize);
+                        vision_grid[idx] = true;
+                        add_influence(&mut influence_grid, idx, settings.unit_weight);
                     }
                 }
             }
         }
     }
 
-    // Combined city loop — city vision square (r4) ⊆ influence circle (r7),
-    // so one span pass writes both. Vision keeps its SQUARE shape (Chebyshev
-    // `city_v_radius`), influence stays circular with weight 5.
-    let city_v_radius = (crate::game::constants::VISION_RADIUS * CITY_RADIUS_MULTIPLIER) as i32;
-    let city_i_radius = ((UNIT_INFLUENCE_RADIUS * CITY_RADIUS_MULTIPLIER) as i32).min(MAX_RADIUS);
-
+    // City loop — same single-circle shape, configured radius/weight, no
+    // terrain modifier.
+    let city_radius =
+        ((settings.unit_radius * settings.city_radius_multiplier) as i32).clamp(0, MAX_RADIUS);
     scratch.city_positions.clear();
     for c in cities {
         if c.owner.as_deref() == Some(player_id) {
             scratch.city_positions.push(c.position);
         }
     }
-    if let Some(spans) = circle_spans().get(city_i_radius as usize) {
-        for &(cx, cy) in &scratch.city_positions {
-            let cx_i = cx as i32;
-            let cy_i = cy as i32;
-            for &(dy, dx_start, dx_end) in spans {
-                let y = cy_i + dy;
-                if (0..h).contains(&y) {
-                    let y_off = (y as usize) * w_usize;
-                    let in_vision_row = dy.abs() <= city_v_radius;
-                    for dx in dx_start..=dx_end {
-                        let x = cx_i + dx;
-                        if (0..w).contains(&x) {
-                            let idx = y_off + (x as usize);
-                            if in_vision_row && dx.abs() <= city_v_radius {
-                                vision_grid[idx] = true;
-                            }
-                            add_influence(&mut influence_grid, idx, 5);
-                        }
+    for &(cx, cy) in &scratch.city_positions {
+        let (cx_i, cy_i) = (cx as i32, cy as i32);
+        for &(dy, dx_start, dx_end) in circle_spans().get(city_radius as usize).unwrap() {
+            let y = cy_i + dy;
+            if (0..h).contains(&y) {
+                let y_off = (y as usize) * w_usize;
+                for dx in dx_start..=dx_end {
+                    let x = cx_i + dx;
+                    if (0..w).contains(&x) {
+                        let idx = y_off + (x as usize);
+                        vision_grid[idx] = true;
+                        add_influence(&mut influence_grid, idx, settings.city_weight);
                     }
                 }
             }
@@ -215,12 +178,49 @@ fn compute_player(
     (vision_grid, influence_grid)
 }
 
+/// Sentinel for "no player has influence at this cell."
+pub(crate) const NONE: u8 = 255;
+
+/// Compute the territory grid: which player has the highest influence at each
+/// cell. Players iterated in sorted order; strict `>` means the lowest-sorted
+/// ID wins ties. Returns `Vec<u8>` — player index or `NONE` (255) where no
+/// player has influence.
+pub(crate) fn build_territory_grid(
+    border_grids: &HashMap<String, Vec<u16>>,
+    player_to_idx: &HashMap<&str, u8>,
+    grid_size: usize,
+) -> Vec<u8> {
+    let mut dominant = vec![NONE; grid_size];
+    let mut max_inf = vec![0u16; grid_size];
+
+    let mut player_ids: Vec<&str> = player_to_idx.keys().copied().collect();
+    player_ids.sort();
+    for player_id in player_ids {
+        let idx = *player_to_idx.get(player_id).unwrap();
+        if let Some(grid) = border_grids.get(player_id) {
+            for i in 0..grid_size {
+                if grid[i] > max_inf[i] {
+                    max_inf[i] = grid[i];
+                    dominant[i] = idx;
+                }
+            }
+        }
+    }
+    for i in 0..grid_size {
+        if max_inf[i] == 0 {
+            dominant[i] = NONE;
+        }
+    }
+    dominant
+}
+
 pub fn run(
     world: &mut World,
     ctx: &TickContext,
     _tick: u64,
     scratch: &mut InfluenceScratch,
     dirty: bool,
+    settings: &InfluenceSettings,
 ) {
     // Skip path: game state unchanged since the last run → stored grids are
     // still correct. Avoids the compute AND all per-player grid allocations.
@@ -245,17 +245,38 @@ pub fn run(
     let mut updated_border: HashMap<String, Vec<u16>> = HashMap::new();
 
     for (player_id, units) in &ctx.units_by_player {
-        let (vision, influence) =
-            compute_player(scratch, &terrain_grid, player_id, units, &ctx.cities, w, h);
+        let (vision, influence) = compute_player(
+            scratch,
+            &terrain_grid,
+            player_id,
+            units,
+            &ctx.cities,
+            settings,
+            w,
+            h,
+        );
         updated_vision.insert(player_id.clone(), vision);
         updated_border.insert(player_id.clone(), influence);
     }
     scratch.clear(); // release the per-player city list contents (capacity kept)
 
+    // Build territory grid from per-player influence (sorted keys for deterministic ties)
+    let mut sorted_players: Vec<&String> = updated_border.keys().collect();
+    sorted_players.sort();
+    let player_to_idx: HashMap<&str, u8> = sorted_players
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i as u8))
+        .collect();
+
+    let grid_size = (w * h) as usize;
+    let territory = build_territory_grid(&updated_border, &player_to_idx, grid_size);
+
     // Write to world
     if let Some(wb) = world.world_data_mut(ctx.world_entity) {
         wb.vision.grids = Arc::new(updated_vision);
         wb.borders.grids = Arc::new(updated_border);
+        wb.territory.grid = Arc::new(territory);
     }
 }
 
@@ -270,7 +291,10 @@ mod tests {
     const W: i32 = 40;
     const H: i32 = 40;
 
-    fn ctx_with(units_by_player: HashMap<String, Vec<UnitHandle>>, cities: Vec<City>) -> TickContext {
+    fn ctx_with(
+        units_by_player: HashMap<String, Vec<UnitHandle>>,
+        cities: Vec<City>,
+    ) -> TickContext {
         TickContext {
             world_entity: hecs::Entity::from_bits(1u64 << 32).unwrap(),
             cities,
@@ -314,92 +338,38 @@ mod tests {
     ) -> (Vec<bool>, Vec<u16>) {
         let mut scratch = InfluenceScratch::new();
         let units: Vec<UnitHandle> = units.iter().map(|&p| unit(p)).collect();
-        compute_player(&mut scratch, terrain, "player_0", &units, cities, W, H)
+        compute_player(
+            &mut scratch,
+            terrain,
+            "player_0",
+            &units,
+            cities,
+            &InfluenceSettings::default(),
+            W,
+            H,
+        )
     }
 
     fn idx(x: i32, y: i32) -> usize {
         (y as usize) * (W as usize) + (x as usize)
     }
 
-    /// Old (pre-fold) projection: separate square vision + circle influence
-    /// passes for every source — the reference implementation for the fold.
-    fn legacy_compute(
-        units: &[(f32, f32)],
-        cities: &[City],
-        terrain: &Arc<Vec<Vec<Terrain>>>,
-    ) -> (Vec<bool>, Vec<u16>) {
-        let mut vision = vec![false; (W * H) as usize];
-        let mut inf = vec![0u16; (W * H) as usize];
-        let w_usize = W as usize;
-        let i_radius = UNIT_INFLUENCE_RADIUS as i32;
-        for &(ux, uy) in units {
-            let mod_f = match terrain.get(ux as usize).and_then(|r| r.get(uy as usize)) {
-                Some(Terrain::Hills) => 2.0,
-                _ => 1.0,
-            };
-            let v_radius = (crate::game::constants::VISION_RADIUS * mod_f) as i32;
-            let (ux_i, uy_i) = (ux as i32, uy as i32);
-            for dy in -v_radius..=v_radius {
-                for dx in -v_radius..=v_radius {
-                    let x = ux_i + dx;
-                    let y = uy_i + dy;
-                    if x >= 0 && y >= 0 && x < W && y < H {
-                        vision[(y as usize) * w_usize + (x as usize)] = true;
-                    }
-                }
-            }
-            for &(dy, dx_start, dx_end) in circle_spans().get(i_radius as usize).unwrap() {
-                for dx in dx_start..=dx_end {
-                    let x = ux_i + dx;
-                    let y = uy_i + dy;
-                    if x >= 0 && y >= 0 && x < W && y < H {
-                        inf[(y as usize) * w_usize + (x as usize)] += 1;
-                    }
-                }
-            }
-        }
-        let city_v_radius =
-            (crate::game::constants::VISION_RADIUS * CITY_RADIUS_MULTIPLIER) as i32;
-        let city_i_radius = ((UNIT_INFLUENCE_RADIUS * CITY_RADIUS_MULTIPLIER) as i32).min(MAX_RADIUS);
-        for c in cities {
-            if c.owner.as_deref() != Some("player_0") {
-                continue;
-            }
-            let (cx_i, cy_i) = (c.position.0 as i32, c.position.1 as i32);
-            for dy in -city_v_radius..=city_v_radius {
-                for dx in -city_v_radius..=city_v_radius {
-                    let x = cx_i + dx;
-                    let y = cy_i + dy;
-                    if x >= 0 && y >= 0 && x < W && y < H {
-                        vision[(y as usize) * w_usize + (x as usize)] = true;
-                    }
-                }
-            }
-            if let Some(spans) = circle_spans().get(city_i_radius as usize) {
-                for &(dy, dx_start, dx_end) in spans {
-                    for dx in dx_start..=dx_end {
-                        let x = cx_i + dx;
-                        let y = cy_i + dy;
-                        if x >= 0 && y >= 0 && x < W && y < H {
-                            inf[(y as usize) * w_usize + (x as usize)] += 5;
-                        }
-                    }
-                }
-            }
-        }
-        (vision, inf)
-    }
-
     #[test]
     fn flat_unit_vision_and_influence_shape() {
         let (vision, inf) = compute(&[(20.0, 20.0)], &[], &terrain());
-        // Chebyshev-3 square corners visible
+        // Vision = circle r5: dist 3 < 5 → visible
         assert!(vision[idx(23, 20)]);
-        assert!(vision[idx(20, 23)]);
+        // dist 4 < 5 → visible (was outside the old r3 square)
+        assert!(vision[idx(24, 20)]);
+        // dist 5 = r5 edge → visible
+        assert!(vision[idx(25, 20)]);
+        // dist 6 > 5 → not visible
+        assert!(!vision[idx(26, 20)]);
+        // (3,3) corner: dist √18 ≈ 4.24 < 5 → visible
         assert!(vision[idx(23, 23)]);
-        // Outside the r3 square, inside the r5 circle — not visible
-        assert!(!vision[idx(24, 20)]);
-        // Circle influence: r5 edge present, square corner (4,4) absent
+        // (4,4) corner: dist √32 ≈ 5.66 > 5 → NOT visible
+        assert!(!vision[idx(24, 24)]);
+        // Influence: same circle, weight 1
         assert_eq!(inf[idx(25, 20)], 1);
         assert_eq!(inf[idx(24, 24)], 0);
         assert_eq!(inf[idx(20, 20)], 1);
@@ -408,49 +378,34 @@ mod tests {
     #[test]
     fn city_vision_and_influence_shape() {
         let (vision, inf) = compute(&[], &[city((20.0, 20.0), "player_0")], &terrain());
-        // Chebyshev-4 square corners visible (3*1.5 truncated = 4)
-        assert!(vision[idx(24, 20)]);
+        // City circle r7: dist 7 = edge → visible
+        assert!(vision[idx(27, 20)]);
+        // (4,4) corner: dist 5.66 < 7 → visible
         assert!(vision[idx(24, 24)]);
-        // Chebyshev 5 — not visible
-        assert!(!vision[idx(25, 20)]);
-        // Circle r7 influence with weight 5
-        assert_eq!(inf[idx(27, 20)], 5);
-        assert_eq!(inf[idx(20, 20)], 5);
+        // dist 8 > 7 → not visible
+        assert!(!vision[idx(28, 20)]);
+        // Influence: city weight is 1 (equal to units, per design decision)
+        assert_eq!(inf[idx(27, 20)], 1);
+        assert_eq!(inf[idx(20, 20)], 1);
     }
 
     #[test]
-    fn hill_unit_vision_preserved() {
-        // Hill at (20,20): vision square r6 (3*2) — must include cells that
-        // are OUTSIDE the influence circle r5, e.g. Cheb 6 and the (4,4) corner.
+    fn hill_unit_extends_both_vision_and_influence() {
+        // Hill at (20,20): circle r10 (5×2) — extends both vision and influence
         let (vision, inf) = compute(&[(20.0, 20.0)], &[], &terrain_with_hills());
-        assert!(vision[idx(26, 20)], "Chebyshev 6 must be visible on a hill");
-        assert!(vision[idx(24, 24)], "square corner (4,4) must stay visible");
-        // But influence stays circular: (4,4) at dist 5.66 > r5
-        assert_eq!(inf[idx(24, 24)], 0);
-        assert_eq!(inf[idx(25, 20)], 1);
-    }
-
-    #[test]
-    fn fold_matches_legacy_projection() {
-        // Differential: mixed plains + hill units and two cities (one owned,
-        // one not) — folded output must be byte-identical to the legacy
-        // square + circle passes.
-        let mut units = Vec::new();
-        let mut rng = 0x1234_5678u32;
-        for _ in 0..200 {
-            // deterministic LCG
-            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let x = (rng % (W as u32 - 4)) as f32 + 2.0;
-            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let y = ((rng >> 8) % (H as u32 - 4)) as f32 + 2.0;
-            units.push((x, y));
-        }
-        let cities = vec![city((10.0, 10.0), "player_0"), city((30.0, 30.0), "player_1")];
-        let t = terrain_with_hills();
-        let (v_new, i_new) = compute(&units, &cities, &t);
-        let (v_old, i_old) = legacy_compute(&units, &cities, &t);
-        assert_eq!(v_new, v_old, "vision grids must be identical");
-        assert_eq!(i_new, i_old, "influence grids must be identical");
+        // Vision: dist 6 < 10 → visible
+        assert!(vision[idx(26, 20)]);
+        // (4,4) corner: dist 5.66 < 10 → visible (was not under r5)
+        assert!(vision[idx(24, 24)]);
+        // dist 10 = r10 edge → visible
+        assert!(vision[idx(30, 20)]);
+        // dist 11 > 10 → not visible
+        assert!(!vision[idx(31, 20)]);
+        // Influence: also r10 now
+        assert_eq!(inf[idx(26, 20)], 1); // was 0 under r5
+        assert_eq!(inf[idx(24, 24)], 1); // was 0 under r5 (dist 5.66 < 10)
+        assert_eq!(inf[idx(30, 20)], 1); // r10 edge
+        assert_eq!(inf[idx(31, 20)], 0); // outside r10
     }
 
     #[test]
@@ -485,36 +440,182 @@ mod tests {
         );
 
         let mut ctx = ctx_with(
-            HashMap::from([(
-                "player_0".to_string(),
-                vec![unit((20.0, 20.0))],
-            )]),
+            HashMap::from([("player_0".to_string(), vec![unit((20.0, 20.0))])]),
             vec![city((10.0, 10.0), "player_0")],
         );
         ctx.world_entity = world_entity;
 
+        let settings = InfluenceSettings::default();
         let mut scratch = InfluenceScratch::new();
-        run(&mut world, &ctx, 1, &mut scratch, true);
-        let (grids_ptr, vision_snapshot, border_snapshot) = {
+        run(&mut world, &ctx, 1, &mut scratch, true, &settings);
+        let (grids_ptr, vision_snapshot, border_snapshot, territory_ptr) = {
             let wb = world.world_data(world_entity).unwrap();
             (
                 Arc::as_ptr(&wb.borders.grids) as *const (),
                 wb.vision.grids.clone(),
                 wb.borders.grids.clone(),
+                Arc::as_ptr(&wb.territory.grid) as *const (),
             )
         };
 
         // Clean tick: must early-return without touching the stored Arcs.
-        run(&mut world, &ctx, 2, &mut scratch, false);
+        run(&mut world, &ctx, 2, &mut scratch, false, &settings);
         let wb = world.world_data(world_entity).unwrap();
         assert_eq!(
             Arc::as_ptr(&wb.borders.grids) as *const (),
             grids_ptr,
             "skip must not replace the grid Arc"
         );
+        assert_eq!(
+            Arc::as_ptr(&wb.territory.grid) as *const (),
+            territory_ptr,
+            "skip must not replace the territory grid Arc"
+        );
         assert_eq!(&*wb.vision.grids, &*vision_snapshot);
         assert_eq!(&*wb.borders.grids, &*border_snapshot);
         // Sanity: the dirty run actually produced non-empty grids
         assert!(!border_snapshot["player_0"].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn territory_grid_single_player() {
+        // One unit → territory = 0 within the r5 circle, 255 outside
+        let (_, inf) = compute(&[(20.0, 20.0)], &[], &terrain());
+        let player_to_idx: HashMap<&str, u8> = [("player_0", 0u8)].into_iter().collect();
+        let grids: HashMap<String, Vec<u16>> =
+            [("player_0".to_string(), inf)].into_iter().collect();
+        let territory = build_territory_grid(&grids, &player_to_idx, (W * H) as usize);
+        assert_eq!(territory[idx(20, 20)], 0); // center
+        assert_eq!(territory[idx(25, 20)], 0); // r5 edge
+        assert_eq!(territory[idx(26, 20)], NONE); // outside
+    }
+
+    #[test]
+    fn territory_grid_two_players_boundary() {
+        // Two units 10 apart: (15,20) player_a and (25,20) player_b.
+        // Cell (20,20): dist 5 from both → tie → "player_a" wins (sorted).
+        let (_, inf_a) = compute(&[(15.0, 20.0)], &[], &terrain());
+        let (_, inf_b) = compute(&[(25.0, 20.0)], &[], &terrain());
+        let player_to_idx: HashMap<&str, u8> =
+            [("player_a", 0u8), ("player_b", 1u8)].into_iter().collect();
+        let grids: HashMap<String, Vec<u16>> = [
+            ("player_a".to_string(), inf_a),
+            ("player_b".to_string(), inf_b),
+        ]
+        .into_iter()
+        .collect();
+        let territory = build_territory_grid(&grids, &player_to_idx, (W * H) as usize);
+        // Center cell (20,20): dist 5 from both, tie → player_a (index 0)
+        assert_eq!(territory[idx(20, 20)], 0);
+        // (15,20): dist 0 from a, dist 10 from b → player_a
+        assert_eq!(territory[idx(15, 20)], 0);
+        // (25,20): dist 10 from a, dist 0 from b → player_b
+        assert_eq!(territory[idx(25, 20)], 1);
+    }
+
+    #[test]
+    fn territory_grid_no_units() {
+        let player_to_idx: HashMap<&str, u8> = [("player_a", 0u8)].into_iter().collect();
+        let grids: HashMap<String, Vec<u16>> =
+            [("player_a".to_string(), vec![0u16; (W * H) as usize])]
+                .into_iter()
+                .collect();
+        let territory = build_territory_grid(&grids, &player_to_idx, (W * H) as usize);
+        assert!(territory.iter().all(|&v| v == NONE));
+    }
+
+    #[test]
+    fn build_territory_grid_missing_player_key() {
+        // A player present in the index map but absent from the grids map must
+        // not panic and contributes nothing.
+        let player_to_idx: HashMap<&str, u8> =
+            [("player_a", 0u8), ("player_b", 1u8)].into_iter().collect();
+        let grids: HashMap<String, Vec<u16>> =
+            [("player_a".to_string(), vec![1u16; (W * H) as usize])]
+                .into_iter()
+                .collect();
+        let territory = build_territory_grid(&grids, &player_to_idx, (W * H) as usize);
+        assert!(territory.iter().all(|&v| v == 0));
+    }
+
+    /// Independent u32 reference implementation (wider accumulator type) used
+    /// to cross-check `build_territory_grid`'s u16 arithmetic. Logic mirrors
+    /// the production function but never truncates, so any divergence flags a
+    /// u16 overflow/mis-ordering bug.
+    fn reference_dominant(
+        border_grids: &HashMap<String, Vec<u32>>,
+        player_to_idx: &HashMap<&str, u8>,
+        grid_size: usize,
+    ) -> Vec<u8> {
+        let mut dominant = vec![NONE; grid_size];
+        let mut max_inf = vec![0u32; grid_size];
+        let mut players: Vec<&str> = player_to_idx.keys().copied().collect();
+        players.sort();
+        for player_id in players {
+            let idx = *player_to_idx.get(player_id).unwrap();
+            if let Some(grid) = border_grids.get(player_id) {
+                for i in 0..grid_size {
+                    if grid[i] > max_inf[i] {
+                        max_inf[i] = grid[i];
+                        dominant[i] = idx;
+                    }
+                }
+            }
+        }
+        for i in 0..grid_size {
+            if max_inf[i] == 0 {
+                dominant[i] = NONE;
+            }
+        }
+        dominant
+    }
+
+    #[test]
+    fn build_territory_grid_u16_matches_u32_reference() {
+        let grid_size = 900; // 30x30
+        let players = ["player_a", "player_b", "player_c"];
+        let player_to_idx: HashMap<&str, u8> = players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, i as u8))
+            .collect();
+
+        // Deterministic LCG
+        let mut rng = 0x9e37_79b9u32;
+        let mut next = move || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rng
+        };
+
+        let mut grids_u16: HashMap<String, Vec<u16>> = HashMap::new();
+        let mut grids_u32: HashMap<String, Vec<u32>> = HashMap::new();
+        for p in players {
+            let mut g16 = vec![0u16; grid_size];
+            let mut g32 = vec![0u32; grid_size];
+            for i in 0..grid_size {
+                // Sparse values including exact-tie points: 5, 10, 65530, 0
+                let v = match next() % 10 {
+                    0 => 0u32,
+                    1 => 5,
+                    2 => 10,
+                    3 => 65530,
+                    _ => next() % 65536,
+                };
+                g16[i] = v as u16;
+                g32[i] = v;
+            }
+            grids_u16.insert(p.to_string(), g16);
+            grids_u32.insert(p.to_string(), g32);
+        }
+
+        let d16 = build_territory_grid(&grids_u16, &player_to_idx, grid_size);
+        let d32 = reference_dominant(&grids_u32, &player_to_idx, grid_size);
+        assert_eq!(d16, d32, "u16 territory grid must match u32 reference");
+
+        // Sanity: the grid is non-trivial (multiple players + NONE cells)
+        let seen: std::collections::HashSet<u8> = d16.iter().copied().collect();
+        assert!(seen.contains(&0));
+        assert!(seen.contains(&1));
+        assert!(seen.contains(&NONE));
     }
 }

@@ -330,6 +330,7 @@ mod tests {
     use crate::game::components::{UnitTypeId, UnitWaterTransition};
     use crate::game::economy::City;
     use crate::game::game::GameSettings;
+    use crate::game::game::InfluenceSettings;
     use crate::game::game::TickContext;
     use crate::game::unit::Equipment;
     use crate::game::unit::Terrain;
@@ -381,6 +382,7 @@ mod tests {
             }],
             city_upgrade_settings: CityUpgradeSettings::default(),
             water_speed: 0.5,
+            influence: InfluenceSettings::default(),
         };
         (world, world_entity, settings)
     }

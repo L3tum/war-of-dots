@@ -55,6 +55,56 @@ macro_rules! tick_system {
     };
 }
 
+/// Tunable influence/vision parameters (game balance). Defaults = equal weights.
+///
+/// Vision and influence share one circle per source. These knobs control the
+/// weight each source adds per cell and the circle radii. Exposed so balance
+/// can be playtested from `config.toml` without code changes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct InfluenceSettings {
+    /// Influence added per cell by a unit (default 1).
+    #[serde(default = "default_unit_weight")]
+    pub unit_weight: u16,
+    /// Influence added per cell by a city (default 1 — equal to units).
+    #[serde(default = "default_city_weight")]
+    pub city_weight: u16,
+    /// Base circle radius for a unit (default 5.0).
+    #[serde(default = "default_unit_radius")]
+    pub unit_radius: f32,
+    /// City radius = unit_radius × this multiplier (default 1.5 → r7).
+    #[serde(default = "default_city_radius_multiplier")]
+    pub city_radius_multiplier: f32,
+    /// Hill terrain radius multiplier applied to unit radius (default 2.0 → r10).
+    #[serde(default = "default_hill_radius_multiplier")]
+    pub hill_radius_multiplier: f32,
+}
+impl Default for InfluenceSettings {
+    fn default() -> Self {
+        Self {
+            unit_weight: 1,
+            city_weight: 1,
+            unit_radius: 5.0,
+            city_radius_multiplier: 1.5,
+            hill_radius_multiplier: 2.0,
+        }
+    }
+}
+fn default_unit_weight() -> u16 {
+    1
+}
+fn default_city_weight() -> u16 {
+    1
+}
+fn default_unit_radius() -> f32 {
+    5.0
+}
+fn default_city_radius_multiplier() -> f32 {
+    1.5
+}
+fn default_hill_radius_multiplier() -> f32 {
+    2.0
+}
+
 /// Game-level settings.
 #[derive(Debug, Clone)]
 pub struct GameSettings {
@@ -71,6 +121,8 @@ pub struct GameSettings {
     pub unit_types: Vec<UnitType>,
     pub city_upgrade_settings: CityUpgradeSettings,
     pub water_speed: f32,
+    /// Influence/vision balance knobs (weights, radii). Defaults = equal weights.
+    pub influence: InfluenceSettings,
 }
 
 /// Per-player statistics for the current game.
@@ -682,7 +734,8 @@ impl Game {
                         ctx,
                         self.tick,
                         &mut self.influence_scratch,
-                        true
+                        true,
+                        &self.settings.influence,
                     )
                 );
                 self.influence_dirty = false;
@@ -1214,22 +1267,23 @@ impl Game {
         })
     }
 
-    /// Get border grid for a player as 2D Vec<Vec<u32>>[y][x].
-    /// Grids are stored flat as u16 internally; widened to u32 here for wire
-    /// protocol compatibility (the single u16→u32 export seam).
-    pub fn border_grid_2d(&self, player_id: &str) -> Option<Vec<Vec<u32>>> {
+    /// Get the territory grid (dominant player per cell) as 2D `Vec<Vec<u32>>`[y][x].
+    /// Values are player indices (0..N) or 255 (NONE/unclaimed).
+    /// Note: `player_id` is accepted for API compatibility but ignored —
+    /// the territory grid is global (same for all players).
+    pub fn border_grid_2d(&self, _player_id: &str) -> Option<Vec<Vec<u32>>> {
         let wb = self.world.world_data(self.world_entity)?;
+        let grid = &wb.territory.grid;
+        if grid.is_empty() {
+            return None; // before first influence run
+        }
         let w = wb.terrain.width as usize;
         let h = wb.terrain.height as usize;
-        wb.borders.grids.get(player_id).map(|flat| {
+        Some(
             (0..h)
-                .map(|y| {
-                    (0..w)
-                        .map(|x| flat[y * w + x] as u32)
-                        .collect()
-                })
-                .collect()
-        })
+                .map(|y| (0..w).map(|x| grid[y * w + x] as u32).collect())
+                .collect(),
+        )
     }
 
     /// Supervisor (spectator/replay) view: union of every player's vision.
@@ -1255,28 +1309,9 @@ impl Game {
         out
     }
 
-    /// Supervisor (spectator/replay) view: strongest border influence across all players.
+    /// Supervisor (spectator/replay) view: the territory grid (who dominates each cell).
     pub fn supervisor_border_grid(&self) -> Option<Vec<Vec<u32>>> {
-        let ids: Vec<String> = self.all_player_funds().keys().cloned().collect();
-        let mut out: Option<Vec<Vec<u32>>> = None;
-        for id in ids {
-            if let Some(grid) = self.border_grid_2d(&id) {
-                out = Some(match out {
-                    None => grid,
-                    Some(mut acc) => {
-                        for (row, src) in acc.iter_mut().zip(grid) {
-                            for (cell, s) in row.iter_mut().zip(src) {
-                                if s > *cell {
-                                    *cell = s;
-                                }
-                            }
-                        }
-                        acc
-                    }
-                });
-            }
-        }
-        out
+        self.border_grid_2d("")
     }
 
     /// Get debug stats as JSON (only available in debug builds).
@@ -1591,6 +1626,7 @@ mod tests {
             unit_types: vec![basic_unit_type()],
             city_upgrade_settings: CityUpgradeSettings::default(),
             water_speed: 0.5,
+            influence: InfluenceSettings::default(),
         }
     }
 
@@ -1628,12 +1664,17 @@ mod tests {
         game.tick_game(); // tick 1
         game.tick_game(); // tick 2
         game.tick_game(); // tick 3 → consumer tick
-        assert_eq!(game.ctx_unit_count_for_test(), 1, "rebuild must include the recruit");
+        assert_eq!(
+            game.ctx_unit_count_for_test(),
+            1,
+            "rebuild must include the recruit"
+        );
         assert!(!game.influence_dirty_for_test());
-        // City at (3,3) + unit at (3,3) project influence ≥ 5.
-        assert!(
-            border_at(&game, "player_0", 3, 3) >= 5,
-            "grid must reflect the recruit + city"
+        // Territory: (3,3) is player_0's (city + unit) → value = player index 0.
+        assert_eq!(
+            border_at(&game, "player_0", 3, 3),
+            0,
+            "(3,3) must be player_0 territory after the recruit"
         );
     }
 
@@ -1650,7 +1691,10 @@ mod tests {
         for _ in 0..3 {
             game.tick_game();
         }
-        assert!(!game.influence_dirty_for_test(), "tick 3 must consume the dirt");
+        assert!(
+            !game.influence_dirty_for_test(),
+            "tick 3 must consume the dirt"
+        );
         let snap_3 = game.border_grid_2d("player_0").unwrap();
         let ptr_3 = Arc::as_ptr(
             &game
@@ -1665,7 +1709,10 @@ mod tests {
             game.tick_game();
         }
         assert_eq!(game.tick_number(), 6);
-        assert!(!game.influence_dirty_for_test(), "no changes → must stay clean");
+        assert!(
+            !game.influence_dirty_for_test(),
+            "no changes → must stay clean"
+        );
         assert_eq!(game.border_grid_2d("player_0").unwrap(), snap_3);
         assert_eq!(
             Arc::as_ptr(
@@ -1699,8 +1746,12 @@ mod tests {
         for _ in 0..110 {
             game.tick_game();
         }
-        // Unit arrived at (10,10); grid must show its influence there.
-        assert_eq!(border_at(&game, "player_0", 10, 10), 1, "unit influence at (10,10)");
+        // Unit arrived at (10,10); territory must show player_0 there (index 0).
+        assert_eq!(
+            border_at(&game, "player_0", 10, 10),
+            0,
+            "unit at (10,10) → player_0 territory"
+        );
         assert_eq!(game.ctx_unit_count_for_test(), 1);
 
         // Force death deterministically: men <= 0 → the surrender sweep (every
@@ -1739,8 +1790,8 @@ mod tests {
         assert!(!game.influence_dirty_for_test());
         assert_eq!(
             border_at(&game, "player_0", 10, 10),
-            0,
-            "dead unit must no longer project influence"
+            255,
+            "dead unit → (10,10) is unclaimed (NONE)"
         );
     }
 
@@ -1761,12 +1812,19 @@ mod tests {
             game.tick_game();
         }
         assert!(!game.influence_dirty_for_test());
+        // Territory: (3,3) is player_0's (city + unit) → player index 0.
         assert_eq!(
             border_at(&game, "player_0", 3, 3),
-            6,
-            "city (5) + unit (1) at (3,3)"
+            0,
+            "(3,3) is player_0 territory"
         );
-        assert!(border_at(&game, "player_0", 3, 3) >= 5);
+        // (9,4) sits in city_0's r7 ring (dist ~6.08) but outside the unit's
+        // r5 and outside player_1's city_1 r7 → also player_0 territory.
+        assert_eq!(
+            border_at(&game, "player_0", 9, 4),
+            0,
+            "(9,4) is player_0's city ring"
+        );
 
         // Steal city_0 from player_0 to player_1 → next influence run must
         // move the city projection. (assign_city_owner refreshes ctx.cities
@@ -1776,14 +1834,18 @@ mod tests {
             game.tick_game();
         }
         assert!(!game.influence_dirty_for_test());
+        // (3,3): player_0's unit (r5) still covers it and tie-breaks (sorted
+        // first) against player_1's now-stolen city → stays player_0.
         assert_eq!(
             border_at(&game, "player_0", 3, 3),
-            1,
-            "player_0 keeps only its unit at (3,3) — city is gone"
+            0,
+            "(3,3) still player_0 — its unit tie-breaks"
         );
-        assert!(
-            border_at(&game, "player_1", 3, 3) >= 5,
-            "player_1 grid must show the stolen city"
+        // (9,4): now in player_1's city ring, no longer player_0's → player_1 (index 1).
+        assert_eq!(
+            border_at(&game, "player_0", 9, 4),
+            1,
+            "(9,4) flipped to player_1 after the city was stolen"
         );
     }
 }

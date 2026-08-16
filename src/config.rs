@@ -145,6 +145,10 @@ pub struct StandardRuleset {
     /// Movement speed multiplier for water tiles (default: 1.2)
     #[serde(default = "default_water_speed")]
     pub water_speed: f32,
+    /// Optional influence/vision balance knobs (unit/city weights, radii).
+    /// Absent → defaults (equal weights).
+    #[serde(default)]
+    pub influence: Option<crate::game::game::InfluenceSettings>,
 }
 
 fn default_starting_funds() -> u32 {

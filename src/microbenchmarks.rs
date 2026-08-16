@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::config::CityUpgradeSettings;
 use crate::game::components::*;
 use crate::game::economy::{City, UnitType};
-use crate::game::game::{Game, GameSettings, TickContext};
+use crate::game::game::{Game, GameSettings, InfluenceSettings, TickContext};
 use crate::game::unit::{Equipment, Terrain};
 use crate::game::world_ext::WorldExt;
 use hecs::World;
@@ -336,6 +336,7 @@ fn bench_settings() -> GameSettings {
         unit_types: vec![bench_unit_type()],
         city_upgrade_settings: CityUpgradeSettings::default(),
         water_speed: 0.5,
+        influence: InfluenceSettings::default(),
     }
 }
 
@@ -616,6 +617,7 @@ impl InfluenceFixture {
             1,
             &mut fixture.scratch,
             true,
+            &InfluenceSettings::default(),
         );
         fixture
     }
@@ -665,6 +667,7 @@ impl EncirclementFixture {
             1,
             &mut fixture.scratch,
             true,
+            &InfluenceSettings::default(),
         );
         fixture
     }
@@ -1172,6 +1175,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 1,
                 &mut f.scratch,
                 true,
+                &InfluenceSettings::default(),
             );
             black_box(100);
         },
@@ -1193,6 +1197,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 1,
                 &mut f.scratch,
                 true,
+                &InfluenceSettings::default(),
             );
             black_box(500);
         },
@@ -1216,6 +1221,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 2,
                 &mut f.scratch,
                 false,
+                &InfluenceSettings::default(),
             );
             black_box(100);
         },

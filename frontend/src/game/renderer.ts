@@ -26,6 +26,10 @@ import {
   CITY_COLORS,
 } from './config';
 
+/** Sentinel for "no player has influence at this cell" in the territory grid.
+ *  borderGrid values are player indices (0..N) or 255 (unclaimed/NONE). */
+const TERRITORY_NONE = 255;
+
 export class Renderer {
   private canvas: HTMLCanvasElement;
   private device: GPUDevice;
@@ -1202,7 +1206,9 @@ export class Renderer {
               const p1 = borderGrid[y][x];
               const p2 = borderGrid[y][x + 1];
               const p3 = borderGrid[y + 1][x];
-              if (p1 !== p2) {
+              // Only draw borders between two different players — never at the
+              // edge of claimed vs unclaimed (255) territory.
+              if (p1 !== p2 && p1 !== TERRITORY_NONE && p2 !== TERRITORY_NONE) {
                 this.borderCacheEdges.push({
                   gridX: x,
                   gridY: y,
@@ -1211,7 +1217,7 @@ export class Renderer {
                   ownerB: p2,
                 });
               }
-              if (p1 !== p3) {
+              if (p1 !== p3 && p1 !== TERRITORY_NONE && p3 !== TERRITORY_NONE) {
                 this.borderCacheEdges.push({
                   gridX: x,
                   gridY: y,

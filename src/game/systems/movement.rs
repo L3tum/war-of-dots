@@ -338,6 +338,7 @@ mod tests {
             }],
             city_upgrade_settings: crate::config::CityUpgradeSettings::default(),
             water_speed: 0.5,
+            influence: crate::game::game::InfluenceSettings::default(),
         }
     }
 

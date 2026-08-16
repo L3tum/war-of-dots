@@ -19,13 +19,6 @@ pub const COMBAT_RANGE_SQ: f32 = 4.0;
 /// max_supply = men * CARRY_WEIGHT
 pub const CARRY_WEIGHT: f32 = 2.0;
 
-/// Base vision radius in grid cells.
-pub const VISION_RADIUS: f32 = 3.0;
-
-/// Vision multiplier for city owners (cities see 1.5× further).
-#[allow(dead_code)] // Used by legacy vision.rs; influence.rs uses its own CITY_RADIUS_MULTIPLIER
-pub const CITY_VISION_MULTIPLIER: f32 = 1.5;
-
 /// Embark timer: ticks required to board a unit onto water.
 pub const EMBARK_TICKS: u32 = 10;
 

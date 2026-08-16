@@ -18,7 +18,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::config::CityUpgradeSettings;
 use crate::game::economy::UnitType;
-use crate::game::game::{Game, GameSettings};
+use crate::game::game::{Game, GameSettings, InfluenceSettings};
 use crate::map::map::{Map, MapConfig};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
@@ -228,6 +228,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         unit_types: make_unit_types(),
         city_upgrade_settings: CityUpgradeSettings::default(),
         water_speed: 1.2,
+        influence: InfluenceSettings::default(),
     };
 
     let total_cities = map_cfg.cities.len();

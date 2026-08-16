@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use war_of_dots::config::CityUpgradeSettings;
 use war_of_dots::game::economy::UnitType;
-use war_of_dots::game::game::{Game, GameSettings};
+use war_of_dots::game::game::{Game, GameSettings, InfluenceSettings};
 use war_of_dots::game::unit::Equipment;
 use war_of_dots::map::map::{Map, MapConfig};
 
@@ -46,6 +46,7 @@ fn test_settings() -> GameSettings {
         unit_types: vec![basic_unit_type()],
         city_upgrade_settings: CityUpgradeSettings::default(),
         water_speed: 0.5,
+        influence: InfluenceSettings::default(),
     }
 }
 

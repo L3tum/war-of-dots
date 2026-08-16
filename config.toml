@@ -20,6 +20,17 @@ unit_types = [
   { name = "Tank", symbol = "T", men = 30, equipment = ["tanks:1:20.0", "anti-tank:5:3.0", "radios:2:2.0"], soft_attack = 5.0, soft_defense = 10.0, hard_attack = 20.0, hard_defense = 15.0, speed = 1.0, max_organisation = 100.0, reinforcement_rate = 2.0, base_attrition = 5.0, fighting_attrition = 8.0, recruitment_cost = 500 },
 ]
 
+# Influence / vision balance knobs (playtest without recompiling game logic).
+# Vision and influence share one circle per source. unit/city weights add to the
+# per-cell influence; radii set the circle sizes. Omit this block to use defaults
+# (equal weights, unit r5, city x1.5, hill x2.0).
+[standard_ruleset.influence]
+unit_weight = 1
+city_weight = 1
+unit_radius = 5.0
+city_radius_multiplier = 1.5
+hill_radius_multiplier = 2.0
+
 [storage]
 database_path = "war_of_dots.db"
 replay_path = "replays"

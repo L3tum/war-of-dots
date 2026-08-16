@@ -1156,6 +1156,7 @@ pub(crate) async fn handle_replay_ws(
                         unit_types: vec![],
                         city_upgrade_settings: crate::config::CityUpgradeSettings::default(),
                         water_speed: 1.2,
+                        influence: crate::game::game::InfluenceSettings::default(),
                     },
                     num_replay_players,
                 ),
@@ -1946,6 +1947,11 @@ pub(crate) async fn handle_client_message(
                                     std.water_speed
                                 } else {
                                     settings.water_speed
+                                },
+                                influence: if settings.use_standard_ruleset {
+                                    std.influence.clone().unwrap_or_default()
+                                } else {
+                                    crate::game::game::InfluenceSettings::default()
                                 },
                             };
                             let map =

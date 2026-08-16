@@ -6,6 +6,8 @@ import { colorForType } from './terrain';
 describe('Border edge detection', () => {
   type BorderEdge = { gridX: number; gridY: number; dir: 'h' | 'v'; owner: number };
 
+  const TERRITORY_NONE = 255;
+
   function detectBorderEdges(borderGrid: number[][]): BorderEdge[] {
     const edges: BorderEdge[] = [];
     if (borderGrid.length === 0) return edges;
@@ -14,16 +16,35 @@ describe('Border edge detection', () => {
         const p1 = borderGrid[y][x];
         const p2 = borderGrid[y][x + 1];
         const p3 = borderGrid[y + 1][x];
-        if (p1 !== p2) {
+        // Only borders between two different players — never claimed vs NONE.
+        if (p1 !== p2 && p1 !== TERRITORY_NONE && p2 !== TERRITORY_NONE) {
           edges.push({ gridX: x, gridY: y, dir: 'h' as const, owner: p1 });
         }
-        if (p1 !== p3) {
+        if (p1 !== p3 && p1 !== TERRITORY_NONE && p3 !== TERRITORY_NONE) {
           edges.push({ gridX: x, gridY: y, dir: 'v' as const, owner: p1 });
         }
       }
     }
     return edges;
   }
+
+  it('does not draw border between a player and NONE (255)', () => {
+    // player 0 adjacent to unclaimed (255) → no border
+    const edges = detectBorderEdges([
+      [0, 255],
+      [0, 255],
+    ]);
+    expect(edges).toEqual([]);
+  });
+
+  it('draws only the player-vs-player border when NONE is adjacent', () => {
+    // row: 255 | 0 | 1 → single horizontal border between 0 and 1 at x=1
+    const edges = detectBorderEdges([
+      [255, 0, 1],
+      [255, 0, 1],
+    ]);
+    expect(edges).toEqual([{ gridX: 1, gridY: 0, dir: 'h', owner: 0 }]);
+  });
 
   it('returns empty for 1x1 grid', () => {
     expect(detectBorderEdges([[0]])).toEqual([]);

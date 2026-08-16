@@ -130,6 +130,8 @@ impl LlmAgent {
             "You are an LLM agent controlling player '{}' in a real-time strategy game called War of Dots. \
             You command troops to move, recruit units, and heal. \
             Your goal is to capture cities and expand your territory. \
+            In your state, `border_grid` is a territory-ownership map: each cell holds a player \
+            index (0..n) or 255 (unclaimed). Borders form where two different players' cells meet. \
             Use the provided tools to make decisions. Be strategic and consider your opponent's movements. \
             Always provide a brief reason for each action.",
             self.name
