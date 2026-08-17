@@ -210,6 +210,32 @@ pub fn record_system_timing(
     }
 }
 
+/// Record per-system allocation totals into `system_allocs`. Called once per
+/// system invocation by the `tick_system!` macro (bench-alloc builds only).
+/// `allocs`/`bytes` are the counting-allocator delta for this one system call.
+///
+/// Requires both the debug stats (debug-overlay/debug_assertions) and the
+/// counting allocator (bench-alloc); the benchmark enables both.
+#[cfg(all(
+    any(debug_assertions, feature = "debug-overlay"),
+    feature = "bench-alloc"
+))]
+pub fn record_system_alloc(
+    world: &mut World,
+    world_entity: hecs::Entity,
+    system_name: &str,
+    allocs: u64,
+    bytes: u64,
+) {
+    if let Some(wb) = world.world_data_mut(world_entity) {
+        let ds = &mut wb.debug_stats;
+        let entry = ds.system_allocs.entry(system_name.to_string()).or_default();
+        entry.total_allocs += allocs;
+        entry.total_bytes += bytes;
+        entry.call_count += 1;
+    }
+}
+
 /// Get debug stats as JSON-serializable structure.
 pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serde_json::Value> {
     let wb_ref = world.world_data(world_entity)?;
@@ -300,7 +326,36 @@ pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serd
             })
             .collect();
 
-        Some(serde_json::json!({
+        // Per-system allocation totals (bench-alloc builds only). avg_* are
+        // per-call averages; the benchmark aggregates across runs and formats.
+        // Computed in both cfg branches (empty when bench-alloc is off) so the
+        // assignment below is unconditional and `stats_json` always needs `mut`.
+        let system_allocs_json: Vec<serde_json::Value> = {
+            #[cfg(feature = "bench-alloc")]
+            {
+                stats
+                    .system_allocs
+                    .iter()
+                    .map(|(name, a)| {
+                        let calls = a.call_count.max(1) as f64;
+                        serde_json::json!({
+                            "name": name,
+                            "total_allocs": a.total_allocs,
+                            "total_bytes": a.total_bytes,
+                            "call_count": a.call_count,
+                            "avg_allocs": a.total_allocs as f64 / calls,
+                            "avg_bytes": a.total_bytes as f64 / calls,
+                        })
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "bench-alloc"))]
+            {
+                Vec::new()
+            }
+        };
+
+        let mut stats_json = serde_json::json!({
             "tick_count": stats.tick_count,
             "entity_count": stats.entity_count,
             "archetype_count": stats.archetype_count,
@@ -310,7 +365,10 @@ pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serd
             "tick_durations_ms": tick_durations,
             "system_timings": system_timings,
             "detailed_timings": detailed_timings_json,
-        }))
+        });
+        stats_json["system_allocs"] = serde_json::json!(system_allocs_json);
+
+        Some(stats_json)
     }
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]

@@ -266,6 +266,9 @@ pub struct DebugStats {
     pub detailed_systems: std::collections::HashSet<String>,
     /// Sub-part timing data: "system/sub_part" -> SystemTimings
     pub detailed_timings: HashMap<String, SystemTimings>,
+    /// Per-system allocation totals (populated only under `bench-alloc`).
+    #[cfg(feature = "bench-alloc")]
+    pub system_allocs: HashMap<String, SystemAlloc>,
 }
 
 /// Timing info for a single system.
@@ -277,6 +280,21 @@ pub struct SystemTimings {
     pub avg_ms: f64,
     /// Per-tick duration buffer (bounded to 200 entries for P90/P99 computation)
     pub durations_ms: Vec<f64>,
+}
+
+/// Per-system allocation totals. Only populated when the counting allocator
+/// (`--features bench-alloc`) is installed; accumulated by the `tick_system!`
+/// macro via `debug_stats::record_system_alloc`. Gives a per-system split of
+/// the benchmark's per-tick allocation budget.
+#[cfg(feature = "bench-alloc")]
+#[derive(Debug, Default, Clone)]
+pub struct SystemAlloc {
+    /// Total allocation calls attributed to this system (across all calls).
+    pub total_allocs: u64,
+    /// Total heap bytes allocated by this system (across all calls).
+    pub total_bytes: u64,
+    /// Number of times this system's `tick_system!` ran.
+    pub call_count: u64,
 }
 
 #[cfg(test)]

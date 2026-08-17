@@ -37,13 +37,23 @@ use super::debug_stats::DebugSystemGuard;
 macro_rules! tick_system {
     ($name:expr, $world:expr, $world_entity:expr, $expr:expr) => {{
         let _start = std::time::Instant::now();
+        #[cfg(feature = "bench-alloc")]
+        let _alloc_base = crate::bench_alloc::peek();
         let _result = $expr;
-        crate::game::debug_stats::record_system_timing(
-            $world,
-            $world_entity,
-            $name,
-            _start.elapsed().as_secs_f64() * 1000.0,
-        );
+        let _dur = _start.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "bench-alloc")]
+        let _alloc_delta = crate::bench_alloc::peek().diff(_alloc_base);
+        crate::game::debug_stats::record_system_timing($world, $world_entity, $name, _dur);
+        #[cfg(feature = "bench-alloc")]
+        {
+            crate::game::debug_stats::record_system_alloc(
+                $world,
+                $world_entity,
+                $name,
+                _alloc_delta.allocs,
+                _alloc_delta.bytes,
+            );
+        }
         _result
     }};
 }
@@ -544,6 +554,48 @@ impl Game {
             )>()
             .iter()
             .count()
+    }
+
+    /// Fill a caller-owned scratch buffer with `(id, owner)` for every unit,
+    /// for the benchmark AI. Same 9-component query as `query_all_units`, so it
+    /// sees the identical entity set (and preserves its determinism), but emits
+    /// only the `(id, owner)` the caller needs instead of the full
+    /// String/`Vec`-heavy `UnitQueryData`. Slots are overwritten in place and the
+    /// buffer is never shrunk, so after the first growth the steady-state call
+    /// performs no allocations. Returns the live unit count.
+    #[allow(dead_code)]
+    pub fn fill_unit_id_owner(&self, out: &mut Vec<(String, String)>) -> usize {
+        use std::fmt::Write as _;
+        let mut n = 0usize;
+        for (entity, owner, _utype, _display, _pos, _path, _stats, _equipment, _flags, _wt) in self
+            .world
+            .query::<(
+                Entity,
+                &UnitOwner,
+                &UnitTypeId,
+                &UnitDisplay,
+                &UnitPosition,
+                &UnitPath,
+                &UnitStats,
+                &UnitEquipment,
+                &UnitFlags,
+                &UnitWaterTransition,
+            )>()
+            .iter()
+        {
+            if n == out.len() {
+                out.push((String::new(), String::new()));
+            }
+            let slot = &mut out[n];
+            let eid = entity.id();
+            // `unit_{eid}` written in place; capacity is reused after the first
+            // pass so this is allocation-free in steady state.
+            slot.0.clear();
+            let _ = write!(slot.0, "unit_{eid}");
+            slot.1.clone_from(&owner.player_id);
+            n += 1;
+        }
+        n
     }
 
     /// Test-only: expose the persistent influence dirty flag.
@@ -1377,6 +1429,27 @@ impl Game {
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     pub fn set_detailed_systems(&mut self, _systems: Vec<String>) {}
+
+    /// Clear per-system allocation totals. Called by the benchmark after warmup
+    /// so the per-system alloc table (and its reconciliation with the measured
+    /// per-tick summary) reflects measured (steady-state) ticks only.
+    #[allow(dead_code)]
+    #[cfg(all(
+        any(debug_assertions, feature = "debug-overlay"),
+        feature = "bench-alloc"
+    ))]
+    pub fn reset_system_allocs(&mut self) {
+        if let Some(wb) = self.world.world_data_mut(self.world_entity) {
+            wb.debug_stats.system_allocs.clear();
+        }
+    }
+
+    #[cfg(not(all(
+        any(debug_assertions, feature = "debug-overlay"),
+        feature = "bench-alloc"
+    )))]
+    #[allow(dead_code)]
+    pub fn reset_system_allocs(&mut self) {}
 
     pub fn union_vision_grids(&self, player_ids: &[String]) -> Option<Vec<Vec<bool>>> {
         let wb = self.world.world_data(self.world_entity)?;

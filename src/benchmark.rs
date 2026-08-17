@@ -63,6 +63,14 @@ pub struct BenchmarkConfig {
     pub detailed_systems: Vec<String>,
     /// Previous HTML report file for comparison (green/red deltas)
     pub bench_prev: Option<String>,
+    /// Total initial units to recruit across all cities (stress test). When set,
+    /// overrides `units_per_city` and the starting budget is scaled so N units
+    /// can actually spawn. `None` = use `units_per_city` per city (default path).
+    pub initial_units: Option<u32>,
+    /// Map size (width = height = this, in tiles). Default 200. City positions
+    /// scale proportionally to fill the map, so a stress test can spread units
+    /// over a larger area (e.g. 1000×1000) to cut local combat density.
+    pub map_size: u32,
 }
 
 impl Default for BenchmarkConfig {
@@ -73,6 +81,8 @@ impl Default for BenchmarkConfig {
             seed: 0,
             detailed_systems: Vec::new(),
             bench_prev: None,
+            initial_units: None,
+            map_size: 200,
         }
     }
 }
@@ -93,6 +103,10 @@ struct BattleSimulator {
     /// the combat/spatialty pipeline is actually exercised by the benchmark.
     center: (f32, f32),
     tick: u64,
+    /// Reusable (id, owner) list for the movement event. Filled in place by
+    /// `Game::fill_unit_id_owner` so steady-state (post-warmup) movement runs
+    /// allocation-free instead of rebuilding a fat `Vec<UnitQueryData>` each time.
+    unit_id_owner: Vec<(String, String)>,
 }
 
 impl BattleSimulator {
@@ -118,6 +132,7 @@ impl BattleSimulator {
             city_info,
             center: (map_w / 2.0, map_h / 2.0),
             tick: 0,
+            unit_id_owner: Vec::new(),
         }
     }
 
@@ -137,18 +152,18 @@ impl BattleSimulator {
 
         // Movement events: every 20 ticks, move 30% of units toward the map
         // centre. Units are sorted by id and the RNG draw order is fixed, so
-        // the whole simulation is deterministic for a given seed.
+        // the whole simulation is deterministic for a given seed (ids are unique,
+        // so the id-sort is a total order). The unit list is a reusable scratch
+        // buffer filled in place by `Game::fill_unit_id_owner`, so this builds no
+        // `Vec<UnitQueryData>` and allocates nothing in steady state.
         if self.tick.is_multiple_of(20) {
-            let mut units = game.query_all_units();
-            units.sort_by(|a, b| a.id.cmp(&b.id));
-            let mut moves: Vec<(String, String, (f32, f32))> = Vec::new();
-            for unit in &units {
+            let n = game.fill_unit_id_owner(&mut self.unit_id_owner);
+            self.unit_id_owner[..n].sort_by(|a, b| a.0.cmp(&b.0));
+            for i in 0..n {
                 if self.rand_f32() < 0.3 {
-                    moves.push((unit.id.clone(), unit.owner.clone(), self.center));
+                    let (unit_id, owner) = &self.unit_id_owner[i];
+                    game.move_troops(unit_id, owner, vec![self.center]);
                 }
-            }
-            for (unit_id, owner, target) in moves {
-                game.move_troops(&unit_id, &owner, vec![target]);
             }
         }
 
@@ -169,29 +184,22 @@ impl BattleSimulator {
                 let _ = game.recruit_unit(&city_id, &utype, &owner);
             }
         }
-
-        // Healing toggle: every 5 ticks
-        if self.tick.is_multiple_of(5) {
-            let units = game.query_all_units();
-            if !units.is_empty() {
-                let unit_idx = self.rand_idx(units.len());
-                game.toggle_healing(
-                    &units[unit_idx].id,
-                    &units[unit_idx].owner,
-                    self.rand_f32() > 0.5,
-                );
-            }
-        }
     }
 }
 
 /// Run a benchmark using a fresh game and return detailed results.
 pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     println!("🔬 Starting benchmark...");
-    println!(
-        "  Units/city: {}, Ticks: {}, Seed: {}",
-        config.units_per_city, config.ticks, config.seed
-    );
+    match config.initial_units {
+        Some(n) => println!(
+            "  Map: {}×{}, Initial units: {} (total), Ticks: {}, Seed: {}",
+            config.map_size, config.map_size, n, config.ticks, config.seed
+        ),
+        None => println!(
+            "  Map: {}×{}, Units/city: {}, Ticks: {}, Seed: {}",
+            config.map_size, config.map_size, config.units_per_city, config.ticks, config.seed
+        ),
+    };
 
     // Run microbenchmarks first (feature-gated)
     let microbench_json = {
@@ -206,30 +214,59 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         }
     };
 
+    // The city layout is authored for a 200×200 map; scale positions by
+    // map_size/200 so the same arrangement fills the map at any size. At the
+    // default (200) the scale is 1.0 and the layout is byte-identical.
+    let map_size = config.map_size;
+    let city_scale = map_size as f32 / 200.0;
+    let base_cities: &[(f32, f32)] = &[
+        (30.0, 30.0),
+        (170.0, 30.0),
+        (30.0, 170.0),
+        (170.0, 170.0),
+        (100.0, 100.0),
+        (60.0, 100.0),
+        (140.0, 100.0),
+        (100.0, 60.0),
+        (100.0, 140.0),
+        (50.0, 50.0),
+        (150.0, 50.0),
+        (100.0, 150.0),
+    ];
+    let cities: Vec<(f32, f32)> = base_cities
+        .iter()
+        .map(|&(x, y)| (x * city_scale, y * city_scale))
+        .collect();
     let map_cfg = MapConfig {
-        width: 200,
-        height: 200,
-        cities: vec![
-            (30.0, 30.0),
-            (170.0, 30.0),
-            (30.0, 170.0),
-            (170.0, 170.0),
-            (100.0, 100.0),
-            (60.0, 100.0),
-            (140.0, 100.0),
-            (100.0, 60.0),
-            (100.0, 140.0),
-            (50.0, 50.0),
-            (150.0, 50.0),
-            (100.0, 150.0),
-        ],
+        width: map_size,
+        height: map_size,
+        cities,
         terrain_data: None,
     };
+    // Size the per-player starting budget to the initial army. The default army
+    // (units_per_city × cities ≈ 240) fits the fixed 2000 funds / 100k manpower.
+    // When an explicit `--bench-initial-units N` total is requested (stress test),
+    // scale the budget so N units actually spawn — manpower is the binding resource
+    // (infantry 1000 men, cavalry 80 men; funds secondary). ~2× headroom mirrors the
+    // default (100k manpower for ~60 units/player ≈ 2.5×).
+    let (init_funds, init_manpower) = match config.initial_units {
+        Some(n) => {
+            let n64 = n as u64;
+            // Army: N units, half infantry (1000 men / cost 20), half cavalry
+            // (80 men / cost 15). Per player (BENCH_PLAYERS=4):
+            //   manpower = (540 * N) / 4 per player, ×2 headroom = 270 * N.
+            //   funds    = (17.5 * N) / 4 per player, ×2 headroom = 8.75 * N.
+            let mp = (n64 * 270).max(100_000);
+            let funds = (n64 * 35).div_ceil(4).max(2000);
+            (funds as u32, mp as u32)
+        }
+        None => (2000, 100_000),
+    };
     let settings_template = GameSettings {
-        starting_funds: 2000,
-        // Generous initial manpower so the pre-battle army spawns fully (each player
-        // fields ~60 units in the default config).
-        initial_manpower: 100_000,
+        starting_funds: init_funds,
+        // Sized to the initial army (see above); generous enough that the full
+        // pre-battle force spawns, with headroom for mid-battle recruitment.
+        initial_manpower: init_manpower,
         funds_per_city: 20.0,
         recruitment_rate: 1.0,
         game_speed: 1.0,
@@ -258,6 +295,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         std::collections::HashMap::new();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let mut agg_detailed: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    // Per-system allocation totals, averaged across runs (bench-alloc only).
+    #[cfg(all(
+        any(debug_assertions, feature = "debug-overlay"),
+        feature = "bench-alloc"
+    ))]
+    let mut agg_system_allocs: std::collections::HashMap<String, Vec<serde_json::Value>> =
         std::collections::HashMap::new();
     let mut bench_elapsed_total = std::time::Duration::ZERO;
     let mut total_units: u32 = 0;
@@ -311,21 +355,50 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         let _ = settings_ref;
 
         let cities_with_owners = game.query_cities();
+        let requested_total = config
+            .initial_units
+            .unwrap_or(config.units_per_city.saturating_mul(cities_with_owners.len() as u32));
         total_units = 0;
-        for city in &cities_with_owners {
-            let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
-            for _ in 0..config.units_per_city {
-                let utype = if total_units.is_multiple_of(2) {
-                    &infantry
-                } else {
-                    &cavalry
-                };
-                if game.recruit_unit(&city.id, utype, &owner).is_some() {
-                    total_units += 1;
+        match config.initial_units {
+            // Stress mode: field exactly N units total, distributed round-robin across
+            // cities (each city's owner fields its share). Infantry/cavalry alternate by
+            // global parity, same as the default path.
+            Some(target_total) => {
+                let n_cities = cities_with_owners.len().max(1);
+                for k in 0..target_total as usize {
+                    let city = &cities_with_owners[k % n_cities];
+                    let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
+                    let utype = if total_units.is_multiple_of(2) {
+                        &infantry
+                    } else {
+                        &cavalry
+                    };
+                    if game.recruit_unit(&city.id, utype, &owner).is_some() {
+                        total_units += 1;
+                    }
+                }
+            }
+            // Default path (unchanged): units_per_city per city, in city order.
+            None => {
+                for city in &cities_with_owners {
+                    let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
+                    for _ in 0..config.units_per_city {
+                        let utype = if total_units.is_multiple_of(2) {
+                            &infantry
+                        } else {
+                            &cavalry
+                        };
+                        if game.recruit_unit(&city.id, utype, &owner).is_some() {
+                            total_units += 1;
+                        }
+                    }
                 }
             }
         }
-        println!("  Recruited {} units", total_units);
+        println!(
+            "  Recruited {} units (requested {})",
+            total_units, requested_total
+        );
 
         let mut sim = BattleSimulator::new(
             unit_types_clone,
@@ -347,6 +420,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             sim.tick(&mut game, &config);
             game.tick_game();
         }
+
+        // Reset per-system alloc accumulators so the per-system table reflects
+        // measured (steady-state) ticks only, matching the measured-only summary.
+        #[cfg(all(
+            any(debug_assertions, feature = "debug-overlay"),
+            feature = "bench-alloc"
+        ))]
+        game.reset_system_allocs();
 
         // Collect per-tick data
         let mut run_tick_data: Vec<TickData> = Vec::with_capacity(config.ticks as usize);
@@ -461,6 +542,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     agg_detailed.entry(name).or_default().push(s.clone());
                 }
             }
+            #[cfg(feature = "bench-alloc")]
+            if let Some(arr) = final_debug["system_allocs"].as_array() {
+                for s in arr {
+                    let name = s["name"].as_str().unwrap_or("?").to_string();
+                    agg_system_allocs.entry(name).or_default().push(s.clone());
+                }
+            }
         }
     } // end of measured-run loop
 
@@ -474,6 +562,52 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let final_detailed_timings: Vec<serde_json::Value> = agg_detailed
         .values()
         .map(|vals| average_timings(vals))
+        .collect();
+
+    // Per-system allocation totals averaged across runs (empty unless bench-alloc
+    // + debug stats are both active).
+    let final_system_allocs: Vec<serde_json::Value> = {
+        #[cfg(all(
+            any(debug_assertions, feature = "debug-overlay"),
+            feature = "bench-alloc"
+        ))]
+        {
+            agg_system_allocs
+                .values()
+                .map(|vals| average_allocs(vals))
+                .collect()
+        }
+        #[cfg(not(all(
+            any(debug_assertions, feature = "debug-overlay"),
+            feature = "bench-alloc"
+        )))]
+        {
+            Vec::new()
+        }
+    };
+
+    // Per-system allocation split, expressed both as per-tick averages (divide
+    // each run's measured-tick total by `ticks`) and per-call averages (like the
+    // timing breakdown's Avg/Call). Computed early so the CLI section can use it.
+    // Empty unless bench-alloc + debug stats are on.
+    let system_allocs: Vec<serde_json::Value> = final_system_allocs
+        .iter()
+        .map(|s| {
+            let total_allocs = s["total_allocs"].as_f64().unwrap_or(0.0);
+            let total_bytes = s["total_bytes"].as_f64().unwrap_or(0.0);
+            let calls = s["call_count"].as_f64().unwrap_or(0.0);
+            let ticks = config.ticks.max(1) as f64;
+            serde_json::json!({
+                "name": s["name"],
+                "total_allocs": total_allocs,
+                "total_bytes": total_bytes,
+                "call_count": s["call_count"].as_u64().unwrap_or(0),
+                "allocs_per_tick": total_allocs / ticks,
+                "bytes_per_tick": total_bytes / ticks,
+                "avg_allocs": if calls > 0.0 { total_allocs / calls } else { 0.0 },
+                "avg_bytes": if calls > 0.0 { total_bytes / calls } else { 0.0 },
+            })
+        })
         .collect();
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
@@ -721,6 +855,43 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         );
     }
 
+    // Per-system allocation breakdown (bench-alloc + debug stats only). Mirrors
+    // the timing table: allocs and bytes attributed to each system, as per-tick
+    // averages (÷ ticks) and per-call averages.
+    if !system_allocs.is_empty() {
+        let mut sorted_allocs: Vec<&serde_json::Value> = system_allocs.iter().collect();
+        sorted_allocs.sort_by(|a, b| {
+            b["bytes_per_tick"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&a["bytes_per_tick"].as_f64().unwrap_or(0.0))
+                .unwrap()
+        });
+        println!("  Per-system allocations (avg per tick, bench-alloc):");
+        println!("  ───────────────────────────────────────────────────────");
+        println!(
+            "    {:<25}  {:>10} {:>14} {:>12} {:>14}  {:>8}",
+            "system", "allocs/tick", "bytes/tick", "allocs/call", "bytes/call", "calls"
+        );
+        for s in &sorted_allocs {
+            let name = s["name"].as_str().unwrap_or("?");
+            let apt = s["allocs_per_tick"].as_f64().unwrap_or(0.0);
+            let bpt = s["bytes_per_tick"].as_f64().unwrap_or(0.0);
+            let a_c = s["avg_allocs"].as_f64().unwrap_or(0.0);
+            let b_c = s["avg_bytes"].as_f64().unwrap_or(0.0);
+            let calls = s["call_count"].as_u64().unwrap_or(0);
+            println!(
+                "    {:<25}  {:>10.2} {:>14} {:>12.2} {:>14}  {:>8}",
+                name,
+                apt,
+                fmt_bytes(bpt),
+                a_c,
+                fmt_bytes(b_c),
+                calls
+            );
+        }
+    }
+
     // Detailed sub-part breakdown
     if !final_detailed_timings.is_empty() {
         println!("\n  Detailed sub-part timings:");
@@ -805,6 +976,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
+            "initial_units": config.initial_units,
+            "map_size": config.map_size,
             "total_units_initial": total_units, "total_units_recruited": total_recruited,
             "ticks": config.ticks, "seed": config.seed,
             "measured_runs": MEASURED_RUNS, "warmup_ticks": BENCH_WARMUP_TICKS,
@@ -838,6 +1011,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "overhead_durations_ms": overhead_durations,
         "system_timings": final_system_timings,
         "detailed_timings": final_detailed_timings,
+        // Per-system allocation split (bench-alloc + debug stats). `allocs_per_tick`
+        // / `bytes_per_tick` divide each run's measured-tick totals by `ticks`;
+        // `avg_allocs`/`avg_bytes` are per system call. Empty unless bench-alloc is on.
+        "system_allocs": {
+            "ticks": config.ticks,
+            "systems": system_allocs,
+        },
         // Per-tick arrays are the averaged series (length == config.ticks),
         // matching the charts. Note overhead_durations_ms above stays the raw
         // 3×N distribution (it backs the overhead percentiles); the length
@@ -949,6 +1129,8 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let units_initial = results.summary["config"]["total_units_initial"]
         .as_u64()
         .unwrap_or(0);
+    let map_size = results.summary["config"]["map_size"].as_u64().unwrap_or(200);
+    let map_desc = format!("{}×{} ({} tiles)", map_size, map_size, map_size * map_size);
     let units_recruited = results.summary["config"]["total_units_recruited"]
         .as_u64()
         .unwrap_or(0);
@@ -1397,6 +1579,68 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         }
     };
 
+    // Per-system allocation table rows (bench-alloc). Sorted by bytes/tick; a
+    // trailing "other / overhead" row shows the share of the per-tick budget NOT
+    // attributed to a tick_system!-wrapped system (ECS archetype rebuild, query
+    // setup, benchmark AI such as query_all_units / recruit).
+    let alloc_rows = {
+        let sa = &results.summary["system_allocs"];
+        let systems = sa.get("systems").and_then(|s| s.as_array());
+        let total_bytes_per_tick = results.summary["results"]["bytes_per_tick"]
+            .as_f64()
+            .unwrap_or(0.0);
+        match systems {
+            Some(systems) if !systems.is_empty() => {
+                let mut sorted: Vec<&serde_json::Value> = systems.iter().collect();
+                sorted.sort_by(|a, b| {
+                    b["bytes_per_tick"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a["bytes_per_tick"].as_f64().unwrap_or(0.0))
+                        .unwrap()
+                });
+                let mut rows: Vec<String> = sorted
+                    .iter()
+                    .map(|s| {
+                        let name = s["name"].as_str().unwrap_or("?");
+                        let apt = s["allocs_per_tick"].as_f64().unwrap_or(0.0);
+                        let bpt = s["bytes_per_tick"].as_f64().unwrap_or(0.0);
+                        let a_c = s["avg_allocs"].as_f64().unwrap_or(0.0);
+                        let b_c = s["avg_bytes"].as_f64().unwrap_or(0.0);
+                        let calls = s["call_count"].as_u64().unwrap_or(0);
+                        let share = if total_bytes_per_tick > 0.0 {
+                            bpt / total_bytes_per_tick * 100.0
+                        } else {
+                            0.0
+                        };
+                        format!(
+                            "<tr><td>{}</td><td>{:.2}</td><td>{}</td><td>{:.1}%</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
+                            name, apt, fmt_bytes(bpt), share, a_c, fmt_bytes(b_c), calls
+                        )
+                    })
+                    .collect();
+                let attributed: f64 = sorted
+                    .iter()
+                    .map(|s| s["bytes_per_tick"].as_f64().unwrap_or(0.0))
+                    .sum();
+                let unattributed = total_bytes_per_tick - attributed;
+                if unattributed > 0.5 {
+                    let un_attr_share = if total_bytes_per_tick > 0.0 {
+                        unattributed / total_bytes_per_tick * 100.0
+                    } else {
+                        0.0
+                    };
+                    rows.push(format!(
+                        "<tr style='background:rgba(255,255,255,0.05)'><td><i>other / overhead</i></td><td>—</td><td>{}</td><td>{:.1}%</td><td>—</td><td>—</td><td>—</td></tr>",
+                        fmt_bytes(unattributed), un_attr_share
+                    ));
+                }
+                rows.join("\n      ")
+            }
+            _ => "<tr><td colspan='7'>No per-system allocation data. Enable --features bench-alloc to populate.</td></tr>".to_string(),
+        }
+    };
+
     // Microbenchmark table rows. Previous per-bench object kept for per-column
     // deltas (mean/min/median/p99, field-presence: older reports only have
     // mean_ns, so their min/median/p99 cells render without a delta).
@@ -1737,7 +1981,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
 
         <h2>Configuration</h2>
         <table>
-            <tr><td>Map</td><td>200×200 (40,000 tiles)</td></tr>
+            <tr><td>Map</td><td>{map_desc}</td></tr>
             <tr><td>Cities</td><td>{cities}</td></tr>
             <tr><td>Players</td><td>{bench_players} (cities round-robin)</td></tr>
             <tr><td>Units per city</td><td>{units_per_city}</td></tr>
@@ -1832,6 +2076,18 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             <thead><tr><th>Sub-part</th><th>Total (ms)</th><th>Avg/Call</th><th>Calls</th><th>P99</th></tr></thead>
             <tbody>
       {detailed_rows}
+            </tbody>
+        </table>
+
+        <h2>Per-System Allocations</h2>
+        <p class="note">Allocation budget attributed to each system (bench-alloc only). <b>per tick</b> = the system's measured-tick total ÷ {ticks}; <b>per call</b> = average over its invocations. <i>other / overhead</i> is everything outside the tick_system!-wrapped systems (ECS archetype rebuild, query setup, benchmark AI like query_all_units / recruit).</p>
+        <table>
+            <thead><tr>
+                <th>System</th><th>Allocs/Tick</th><th>Bytes/Tick</th><th>% Bytes/Tick</th>
+                <th>Allocs/Call</th><th>Bytes/Call</th><th>Calls</th>
+            </tr></thead>
+            <tbody>
+      {alloc_rows}
             </tbody>
         </table>
 
@@ -2137,6 +2393,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         units_remaining_delta = units_remaining_delta,
         cities = cities,
         units_per_city = units_per_city,
+        map_desc = map_desc,
         ticks = tick_count,
         avg_system = avg_system,
         avg_system_delta = avg_system_delta,
@@ -2164,6 +2421,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         system_bars = system_bars,
         svg_height = svg_height_val,
         detailed_rows = detailed_rows,
+        alloc_rows = alloc_rows,
         microbench_rows = microbench_rows,
         microbench_count = microbench_count,
         json = serde_json::to_string_pretty(&results.summary).unwrap_or_default(),
@@ -2205,6 +2463,45 @@ fn average_timings(entries: &[serde_json::Value]) -> serde_json::Value {
             out[f] = serde_json::json!(sum / entries.len() as f64);
         }
     }
+    out
+}
+
+/// Average numeric per-system allocation fields across measured runs.
+///
+/// `total_allocs`/`total_bytes`/`call_count` are summed (they are cumulative
+/// over each run's ticks), then divided by the run count to yield the average
+/// per-run totals. `avg_allocs`/`avg_bytes` are recomputed from the averaged
+/// totals (not averaged-of-averages) so the per-call figures stay consistent.
+fn average_allocs(entries: &[serde_json::Value]) -> serde_json::Value {
+    let mut out = entries.first().cloned().unwrap_or(serde_json::Value::Null);
+    if out.is_null() || entries.is_empty() {
+        return out;
+    }
+    let n = entries.len() as f64;
+    let mut sum_total_allocs = 0u64;
+    let mut sum_total_bytes = 0u64;
+    let mut sum_calls = 0u64;
+    for v in entries {
+        sum_total_allocs += v["total_allocs"].as_u64().unwrap_or(0);
+        sum_total_bytes += v["total_bytes"].as_u64().unwrap_or(0);
+        sum_calls += v["call_count"].as_u64().unwrap_or(0);
+    }
+    let avg_total_allocs = sum_total_allocs as f64 / n;
+    let avg_total_bytes = sum_total_bytes as f64 / n;
+    let avg_calls = sum_calls as f64 / n;
+    out["total_allocs"] = serde_json::json!(avg_total_allocs);
+    out["total_bytes"] = serde_json::json!(avg_total_bytes);
+    out["call_count"] = serde_json::json!(sum_calls);
+    out["avg_allocs"] = serde_json::json!(if avg_calls > 0.0 {
+        avg_total_allocs / avg_calls
+    } else {
+        0.0
+    });
+    out["avg_bytes"] = serde_json::json!(if avg_calls > 0.0 {
+        avg_total_bytes / avg_calls
+    } else {
+        0.0
+    });
     out
 }
 

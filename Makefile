@@ -19,7 +19,15 @@ clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 test:
-	cargo test --all-targets
+	# Full suite with the dhat-based alloc_invariants test skipped: dhat uses a
+	# process-global allocator, so its net-heap-growth sample is contaminated by
+	# whatever other test threads/bins (integration_game, bins) are allocating at
+	# the same instant under --all-targets, making the bound flaky. So we run the
+	# rest concurrently...
+	cargo test --all-targets -- --skip alloc_invariants::warm_tick_net_heap_growth_is_bounded
+	# ...then run that one test in isolation (lib target only, single test, no other
+	# binary running) where the dhat measurement is clean and the bound is meaningful.
+	cargo test --lib alloc_invariants::warm_tick_net_heap_growth_is_bounded -- --exact
 	$(MAKE) frontend-test
 
 # MIRI — detects undefined behavior (slow, needs nightly toolchain + miri component)

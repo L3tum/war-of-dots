@@ -394,7 +394,7 @@ mod tests {
 
     fn terrain_with_hills() -> Arc<Vec<Terrain>> {
         let mut t = vec![Terrain::Plains; (W * H) as usize];
-        t[(20 as usize) * (W as usize) + 20] = Terrain::Hills;
+        t[20 * (W as usize) + 20] = Terrain::Hills;
         Arc::new(t)
     }
 

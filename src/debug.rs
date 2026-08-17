@@ -79,6 +79,8 @@ pub async fn debug_benchmark_handler(
         seed: 0,
         detailed_systems: Vec::new(),
         bench_prev: None,
+        initial_units: None,
+        map_size: 200,
     };
 
     // Run benchmark in a blocking thread

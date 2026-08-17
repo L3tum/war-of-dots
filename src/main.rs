@@ -5,6 +5,12 @@
 //! and supports LLM agents.
 
 use war_of_dots::benchmark;
+// Re-export the counting allocator into this binary's crate root so the
+// `tick_system!` macro (compiled into the bin via `mod game`) can resolve
+// `crate::bench_alloc`. A `use` re-export does NOT duplicate the
+// `#[global_allocator]` static — the allocator still lives in the lib.
+#[cfg(feature = "bench-alloc")]
+pub use war_of_dots::bench_alloc;
 mod config;
 mod debug;
 mod errors;
@@ -61,6 +67,15 @@ struct Cli {
     /// Previous HTML report file for comparison (adds green/red deltas to current report)
     #[arg(long)]
     bench_prev: Option<String>,
+
+    /// Total initial units to recruit (stress test). Overrides --bench-units and scales
+    /// the starting budget so N units actually spawn.
+    #[arg(long)]
+    bench_initial_units: Option<u32>,
+
+    /// Map size (width × height in tiles). City positions scale to fill it.
+    #[arg(long, default_value_t = 200)]
+    bench_map_size: u32,
 }
 
 #[tokio::main]
@@ -80,7 +95,9 @@ async fn main() -> anyhow::Result<()> {
             || cli.bench_seed != 0
             || !cli.bench_detailed.is_empty()
             || cli.bench_html.is_some()
-            || cli.bench_prev.is_some();
+            || cli.bench_prev.is_some()
+            || cli.bench_initial_units.is_some()
+            || cli.bench_map_size != 200;
 
         if has_bench_args {
             eprintln!("error: bench arguments provided without --benchmark flag");
@@ -109,6 +126,8 @@ async fn main() -> anyhow::Result<()> {
             seed: cli.bench_seed,
             detailed_systems,
             bench_prev: cli.bench_prev.clone(),
+            initial_units: cli.bench_initial_units,
+            map_size: cli.bench_map_size,
         };
         let results = benchmark::run_benchmark(bench_cfg);
 

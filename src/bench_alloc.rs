@@ -83,6 +83,21 @@ pub fn snapshot() -> AllocSnapshot {
     }
 }
 
+/// Read the cumulative alloc/byte counters WITHOUT touching the "biggest
+/// single allocation since the last snapshot" window.
+///
+/// Used for per-system attribution: the benchmark needs per-tick allocs/bytes
+/// split by system, but must not reset the per-tick `max_alloc` window (which
+/// `snapshot()` owns). Diff two `peek()` results for a region's allocs/bytes;
+/// `max_alloc` is 0 by construction and should be ignored from a peek.
+pub fn peek() -> AllocSnapshot {
+    AllocSnapshot {
+        allocs: ALLOCS.load(Ordering::Relaxed) as u64,
+        bytes: BYTES.load(Ordering::Relaxed) as u64,
+        max_alloc: 0,
+    }
+}
+
 /// Difference between two snapshots (allocations in the region between them).
 #[derive(Clone, Copy, Default)]
 pub struct AllocDelta {
