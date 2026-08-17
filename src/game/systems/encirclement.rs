@@ -14,7 +14,40 @@ use crate::game::world_ext::WorldExt;
 use hecs::World;
 use std::sync::Arc;
 
-pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
+/// Reused scratch buffers for the encirclement flood-fill. `safe` is the
+/// per-cell claim grid (NONE = unvisited, else the owning player idx); `queue`
+/// is the BFS frontier storing cell indices (`usize`) instead of `(x, y, idx)`
+/// tuples — 8 bytes/entry vs 16, better cache locality. Both grow only on map
+/// resize and are reused each run (no per-run alloc).
+pub struct EncirclementScratch {
+    pub safe: Vec<u8>,
+    pub queue: Vec<usize>,
+}
+
+impl EncirclementScratch {
+    pub fn new() -> Self {
+        Self {
+            safe: Vec::new(),
+            queue: Vec::new(),
+        }
+    }
+
+    /// Grow `safe` to `grid_size` once (no-op when already sized). `queue`
+    /// grows on demand and keeps its capacity for reuse.
+    fn ensure(&mut self, grid_size: usize) {
+        if self.safe.len() != grid_size {
+            self.safe.resize(grid_size, NONE);
+        }
+    }
+}
+
+impl Default for EncirclementScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn run(world: &mut World, ctx: &TickContext, _tick: u64, scratch: &mut EncirclementScratch) {
     // Read the pre-computed territory grid (computed by influence::run): which
     // player dominates each cell (player index 0..N, or NONE=255 where none).
     let territory: Arc<Vec<u8>> = match world.world_data(ctx.world_entity) {
@@ -50,35 +83,41 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64) {
 
     // Combined multi-player flood-fill: one BFS pass for ALL players simultaneously.
     // safe[i] == NONE → unvisited, safe[i] == player_idx → claimed by that player.
-    let mut safe = vec![NONE; grid_size];
+    // Reused from scratch (grown only on map resize); reset for this run.
+    scratch.ensure(grid_size);
+    scratch.safe.fill(NONE);
+    let safe = &mut scratch.safe;
     // Mark all edge cells as safe for ALL players (edges are universally safe)
-    mark_safe_edges_multi(&mut safe, wusize, h as usize, dominant);
+    mark_safe_edges_multi(safe, wusize, h as usize, dominant);
     // Mark cells near cities as safe (each city's radius marks cells for that player)
     for (pidx, cities) in cities_by_player.iter().take(nplayers).enumerate() {
-        mark_safe_near_cities_multi(&mut safe, cities, wusize, h as usize, pidx as u8);
+        mark_safe_near_cities_multi(safe, cities, wusize, h as usize, pidx as u8);
     }
 
-    // Single combined BFS: queue stores (x, y, player_idx)
-    let mut queue_buf: Vec<(i32, i32, u8)> = Vec::with_capacity(grid_size);
+    // Single combined BFS: queue stores cell indices (usize) — reused from
+    // scratch and cleared each run.
+    let queue_buf = &mut scratch.queue;
+    queue_buf.clear();
     let mut qhead = 0;
     // Seed queue with all safe anchor cells that have a dominant player
     for idx in 0..grid_size {
         if safe[idx] != NONE && dominant[idx] != NONE && safe[idx] == dominant[idx] {
-            let x = idx % wusize;
-            let y = idx / wusize;
-            queue_buf.push((x as i32, y as i32, dominant[idx]));
+            queue_buf.push(idx);
         }
     }
     // BFS outward — each cell propagates to neighbors dominated by the SAME player
     while qhead < queue_buf.len() {
-        let (cx, cy, pidx) = queue_buf[qhead];
+        let idx = queue_buf[qhead];
         qhead += 1;
+        let pidx = safe[idx];
+        let cx = (idx % wusize) as i32;
+        let cy = (idx / wusize) as i32;
         for (nx, ny) in [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)] {
             if nx >= 0 && ny >= 0 && nx < w && ny < h {
                 let nidx = (ny as usize) * wusize + (nx as usize);
                 if safe[nidx] == NONE && dominant[nidx] == pidx {
                     safe[nidx] = pidx;
-                    queue_buf.push((nx, ny, pidx));
+                    queue_buf.push(nidx);
                 }
             }
         }

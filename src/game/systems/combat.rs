@@ -159,8 +159,8 @@ pub fn run(
     // Scoped Arc extraction: drops hecs::Ref borrow immediately, only clones terrain Arc (24 bytes)
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_wdc = crate::game::debug_stats::DetailedTimer::new("combat/world_data_clone");
-    let terrain = match world.world_data(world_entity) {
-        Some(wb) => Arc::clone(&wb.terrain.grid),
+    let (terrain, terrain_w) = match world.world_data(world_entity) {
+        Some(wb) => (Arc::clone(&wb.terrain.grid), wb.terrain.width as usize),
         None => return Vec::new(),
     };
     // wb (hecs::Ref) dropped — borrow released. Can now do mutable queries.
@@ -344,14 +344,12 @@ pub fn run(
             // Each unit uses the terrain it stands on — fixes asymmetry where both
             // sides would get the attacker's terrain modifier.
             let a_terrain = terrain
-                .get(pos1.x as usize)
-                .and_then(|r| r.get(pos1.y as usize))
-                .cloned()
+                .get((pos1.y as usize) * terrain_w + (pos1.x as usize))
+                .copied()
                 .unwrap_or(crate::game::unit::Terrain::Plains);
             let d_terrain = terrain
-                .get(pos2.x as usize)
-                .and_then(|r| r.get(pos2.y as usize))
-                .cloned()
+                .get((pos2.y as usize) * terrain_w + (pos2.x as usize))
+                .copied()
                 .unwrap_or(crate::game::unit::Terrain::Plains);
             let a_terrain_mod = terrain_modifier(&a_terrain);
             let d_terrain_mod = terrain_modifier(&d_terrain);
@@ -556,7 +554,7 @@ mod tests {
                 max_supply: 2000.0,
             },
             NearbyEnemies {
-                entities: vec![],
+                entities: Default::default(),
                 initialized: true,
             },
         ))
@@ -602,7 +600,7 @@ mod tests {
                 max_supply: 2000.0,
             },
             NearbyEnemies {
-                entities: vec![],
+                entities: Default::default(),
                 initialized: true,
             },
         ))
@@ -632,7 +630,7 @@ mod tests {
                 }
             }
             if let Ok((ne,)) = world.query_one_mut::<(&mut NearbyEnemies,)>(*entity) {
-                ne.entities = nearby;
+                ne.entities = nearby.into_iter().collect();
             }
         }
     }

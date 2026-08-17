@@ -363,7 +363,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // World read-back + counters are part of the per-tick work, so they
             // are timed: this keeps total_ms (systems + overhead) reconciling
             // with the wall-clock avg tick, and counts their allocations.
-            let unit_count = game.query_all_units().len() as u32;
+            // `unit_count()` is an allocation-free count (no UnitQueryData build).
+            let unit_count = game.unit_count() as u32;
             let movers = game.last_mover_count() as u32;
             let combats = game.last_engaged_pairs() as u32;
             let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;

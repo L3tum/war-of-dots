@@ -10,6 +10,7 @@ use crate::game::economy::City;
 use crate::game::unit::Equipment;
 use crate::game::unit::Terrain;
 use hecs;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,7 +52,8 @@ impl UnitPosition {
 /// Path waypoints the unit is following.
 #[derive(Debug, Clone, Default)]
 pub struct UnitPath {
-    pub path: Vec<(f32, f32)>,
+    /// SmallVec keeps typical short paths (≤ 8 waypoints) stack-allocated.
+    pub path: SmallVec<[(f32, f32); 8]>,
 }
 
 /// Cached list of enemy entities within COMBAT_RANGE.
@@ -59,7 +61,8 @@ pub struct UnitPath {
 #[derive(Debug, Clone, Default)]
 pub struct NearbyEnemies {
     /// Enemy entities found during last spatialty update.
-    pub entities: Vec<hecs::Entity>,
+    /// SmallVec keeps the common case (≤ 8 enemies) stack-allocated.
+    pub entities: SmallVec<[hecs::Entity; 8]>,
     /// Whether this list was ever populated by the spatialty system.
     /// false at spawn, set to true after first Tier 1 initialization.
     pub initialized: bool,
@@ -118,20 +121,23 @@ pub struct UnitWaterTransition {
 // ============================================================================
 
 /// Terrain grid for the map.
+///
+/// Stored as a single flat `Arc<Vec<Terrain>>` in **y-major** order
+/// (`idx = y * width + x`), matching `VisionGrids`/`TerritoryGrid`. This
+/// removes the row-pointer indirection of the old `Vec<Vec<Terrain>>` on every
+/// per-unit terrain lookup.
 #[derive(Debug, Clone)]
 pub struct TerrainGrid {
-    pub grid: Arc<Vec<Vec<Terrain>>>,
+    pub grid: Arc<Vec<Terrain>>,
     pub width: u32,
     pub height: u32,
 }
 
 impl TerrainGrid {
     pub fn get(&self, x: f32, y: f32) -> Terrain {
-        self.grid
-            .get(x as usize)
-            .and_then(|r| r.get(y as usize))
-            .cloned()
-            .unwrap_or(Terrain::Plains)
+        let w = self.width as usize;
+        let idx = (y as usize) * w + (x as usize);
+        self.grid.get(idx).copied().unwrap_or(Terrain::Plains)
     }
 }
 
@@ -207,9 +213,24 @@ impl WorldBundle {
         city_upgrade_settings: crate::config::CityUpgradeSettings,
         funds: HashMap<String, u32>,
     ) -> Self {
+        let w = width as usize;
+        let h = height as usize;
+        // Flatten the x-major input (`terrain[x][y]`) into y-major storage
+        // (`flat[y * w + x]`) to match VisionGrids/TerritoryGrid indexing.
+        // Behavior-preserving: new get(x,y) = flat[y*w+x] = terrain[x][y] = old get(x,y).
+        let mut flat = vec![Terrain::Plains; w * h];
+        for x in 0..w {
+            if let Some(row) = terrain.get(x) {
+                for y in 0..h {
+                    if let Some(&t) = row.get(y) {
+                        flat[y * w + x] = t;
+                    }
+                }
+            }
+        }
         Self {
             terrain: TerrainGrid {
-                grid: Arc::new(terrain),
+                grid: Arc::new(flat),
                 width,
                 height,
             },
@@ -256,4 +277,46 @@ pub struct SystemTimings {
     pub avg_ms: f64,
     /// Per-tick duration buffer (bounded to 200 entries for P90/P99 computation)
     pub durations_ms: Vec<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CityUpgradeSettings;
+    use std::collections::HashMap;
+
+    /// Round-trip a NON-SQUARE (120 wide × 80 tall) terrain grid through
+    /// `WorldBundle::new` and `TerrainGrid::get`. Because width != height, any
+    /// x/y stride confusion in the flatten or the lookup would surface here
+    /// (all other tests use square maps and would pass with a silent swap).
+    #[test]
+    fn non_square_terrain_roundtrip() {
+        let w: u32 = 120;
+        let h: u32 = 80;
+        // x-major input: terrain[x][y]. Markers placed where x != y catch a swap.
+        let mut terrain = vec![vec![Terrain::Plains; h as usize]; w as usize];
+        terrain[7][3] = Terrain::Hills; // (x=7, y=3)
+        terrain[3][7] = Terrain::Forest; // (x=3, y=7)
+        terrain[119][79] = Terrain::Water; // far corner
+        terrain[0][0] = Terrain::Mountain; // near corner
+
+        let wb = WorldBundle::new(
+            terrain,
+            w,
+            h,
+            CityUpgradeSettings::default(),
+            HashMap::new(),
+        );
+
+        // get(x, y) must read exactly the cell the x-major builder wrote.
+        assert_eq!(wb.terrain.get(7.0, 3.0), Terrain::Hills);
+        assert_eq!(wb.terrain.get(3.0, 7.0), Terrain::Forest);
+        assert_eq!(wb.terrain.get(119.0, 79.0), Terrain::Water);
+        assert_eq!(wb.terrain.get(0.0, 0.0), Terrain::Mountain);
+        // Unmarked cells stay Plains.
+        assert_eq!(wb.terrain.get(10.0, 10.0), Terrain::Plains);
+        // Out-of-bounds falls back to Plains (no panic).
+        assert_eq!(wb.terrain.get(120.0, 0.0), Terrain::Plains);
+        assert_eq!(wb.terrain.get(0.0, 80.0), Terrain::Plains);
+    }
 }

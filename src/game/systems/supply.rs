@@ -36,6 +36,12 @@ pub struct SupplyScratch {
     /// Reusable per-slot delivery plan buffer for `plan_delivery_into`. Most
     /// units carry 0-2 equipment slots, so the plan stays inline (SmallVec).
     pub delivery: SmallVec<[(usize, u32); 4]>,
+    /// player_id by index (u8), rebuilt only when the player count changes.
+    pub id_by_index: Vec<String>,
+    /// Snapshot of each player's remaining manpower pool, reloaded each tick.
+    pub remaining_mp: Vec<u32>,
+    /// Snapshot of each player's remaining funds pool, reloaded each tick.
+    pub remaining_funds: Vec<u32>,
 }
 
 impl SupplyScratch {
@@ -45,6 +51,9 @@ impl SupplyScratch {
             fund_cost: Vec::new(),
             dead: SmallVec::new(),
             delivery: SmallVec::new(),
+            id_by_index: Vec::new(),
+            remaining_mp: Vec::new(),
+            remaining_funds: Vec::new(),
         }
     }
 
@@ -140,31 +149,36 @@ pub fn run(
 
     // Snapshot each player's global pools (manpower + funds) into dense
     // Vec<u32> indexed by player index (u8 from TickContext), for FCFS gating.
+    // Reuses `scratch` buffers: id_by_index is rebuilt only when the player
+    // count changed, and the pool vecs use resize (a no-op when unchanged).
     // The scoped block drops the hecs::Ref immutable borrow so the query below
     // can take &mut component references.
-    let id_by_index: Vec<String> = {
-        let mut v: Vec<String> = vec![String::new(); ctx.next_player_idx as usize];
-        for (pid, idx) in ctx.player_id_to_index.iter() {
-            v[*idx as usize] = pid.clone();
-        }
-        v
-    };
-    let (remaining_mp0, remaining_funds0) = {
+    let n = ctx.next_player_idx as usize;
+    {
         let wb = match world.world_data(world_entity) {
             Some(wb) => wb,
             None => return SmallVec::new(),
         };
-        let n = ctx.next_player_idx as usize;
-        let mut mp = vec![0u32; n];
-        let mut funds = vec![0u32; n];
-        for (i, id) in id_by_index.iter().enumerate() {
-            mp[i] = wb.funds.manpower.get(id).copied().unwrap_or(0);
-            funds[i] = wb.funds.funds.get(id).copied().unwrap_or(0);
+        // Rebuild id_by_index only when the player count changed (rare).
+        if scratch.id_by_index.len() != n {
+            let mut v = vec![String::new(); n];
+            for (pid, idx) in ctx.player_id_to_index.iter() {
+                v[*idx as usize] = pid.clone();
+            }
+            scratch.id_by_index = v;
         }
-        (mp, funds)
-    };
-    let mut remaining_mp = remaining_mp0;
-    let mut remaining_funds = remaining_funds0;
+        scratch.remaining_mp.resize(n, 0);
+        scratch.remaining_funds.resize(n, 0);
+        for i in 0..n {
+            let id = &scratch.id_by_index[i];
+            scratch.remaining_mp[i] = wb.funds.manpower.get(id).copied().unwrap_or(0);
+            scratch.remaining_funds[i] = wb.funds.funds.get(id).copied().unwrap_or(0);
+        }
+    }
+    // wb (hecs::Ref) dropped — borrow released.
+    let remaining_mp = &mut scratch.remaining_mp;
+    let remaining_funds = &mut scratch.remaining_funds;
+    let id_by_index = &scratch.id_by_index;
     // Per-player cost accumulators indexed by player index (no String hashing).
     scratch.mp_cost.resize(remaining_mp.len(), 0);
     scratch.fund_cost.resize(remaining_funds.len(), 0);

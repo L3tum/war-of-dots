@@ -1,7 +1,7 @@
 //! CityCaptureSystem — capture cities when units stand on them.
 
 use crate::game::components::*;
-use crate::game::game::PlayerGameStats;
+use crate::game::game::{PlayerGameStats, TickContext};
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +13,7 @@ pub fn run(
     world: &mut World,
     world_entity: hecs::Entity,
     player_stats: &mut HashMap<String, PlayerGameStats>,
+    ctx: &TickContext,
 ) -> Vec<String> {
     // Scoped extraction: cities Vec is small (~20 entries), clone is cheap
     let cities = match world.world_data(world_entity) {
@@ -20,24 +21,42 @@ pub fn run(
         None => return Vec::new(),
     };
 
-    let units: Vec<(String, UnitPosition)> = world
-        .query::<(hecs::Entity, &UnitOwner, &UnitPosition)>()
+    // Resolve each city's owner to a u8 player index once (≤ ~20 cities).
+    // A city owned by a player with no units (absent from the index) resolves to
+    // None — any player's unit may capture it, matching the old String compare.
+    let city_owner_idx: Vec<Option<u8>> = cities
         .iter()
-        .map(|(_, owner, pos)| (owner.player_id.clone(), *pos))
+        .map(|c| {
+            c.owner
+                .as_ref()
+                .and_then(|o| ctx.player_id_to_index.get(o).copied())
+        })
         .collect();
 
-    // Collect all capture candidates, then pick one winner per city deterministically
-    // BTreeMap ensures deterministic iteration order (sorted by city_id)
+    // Collect capture candidates in one query pass. Owner identity is compared as
+    // a u8 index (O(1) equality — no per-unit String clone, no per-pair String
+    // compare); the owner String is only cloned when a capture actually fires.
+    // BTreeMap ensures deterministic iteration order (sorted by city_id).
     let city_ids_changed: Vec<(String, String)> = {
         let mut changed: BTreeMap<String, String> = BTreeMap::new();
-        for (owner_id, pos) in &units {
-            for city in &cities {
+        for (entity, owner, pos) in world
+            .query::<(hecs::Entity, &UnitOwner, &UnitPosition)>()
+            .iter()
+        {
+            // Compact owner lookup (see TickContext); skip if the entity is
+            // somehow absent — matches nearby_enemies' defensive pattern.
+            let unit_owner_idx = match ctx.owner_id_by_entity.get(&entity).copied() {
+                Some(i) => i,
+                None => continue,
+            };
+            for (city, city_owner_idx) in cities.iter().zip(city_owner_idx.iter()) {
                 let dx = pos.x - city.position.0;
                 let dy = pos.y - city.position.1;
                 let dist_sq = dx * dx + dy * dy;
-                if dist_sq < CAPTURE_RANGE_SQ && city.owner.as_deref() != Some(owner_id.as_str()) {
-                    // Last qualifying unit per city wins (deterministic due to BTreeMap)
-                    changed.insert(city.id.clone(), owner_id.clone());
+                if dist_sq < CAPTURE_RANGE_SQ && *city_owner_idx != Some(unit_owner_idx) {
+                    // Last qualifying unit per city wins (deterministic due to BTreeMap).
+                    // Clone the owner string only now — a capture is rare.
+                    changed.insert(city.id.clone(), owner.player_id.clone());
                 }
             }
         }

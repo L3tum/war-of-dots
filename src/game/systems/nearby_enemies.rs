@@ -27,7 +27,7 @@ const CELL_SIZE: f32 = 2.0;
 /// owner_idx is the compact owner ID from TickContext (u8).
 /// Enables O(1) owner comparison with a single-byte integer equality.
 #[derive(Clone, Copy)]
-struct CellEntry {
+pub struct CellEntry {
     entity: Entity,
     pos: UnitPosition,
     owner_idx: u8,
@@ -35,10 +35,46 @@ struct CellEntry {
 
 /// Coarse spatial grid: flat-buffer 1D array of cell buckets.
 /// Uses prefix-sum offsets + sizes instead of per-cell Vecs to reduce allocations.
+/// Reused flat-buffer spatial grid buffers, owned by `Game` and passed by
+/// `&mut` into `GridIndex::build`. `entries`/`cell_offsets`/`cell_sizes` are
+/// resized only on growth, so a steady-state tick does no heap allocation for
+/// the grid (the per-cell buffers are overwritten in place).
+pub struct GridIndexScratch {
+    pub entries: Vec<CellEntry>,
+    pub cell_offsets: Vec<usize>,
+    pub cell_sizes: Vec<usize>,
+}
+
+impl GridIndexScratch {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cell_offsets: Vec::new(),
+            cell_sizes: Vec::new(),
+        }
+    }
+
+    /// Grow the per-cell buffers to at least `total` cells (no-op when enough).
+    fn ensure(&mut self, total: usize) {
+        if self.cell_offsets.len() < total {
+            self.cell_offsets.resize(total, 0);
+        }
+        if self.cell_sizes.len() < total {
+            self.cell_sizes.resize(total, 0);
+        }
+    }
+}
+
+impl Default for GridIndexScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Coarse spatial grid metadata: the cell bounds + dimensions. The dense
+/// buffers (entries/offsets/sizes) live in `GridIndexScratch` and are read
+/// directly by the caller after `build`.
 struct GridIndex {
-    entries: Vec<CellEntry>,
-    cell_offsets: Vec<usize>,
-    cell_sizes: Vec<usize>,
     min_x: i32,
     min_y: i32,
     width: usize,
@@ -46,9 +82,13 @@ struct GridIndex {
 }
 
 impl GridIndex {
-    /// Build grid from units array.
+    /// Build grid from units array, filling the reusable `scratch` buffers.
     /// `units` carries compact owner IDs (u8) from TickContext — no dedup needed.
-    fn build(units: &[(Entity, UnitPosition, u8, bool)]) -> Self {
+    ///
+    /// Buffers are reused in place: `cell_offsets`/`cell_sizes` grow only on
+    /// expansion (a no-op at steady state), and `entries` is resized without a
+    /// per-slot default write since every slot is overwritten in pass 2.
+    fn build(units: &[(Entity, UnitPosition, u8, bool)], scratch: &mut GridIndexScratch) -> Self {
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
@@ -72,8 +112,12 @@ impl GridIndex {
         let height = (max_y - min_y + 2) as usize;
         let total = width * height;
 
-        // Pass 1: count entries per cell
-        let mut cell_sizes = vec![0usize; total];
+        scratch.ensure(total);
+        let cell_sizes = &mut scratch.cell_sizes[..total];
+        let cell_offsets = &mut scratch.cell_offsets[..total];
+
+        // Pass 1: count entries per cell (zeroed first for reuse).
+        cell_sizes.fill(0);
         for &(_, pos, _, _) in units {
             let c = cell_for(pos);
             let cx = ((c.0 - min_x) as usize).min(width - 1);
@@ -81,38 +125,39 @@ impl GridIndex {
             cell_sizes[cy * width + cx] += 1;
         }
 
-        // Build prefix-sum offsets
-        let mut cell_offsets = vec![0usize; total];
+        // Build prefix-sum offsets.
         for i in 1..total {
             cell_offsets[i] = cell_offsets[i - 1] + cell_sizes[i - 1];
         }
 
-        // Pass 2: fill entries in place using a cursor
-        let mut cursor = cell_offsets.clone();
-        let mut entries: Vec<CellEntry> = Vec::with_capacity(units.len());
-        entries.resize_with(units.len(), || CellEntry {
-            entity: Entity::from_bits(1u64 << 32).unwrap(),
-            pos: UnitPosition::default(),
-            owner_idx: 0,
-        });
+        // Pass 2: fill entries in place. `cell_sizes` doubles as a per-cell
+        // cursor (reset to 0); each write advances it, so after the pass it
+        // again holds the final per-cell counts — no `cell_offsets.clone()`.
+        let entries = &mut scratch.entries;
+        entries.resize(
+            units.len(),
+            CellEntry {
+                entity: Entity::from_bits(1u64 << 32).unwrap(),
+                pos: UnitPosition::default(),
+                owner_idx: 0,
+            },
+        );
+        cell_sizes.fill(0);
         for &(e, pos, owner_id, _) in units.iter() {
             let c = cell_for(pos);
             let cx = ((c.0 - min_x) as usize).min(width - 1);
             let cy = ((c.1 - min_y) as usize).min(height - 1);
             let idx = cy * width + cx;
-            let slot = cursor[idx];
+            let slot = cell_offsets[idx] + cell_sizes[idx];
             entries[slot] = CellEntry {
                 entity: e,
                 pos,
                 owner_idx: owner_id,
             };
-            cursor[idx] += 1;
+            cell_sizes[idx] += 1;
         }
 
         Self {
-            entries,
-            cell_offsets,
-            cell_sizes,
             min_x,
             min_y,
             width,
@@ -142,7 +187,7 @@ fn cell_for(pos: UnitPosition) -> (i32, i32) {
     )
 }
 
-pub fn run(world: &mut hecs::World, ctx: &TickContext) {
+pub fn run(world: &mut hecs::World, ctx: &TickContext, grid_scratch: &mut GridIndexScratch) {
     // 1. Collect all living unit data in one ECS query (no &UnitOwner —
     //    owner IDs come from the shared TickContext lookup).
     //    Each entry: (entity, position, compact_owner_id, is_moved).
@@ -165,8 +210,8 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext) {
         return;
     }
 
-    // 2. Build grid index.
-    let grid = GridIndex::build(&units);
+    // 2. Build grid index into the reused scratch buffers.
+    let grid = GridIndex::build(&units, grid_scratch);
 
     // Reuse buffer to avoid per-unit allocation.
     let mut enemies = Vec::with_capacity(16);
@@ -180,9 +225,9 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext) {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 if let Some(idx) = grid.cell_idx(c.0 + dx, c.1 + dy) {
-                    let start = grid.cell_offsets[idx];
-                    let count = grid.cell_sizes[idx];
-                    for entry in &grid.entries[start..start + count] {
+                    let start = grid_scratch.cell_offsets[idx];
+                    let count = grid_scratch.cell_sizes[idx];
+                    for entry in &grid_scratch.entries[start..start + count] {
                         if entry.entity == entity {
                             continue;
                         }
@@ -201,20 +246,21 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext) {
         }
 
         // Write/update NearbyEnemies.
+        // Drain the shared scratch into the (stack-backed) SmallVec field; the
+        // scratch `enemies` Vec keeps its buffer (empty) and is reused next unit,
+        // so no fresh per-unit allocation happens.
         let has_enemies = !enemies.is_empty();
         if let Ok((nb,)) = world.query_one_mut::<(&mut NearbyEnemies,)>(entity) {
-            nb.entities = std::mem::take(&mut enemies);
+            nb.entities = enemies.drain(..).collect();
             nb.initialized = true;
-            enemies = Vec::with_capacity(16);
         } else {
             let _ = world.insert(
                 entity,
                 (NearbyEnemies {
-                    entities: std::mem::take(&mut enemies),
+                    entities: enemies.drain(..).collect(),
                     initialized: true,
                 },),
             );
-            enemies = Vec::with_capacity(16);
         }
 
         // Set `attacking` flag for movers only.
@@ -269,7 +315,8 @@ mod tests {
     /// Helper: build TickContext and run the system (used by most tests).
     fn build_ctx_and_run(world: &mut hecs::World, world_entity: hecs::Entity) {
         let ctx = TickContext::build_full(world, world_entity);
-        run(world, &ctx);
+        let mut grid_scratch = GridIndexScratch::new();
+        run(world, &ctx, &mut grid_scratch);
     }
 
     #[test]

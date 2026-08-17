@@ -461,7 +461,9 @@ fn add_paths_to_entities(world: &mut World, entities: &[hecs::Entity]) {
         let target_x = base_x + if i % 2 == 0 { 2.0 } else { -2.0 };
         let target_y = base_y + 2.0;
         let path = UnitPath {
-            path: vec![(target_x, base_y), (target_x, target_y)],
+            path: vec![(target_x, base_y), (target_x, target_y)]
+                .into_iter()
+                .collect(),
         };
         let _ = world.insert_one(entity, (path,));
     }
@@ -481,7 +483,7 @@ fn setup_nearby_enemies(world: &mut World, entities: &[hecs::Entity]) {
             .take(5)
             .collect();
         let nearby = NearbyEnemies {
-            entities: enemies,
+            entities: enemies.into_iter().collect(),
             initialized: true,
         };
         let _ = world.insert_one(entities[i], (nearby,));
@@ -611,6 +613,7 @@ struct NearbyEnemiesFixture {
     world: World,
     world_entity: hecs::Entity,
     entity_ids: Vec<hecs::Entity>,
+    grid_scratch: crate::game::systems::nearby_enemies::GridIndexScratch,
 }
 
 impl NearbyEnemiesFixture {
@@ -627,6 +630,7 @@ impl NearbyEnemiesFixture {
             world,
             world_entity,
             entity_ids,
+            grid_scratch: crate::game::systems::nearby_enemies::GridIndexScratch::new(),
         }
     }
 }
@@ -675,15 +679,18 @@ impl InfluenceFixture {
 struct CityCaptureFixture {
     world: World,
     world_entity: hecs::Entity,
+    ctx: TickContext,
 }
 
 impl CityCaptureFixture {
     fn new(num_players: usize, unit_type: &UnitType, count: usize) -> Self {
         let (mut world, world_entity) = make_world(20, 20, num_players);
         spawn_n_units(&mut world, world_entity, unit_type, count);
+        let ctx = TickContext::build_full(&world, world_entity);
         Self {
             world,
             world_entity,
+            ctx,
         }
     }
 }
@@ -695,6 +702,8 @@ struct EncirclementFixture {
     ctx: TickContext,
     /// Reused scratch for the un-timed influence pre-run.
     scratch: crate::game::systems::influence::InfluenceScratch,
+    /// Reused scratch for the encirclement flood-fill.
+    enc_scratch: crate::game::systems::encirclement::EncirclementScratch,
 }
 
 impl EncirclementFixture {
@@ -706,6 +715,7 @@ impl EncirclementFixture {
             world,
             ctx,
             scratch: crate::game::systems::influence::InfluenceScratch::new(),
+            enc_scratch: crate::game::systems::encirclement::EncirclementScratch::new(),
         };
         // Seed non-trivial border grids once (un-timed) — without this the
         // dominant grid is all-NONE and the flood-fill is trivially cheap.
@@ -920,7 +930,7 @@ fn bench_ecs() -> Vec<MicrobenchmarkResult> {
             let (mut world, _) = make_world(20, 20, 2);
             let entity = world.spawn_unit(&ut, "player_0", (10.0, 10.0));
             let nearby = NearbyEnemies {
-                entities: vec![],
+                entities: Default::default(),
                 initialized: true,
             };
             world.insert_one(entity, (nearby,)).ok();
@@ -1049,7 +1059,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 100),
         |f: &mut NearbyEnemiesFixture| {
             let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
+            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx, &mut f.grid_scratch);
             black_box(f.entity_ids.len());
         },
     );
@@ -1065,7 +1075,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 200),
         |f: &mut NearbyEnemiesFixture| {
             let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
+            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx, &mut f.grid_scratch);
             black_box(f.entity_ids.len());
         },
     );
@@ -1081,7 +1091,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         || NearbyEnemiesFixture::new_movers(40, 40, 2, &ut, 500),
         |f: &mut NearbyEnemiesFixture| {
             let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx);
+            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx, &mut f.grid_scratch);
             black_box(f.entity_ids.len());
         },
     );
@@ -1331,7 +1341,12 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
             for i in 0..4 {
                 stats.insert(format!("player_{i}"), Default::default());
             }
-            crate::game::systems::city_capture::run(&mut f.world, f.world_entity, &mut stats);
+            crate::game::systems::city_capture::run(
+                &mut f.world,
+                f.world_entity,
+                &mut stats,
+                &f.ctx,
+            );
             black_box(stats.len());
         },
     );
@@ -1349,7 +1364,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || EncirclementFixture::new(4, &ut, 100),
         |f: &mut EncirclementFixture| {
-            crate::game::systems::encirclement::run(&mut f.world, &f.ctx, 1);
+            crate::game::systems::encirclement::run(&mut f.world, &f.ctx, 1, &mut f.enc_scratch);
             black_box(100);
         },
     );
@@ -1367,10 +1382,10 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         50000,
         || {
             let (world, world_entity) = make_world(20, 20, 20);
-            (world, world_entity)
+            (world, world_entity, Vec::new())
         },
-        |f: &mut (World, hecs::Entity)| {
-            crate::game::systems::economy::run(&mut f.0, f.1, settings.funds_per_city);
+        |f: &mut (World, hecs::Entity, Vec<(String, u32)>)| {
+            crate::game::systems::economy::run(&mut f.0, f.1, settings.funds_per_city, &mut f.2);
             black_box(20);
         },
     );

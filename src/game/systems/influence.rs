@@ -70,6 +70,9 @@ pub struct InfluenceScratch {
     pub player_influence: Vec<u16>,
     pub territory: Vec<u8>,
     pub territory_max: Vec<u16>,
+    /// Reused per-player vision stamp buffer; `fill(false)`'d before each
+    /// player and cloned into the published Arc (no fresh alloc + zero-init).
+    pub vision: Vec<bool>,
 }
 impl InfluenceScratch {
     pub fn new() -> Self {
@@ -78,6 +81,7 @@ impl InfluenceScratch {
             player_influence: Vec::new(),
             territory: Vec::new(),
             territory_max: Vec::new(),
+            vision: Vec::new(),
         }
     }
     /// Grow the per-tick buffers to `grid_size` once (no-op when already sized).
@@ -90,6 +94,9 @@ impl InfluenceScratch {
         }
         if self.territory_max.len() != grid_size {
             self.territory_max.resize(grid_size, 0);
+        }
+        if self.vision.len() != grid_size {
+            self.vision.resize(grid_size, false);
         }
     }
 }
@@ -153,13 +160,13 @@ fn stamp_circle(
 /// Vision and influence share one circle per source (unit or city); `settings`
 /// supplies the per-source weight and the circle radii.
 ///
-/// Influence is written into the caller's reused `influence` buffer (reset to
-/// zero here) and folded into the territory by the caller; vision is returned
-/// as a fresh `Vec<bool>` because it must be published (owned) each dirty tick.
+/// Both vision and influence are written into the caller's reused buffers
+/// (reset here); the caller clones vision into the published Arc. Influence is
+/// folded into the territory by the caller.
 #[allow(clippy::too_many_arguments)] // Pure per-player projection: sources/settings/dims + 2 output buffers
 fn compute_player(
     city_positions: &mut Vec<(f32, f32)>,
-    terrain: &Arc<Vec<Vec<Terrain>>>,
+    terrain: &Arc<Vec<Terrain>>,
     player_id: &str,
     units: &[UnitHandle],
     cities: &[City],
@@ -167,12 +174,12 @@ fn compute_player(
     w: i32,
     h: i32,
     influence: &mut [u16],
-) -> Vec<bool> {
+    vision: &mut [bool],
+) {
     let w_usize = w as usize;
-    let grid_size = w_usize * (h as usize);
 
-    // Vision is published fresh each tick; influence reuses the caller buffer.
-    let mut vision_grid = vec![false; grid_size];
+    // Vision and influence both reuse caller buffers, reset here (no alloc).
+    vision.fill(false);
     influence.fill(0);
 
     // Unit loop — a single circle pass writes both vision and influence.
@@ -185,8 +192,8 @@ fn compute_player(
         // caps to the precomputed span table.
         let radius = ((settings.unit_radius
             * match terrain
-                .get(ux_f as usize)
-                .and_then(|r| r.get(uy_f as usize))
+                .get((uy_f as usize) * w_usize + (ux_f as usize))
+                .copied()
             {
                 Some(Terrain::Hills) => settings.hill_radius_multiplier,
                 _ => 1.0,
@@ -194,7 +201,7 @@ fn compute_player(
             .clamp(0, MAX_RADIUS);
 
         stamp_circle(
-            &mut vision_grid,
+            vision,
             influence,
             ux_f as i32,
             uy_f as i32,
@@ -217,7 +224,7 @@ fn compute_player(
     }
     for &(cx, cy) in city_positions.iter() {
         stamp_circle(
-            &mut vision_grid,
+            vision,
             influence,
             cx as i32,
             cy as i32,
@@ -227,8 +234,6 @@ fn compute_player(
             h as usize,
         );
     }
-
-    vision_grid
 }
 
 /// Sentinel for "no player has influence at this cell."
@@ -294,7 +299,7 @@ pub fn run(
     }
 
     // Scoped Arc extraction for terrain grid (24 bytes pointer bump, not a clone)
-    let terrain_grid: Arc<Vec<Vec<Terrain>>> = match world.world_data(ctx.world_entity) {
+    let terrain_grid: Arc<Vec<Terrain>> = match world.world_data(ctx.world_entity) {
         Some(wb) => Arc::clone(&wb.terrain.grid),
         None => return,
     };
@@ -321,7 +326,10 @@ pub fn run(
     for (idx, &player_id) in sorted_players.iter().enumerate() {
         let units = ctx.units_by_player.get(player_id).unwrap();
         // Compute into the reused scratch buffers (disjoint field borrows).
-        let vision = compute_player(
+        // Vision is stamped into `scratch.vision`, then cloned into the
+        // published HashMap (one clone per player per dirty tick, no fresh
+        // alloc + zero-init).
+        compute_player(
             &mut scratch.city_positions,
             &terrain_grid,
             player_id,
@@ -331,6 +339,7 @@ pub fn run(
             w,
             h,
             &mut scratch.player_influence,
+            &mut scratch.vision[..],
         );
         // A1: fold this player's influence straight into the running territory
         // (index = sorted position), then discard the buffer.
@@ -340,7 +349,7 @@ pub fn run(
             &scratch.player_influence,
             idx as u8,
         );
-        updated_vision.insert(player_id.clone(), vision);
+        updated_vision.insert(player_id.clone(), scratch.vision.clone());
     }
 
     // Publish. `borders.grids` is production-dead (only `#[cfg(test)]` reads it)
@@ -379,13 +388,13 @@ mod tests {
         }
     }
 
-    fn terrain() -> Arc<Vec<Vec<Terrain>>> {
-        Arc::new(vec![vec![Terrain::Plains; H as usize]; W as usize])
+    fn terrain() -> Arc<Vec<Terrain>> {
+        Arc::new(vec![Terrain::Plains; (W * H) as usize])
     }
 
-    fn terrain_with_hills() -> Arc<Vec<Vec<Terrain>>> {
-        let mut t = vec![vec![Terrain::Plains; H as usize]; W as usize];
-        t[20][20] = Terrain::Hills;
+    fn terrain_with_hills() -> Arc<Vec<Terrain>> {
+        let mut t = vec![Terrain::Plains; (W * H) as usize];
+        t[(20 as usize) * (W as usize) + 20] = Terrain::Hills;
         Arc::new(t)
     }
 
@@ -406,12 +415,13 @@ mod tests {
     fn compute(
         units: &[(f32, f32)],
         cities: &[City],
-        terrain: &Arc<Vec<Vec<Terrain>>>,
+        terrain: &Arc<Vec<Terrain>>,
     ) -> (Vec<bool>, Vec<u16>) {
         let mut city_positions = Vec::new();
         let mut influence = vec![0u16; (W * H) as usize];
+        let mut vision = vec![false; (W * H) as usize];
         let units: Vec<UnitHandle> = units.iter().map(|&p| unit(p)).collect();
-        let vision = compute_player(
+        compute_player(
             &mut city_positions,
             terrain,
             "player_0",
@@ -421,6 +431,7 @@ mod tests {
             W,
             H,
             &mut influence,
+            &mut vision[..],
         );
         (vision, influence)
     }

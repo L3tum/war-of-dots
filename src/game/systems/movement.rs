@@ -56,8 +56,8 @@ pub fn run(
     }
 
     // Scoped Arc extraction: drops hecs::Ref borrow immediately, only clones terrain Arc (24 bytes)
-    let terrain = match world.world_data(world_entity) {
-        Some(wb) => Arc::clone(&wb.terrain.grid),
+    let (terrain, terrain_width) = match world.world_data(world_entity) {
+        Some(wb) => (Arc::clone(&wb.terrain.grid), wb.terrain.width as usize),
         None => return 0,
     };
 
@@ -88,6 +88,7 @@ pub fn run(
                 stats,
                 equipment,
                 &terrain,
+                terrain_width,
                 unit_types_index,
                 settings,
             )
@@ -154,7 +155,8 @@ fn compute_movement(
     utype: &UnitTypeId,
     stats: &UnitStats,
     equipment: &UnitEquipment,
-    terrain: &Arc<Vec<Vec<Terrain>>>,
+    terrain: &Arc<Vec<Terrain>>,
+    terrain_width: usize,
     unit_types_index: &HashMap<String, usize>,
     settings: &GameSettings,
 ) -> Option<MovementChange> {
@@ -170,9 +172,8 @@ fn compute_movement(
         .unwrap_or(1.0);
 
     let current_terrain = terrain
-        .get(pos.x as usize)
-        .and_then(|r| r.get(pos.y as usize))
-        .cloned()
+        .get((pos.y as usize) * terrain_width + (pos.x as usize))
+        .copied()
         .unwrap_or(Terrain::Plains);
     let mut speed =
         unit_speed_with_terrain(&current_terrain, settings.water_speed, unit_type_speed) / 10.0;
@@ -342,8 +343,8 @@ mod tests {
         }
     }
 
-    fn test_terrain(width: u32, height: u32) -> Arc<Vec<Vec<Terrain>>> {
-        Arc::new(vec![vec![Terrain::Plains; height as usize]; width as usize])
+    fn test_terrain(width: u32, height: u32) -> Arc<Vec<Terrain>> {
+        Arc::new(vec![Terrain::Plains; (width * height) as usize])
     }
 
     #[test]
@@ -377,6 +378,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
+            20,
             &ut_index(&settings),
             &settings,
         );
@@ -387,7 +389,7 @@ mod tests {
     fn movement_reaches_waypoint() {
         let pos = UnitPosition { x: 5.0, y: 5.0 };
         let path = UnitPath {
-            path: vec![(5.05, 5.0)], // very close
+            path: [(5.05, 5.0)].into_iter().collect(), // very close
         };
         let utype = UnitTypeId {
             name: "infantry".to_string(),
@@ -416,6 +418,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
+            20,
             &ut_index(&settings),
             &settings,
         );
@@ -432,7 +435,7 @@ mod tests {
     fn movement_towards_waypoint() {
         let pos = UnitPosition { x: 0.0, y: 0.0 };
         let path = UnitPath {
-            path: vec![(10.0, 0.0)], // far away
+            path: [(10.0, 0.0)].into_iter().collect(), // far away
         };
         let utype = UnitTypeId {
             name: "infantry".to_string(),
@@ -461,6 +464,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
+            20,
             &ut_index(&settings),
             &settings,
         );
@@ -478,7 +482,7 @@ mod tests {
     fn movement_organisation_drains() {
         let pos = UnitPosition { x: 0.0, y: 0.0 };
         let path = UnitPath {
-            path: vec![(10.0, 0.0)],
+            path: [(10.0, 0.0)].into_iter().collect(),
         };
         let utype = UnitTypeId {
             name: "infantry".to_string(),
@@ -507,6 +511,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
+            20,
             &ut_index(&settings),
             &settings,
         );
@@ -520,7 +525,7 @@ mod tests {
     fn movement_zero_org_does_not_drain() {
         let pos = UnitPosition { x: 0.0, y: 0.0 };
         let path = UnitPath {
-            path: vec![(10.0, 0.0)],
+            path: [(10.0, 0.0)].into_iter().collect(),
         };
         let utype = UnitTypeId {
             name: "infantry".to_string(),
@@ -549,6 +554,7 @@ mod tests {
             &stats,
             &equipment,
             &terrain,
+            20,
             &ut_index(&settings),
             &settings,
         );

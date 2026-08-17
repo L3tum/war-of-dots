@@ -5,8 +5,6 @@
 //! - `manpower_bonus` scales from 0 (empty garrison) to 1 (full garrison)
 //! - `income_multiplier` comes from city upgrade level
 
-use std::collections::HashMap;
-
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 
@@ -16,18 +14,22 @@ use hecs::World;
 /// - Funds: funds_per_city * income_multiplier(level)
 /// - Manpower: manpower_regen_per_tick * level
 ///
-/// Returns a map of player_id -> funds earned this tick.
+/// Per-player funds earned this tick are written into `earned` (a caller-owned
+/// scratch cleared here) instead of building a fresh HashMap per call. The
+/// persistent funds/manpower maps are updated via `get_mut`, cloning the owner
+/// key only on a player's first city this tick.
 pub fn run(
     world: &mut World,
     world_entity: hecs::Entity,
     funds_per_city: f32,
-) -> HashMap<String, u32> {
+    earned: &mut Vec<(String, u32)>,
+) {
     let wb = match world.world_data_mut(world_entity) {
         Some(wb) => wb,
-        None => return HashMap::new(),
+        None => return,
     };
 
-    let mut earned: HashMap<String, u32> = HashMap::new();
+    earned.clear();
     let settings = &wb.city_upgrades.settings;
 
     for city in &wb.cities.cities {
@@ -35,16 +37,31 @@ pub fn run(
             let income_mult = settings.income_multiplier(city.level);
             let funds_gain = funds_per_city * income_mult;
             let gain_rounded = funds_gain as u32;
-            let funds = wb.funds.funds.entry(owner.clone()).or_insert(0);
-            *funds = funds.saturating_add(gain_rounded);
-            *earned.entry(owner.clone()).or_insert(0) += gain_rounded;
 
-            // Manpower generation into global pool
+            // Funds: add to the persistent pool; clone the key only when the
+            // player's first city is processed this tick.
+            match wb.funds.funds.get_mut(owner) {
+                Some(f) => *f = f.saturating_add(gain_rounded),
+                None => {
+                    wb.funds.funds.insert(owner.clone(), gain_rounded);
+                }
+            }
+
+            // earned: accumulate per player (linear scan over ≤ ~12 players),
+            // cloning the key only on first occurrence.
+            match earned.iter_mut().find(|(pid, _)| pid == owner) {
+                Some(e) => e.1 = e.1.saturating_add(gain_rounded),
+                None => earned.push((owner.clone(), gain_rounded)),
+            }
+
+            // Manpower generation into global pool (same clone-once pattern).
             let mp_gain = (settings.manpower_regen_per_tick * city.level as f32) as u32;
-            let manpower = wb.funds.manpower.entry(owner.clone()).or_insert(0);
-            *manpower = manpower.saturating_add(mp_gain);
+            match wb.funds.manpower.get_mut(owner) {
+                Some(m) => *m = m.saturating_add(mp_gain),
+                None => {
+                    wb.funds.manpower.insert(owner.clone(), mp_gain);
+                }
+            }
         }
     }
-
-    earned
 }

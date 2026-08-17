@@ -50,11 +50,11 @@ mod tests {
     fn cleanup_removes_dead_from_nearby_enemies() {
         let mut world = hecs::World::new();
         let alive = world.spawn((NearbyEnemies {
-            entities: vec![],
+            entities: Default::default(),
             initialized: true,
         },));
         let dead1 = world.spawn((NearbyEnemies {
-            entities: vec![],
+            entities: Default::default(),
             initialized: true,
         },));
         let dead2 = make_entity(&mut world, 10);
@@ -94,7 +94,7 @@ mod tests {
     fn cleanup_empty_input_returns_early() {
         let mut world = hecs::World::new();
         let entity = world.spawn((NearbyEnemies {
-            entities: vec![],
+            entities: Default::default(),
             initialized: true,
         },));
 
@@ -113,7 +113,7 @@ mod tests {
     fn cleanup_removes_from_entity_reverse() {
         let mut world = hecs::World::new();
         let dead = world.spawn((NearbyEnemies {
-            entities: vec![],
+            entities: Default::default(),
             initialized: true,
         },));
 

@@ -154,6 +154,14 @@ pub struct Game {
     combat_scratch: systems::combat::CombatScratch,
     /// Pre-allocated supply/attrition scratch, cleared and reused each tick.
     supply_scratch: systems::supply::SupplyScratch,
+    /// Spatial grid buffers for nearby_enemies, resized on growth and reused
+    /// each tick (no per-tick heap allocation at steady state).
+    grid_index_scratch: systems::nearby_enemies::GridIndexScratch,
+    /// Reused scratch buffers for the encirclement flood-fill.
+    encirclement_scratch: systems::encirclement::EncirclementScratch,
+    /// Economy scratch: (player_id, funds_earned) per player, cleared and reused
+    /// each economy tick instead of building a fresh HashMap.
+    economy_earned: Vec<(String, u32)>,
     /// Unit-type name -> index into `settings.unit_types`, built once at
     /// `Game::new` so the supply system does not rebuild the map every tick.
     unit_types_index: HashMap<String, usize>,
@@ -486,6 +494,9 @@ impl Game {
             entity_reverse: HashMap::new(),
             combat_scratch: systems::combat::CombatScratch::new(),
             supply_scratch: systems::supply::SupplyScratch::new(),
+            grid_index_scratch: systems::nearby_enemies::GridIndexScratch::new(),
+            encirclement_scratch: systems::encirclement::EncirclementScratch::new(),
+            economy_earned: Vec::new(),
             movement_scratch: systems::movement::MovementScratch::default(),
             last_mover_count: 0,
             last_engaged_pairs: 0,
@@ -512,6 +523,27 @@ impl Game {
     #[allow(dead_code)]
     pub fn last_engaged_pairs(&self) -> usize {
         self.last_engaged_pairs
+    }
+
+    /// Allocation-free count of units (same entity set as `query_all_units`),
+    /// for benchmarking. Unlike `query_all_units().len()`, this does not build
+    /// the String-materialized `UnitQueryData` for every unit.
+    #[allow(dead_code)]
+    pub fn unit_count(&self) -> usize {
+        self.world
+            .query::<(
+                &UnitOwner,
+                &UnitTypeId,
+                &UnitDisplay,
+                &UnitPosition,
+                &UnitPath,
+                &UnitStats,
+                &UnitEquipment,
+                &UnitFlags,
+                &UnitWaterTransition,
+            )>()
+            .iter()
+            .count()
     }
 
     /// Test-only: expose the persistent influence dirty flag.
@@ -587,7 +619,7 @@ impl Game {
             .tick
             .is_multiple_of(super::constants::ECONOMY_TICK_INTERVAL)
         {
-            let earned = tick_system!(
+            tick_system!(
                 "economy",
                 &mut self.world,
                 self.world_entity,
@@ -595,11 +627,12 @@ impl Game {
                     &mut self.world,
                     self.world_entity,
                     self.settings.funds_per_city,
+                    &mut self.economy_earned,
                 )
             );
             // Track funds_earned in player stats
-            for (pid, amount) in earned {
-                if let Some(stats) = self.player_stats.get_mut(&pid) {
+            for (pid, amount) in &self.economy_earned {
+                if let Some(stats) = self.player_stats.get_mut(pid) {
                     stats.funds_earned += amount;
                 }
             }
@@ -661,7 +694,7 @@ impl Game {
                 "nearby_enemies",
                 &mut self.world,
                 self.world_entity,
-                systems::nearby_enemies::run(&mut self.world, ctx)
+                systems::nearby_enemies::run(&mut self.world, ctx, &mut self.grid_index_scratch,)
             );
         }
 
@@ -706,7 +739,12 @@ impl Game {
             "city_capture",
             &mut self.world,
             self.world_entity,
-            systems::city_capture::run(&mut self.world, self.world_entity, &mut self.player_stats)
+            systems::city_capture::run(
+                &mut self.world,
+                self.world_entity,
+                &mut self.player_stats,
+                &self.ctx,
+            )
         );
         if !cities_changed.is_empty() {
             self.ctx_dirty.cities_changed = true;
@@ -759,7 +797,12 @@ impl Game {
                     "encirclement",
                     &mut self.world,
                     self.world_entity,
-                    systems::encirclement::run(&mut self.world, ctx, self.tick)
+                    systems::encirclement::run(
+                        &mut self.world,
+                        ctx,
+                        self.tick,
+                        &mut self.encirclement_scratch,
+                    )
                 );
                 self.encirclement_dirty = false;
             }
@@ -910,7 +953,7 @@ impl Game {
         if let Some(entity) = self.entity_registry.get(unit_id) {
             let entity = *entity;
             if let Ok((up,)) = self.world.query_one_mut::<(&mut UnitPath,)>(entity) {
-                up.path = path;
+                up.path = path.into_iter().collect();
             }
         }
     }
@@ -1164,7 +1207,7 @@ impl Game {
                 organisation: stats.organisation,
                 equipment: equipment.equipment.clone(),
                 max_equipment: equipment.max_equipment.clone(),
-                path: path.path.clone(),
+                path: path.path.to_vec(),
                 healing: flags.healing,
                 resupply_enabled: flags.resupply_enabled,
                 encircled: flags.encircled,
@@ -1240,7 +1283,7 @@ impl Game {
                 (0..h)
                     .map(|y| {
                         (0..w)
-                            .map(|x| match &grid[x][y] {
+                            .map(|x| match &grid[y * w + x] {
                                 Terrain::Plains => "Plains".to_string(),
                                 Terrain::Hills => "Hills".to_string(),
                                 Terrain::Forest => "Forest".to_string(),
