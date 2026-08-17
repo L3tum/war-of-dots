@@ -355,9 +355,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         let _ = settings_ref;
 
         let cities_with_owners = game.query_cities();
-        let requested_total = config
-            .initial_units
-            .unwrap_or(config.units_per_city.saturating_mul(cities_with_owners.len() as u32));
+        let requested_total = config.initial_units.unwrap_or(
+            config
+                .units_per_city
+                .saturating_mul(cities_with_owners.len() as u32),
+        );
         total_units = 0;
         match config.initial_units {
             // Stress mode: field exactly N units total, distributed round-robin across
@@ -1129,7 +1131,9 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let units_initial = results.summary["config"]["total_units_initial"]
         .as_u64()
         .unwrap_or(0);
-    let map_size = results.summary["config"]["map_size"].as_u64().unwrap_or(200);
+    let map_size = results.summary["config"]["map_size"]
+        .as_u64()
+        .unwrap_or(200);
     let map_desc = format!("{}×{} ({} tiles)", map_size, map_size, map_size * map_size);
     let units_recruited = results.summary["config"]["total_units_recruited"]
         .as_u64()
@@ -1368,6 +1372,40 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         format!("<td>{value}{inner}</td>")
     }
 
+    /// Render a table cell with an inline per-value byte delta (lower is better),
+    /// the byte counterpart of [cell_delta]. The change is rendered
+    /// human-readable (B/KB/MB/…) so it matches the cell value's scale. Hidden when
+    /// there is no previous value; shown as ≈0 when the change is negligible (<1
+    /// byte, or <0.5% of the previous value, so large values don't flag sub-percent
+    /// run-to-run noise).
+    fn cell_delta_bytes(value: &str, current: f64, previous: Option<f64>) -> String {
+        let inner = match previous {
+            Some(prev) => {
+                let change = current - prev;
+                let negligible =
+                    change.abs() < 1.0 || (prev.abs() > 1e-9 && (change / prev).abs() < 0.005);
+                if negligible {
+                    "<div class='delta' style='color:#555'>≈0</div>".to_string()
+                } else {
+                    let pct = if prev.abs() > 1e-9 {
+                        change / prev * 100.0
+                    } else {
+                        0.0
+                    };
+                    let color = if change < 0.0 { "#0f0" } else { "#f44" };
+                    let arrow = if change < 0.0 { "▼" } else { "▲" };
+                    format!(
+                        "<div class='delta' style='color:{}'>{arrow}{} ({pct:+.1}%)</div>",
+                        color,
+                        fmt_bytes_signed(change)
+                    )
+                }
+            }
+            None => String::new(),
+        };
+        format!("<td>{value}{inner}</td>")
+    }
+
     /// Adaptive time format for microbench values: ns for <1µs, µs for <1ms, ms otherwise.
     fn fmt_ns(x: f64) -> String {
         let a = x.abs();
@@ -1583,6 +1621,32 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     // trailing "other / overhead" row shows the share of the per-tick budget NOT
     // attributed to a tick_system!-wrapped system (ECS archetype rebuild, query
     // setup, benchmark AI such as query_all_units / recruit).
+    // Previous per-system allocation objects, keyed by system name (mirrors
+    // `prev_timings` / `prev_micro`). Field-presence: a report that predates
+    // per-system allocs simply yields no deltas. The previous report's own
+    // bytes-per-tick total reconstructs its per-system "% Bytes/Tick" share.
+    let prev_alloc: std::collections::HashMap<String, &serde_json::Value> = prev_json
+        .get("system_allocs")
+        .and_then(|sa| sa.get("systems"))
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    s.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| (n.to_string(), s))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let prev_total_bytes_per_tick: Option<f64> = prev_json
+        .get("results")
+        .and_then(|r| r.get("bytes_per_tick"))
+        .and_then(|v| v.as_f64());
+    // A real previous report was supplied (vs. no comparison at all). Only then is
+    // the per-system "new" flag meaningful; with no prev report nothing is new.
+    let has_prev_report = !prev_json.is_null();
+
     let alloc_rows = {
         let sa = &results.summary["system_allocs"];
         let systems = sa.get("systems").and_then(|s| s.as_array());
@@ -1613,9 +1677,44 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
                         } else {
                             0.0
                         };
+
+                        // Previous per-system values, or None when new / absent.
+                        let prev = prev_alloc.get(name);
+                        let prev_apt: Option<f64> =
+                            prev.and_then(|p| p.get("allocs_per_tick")).and_then(|v| v.as_f64());
+                        let prev_bpt: Option<f64> =
+                            prev.and_then(|p| p.get("bytes_per_tick")).and_then(|v| v.as_f64());
+                        let prev_a_c: Option<f64> =
+                            prev.and_then(|p| p.get("avg_allocs")).and_then(|v| v.as_f64());
+                        let prev_b_c: Option<f64> =
+                            prev.and_then(|p| p.get("avg_bytes")).and_then(|v| v.as_f64());
+                        let prev_calls: Option<f64> =
+                            prev.and_then(|p| p.get("call_count")).and_then(|v| v.as_f64());
+                        // % share reconstructed with the previous report's own total.
+                        let prev_share: Option<f64> = prev_bpt.and_then(|pb| {
+                            prev_total_bytes_per_tick
+                                .filter(|t| *t > 0.0)
+                                .map(|t| pb / t * 100.0)
+                        });
+
+                        // Name cell: flag a system "new" when a previous report exists
+                        // but this system is absent from it (not when there's no prev).
+                        let name_cell = if has_prev_report && prev.is_none() {
+                            format!("<td>{name} <span style='color:#888'><i>new</i></span></td>")
+                        } else {
+                            format!("<td>{name}</td>")
+                        };
+                        let apt_cell = cell_delta(&format!("{:.2}", apt), apt, prev_apt, "", 0.5);
+                        let bpt_cell = cell_delta_bytes(&fmt_bytes(bpt), bpt, prev_bpt);
+                        let share_cell =
+                            cell_delta(&format!("{:.1}%", share), share, prev_share, "pts", 0.5);
+                        let ac_cell = cell_delta(&format!("{:.2}", a_c), a_c, prev_a_c, "", 0.5);
+                        let bc_cell = cell_delta_bytes(&fmt_bytes(b_c), b_c, prev_b_c);
+                        let calls_cell =
+                            cell_delta(&format!("{}", calls), calls as f64, prev_calls, "", 0.5);
+
                         format!(
-                            "<tr><td>{}</td><td>{:.2}</td><td>{}</td><td>{:.1}%</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
-                            name, apt, fmt_bytes(bpt), share, a_c, fmt_bytes(b_c), calls
+                            "<tr>{name_cell}{apt_cell}{bpt_cell}{share_cell}{ac_cell}{bc_cell}{calls_cell}</tr>"
                         )
                     })
                     .collect();
@@ -2556,4 +2655,153 @@ fn parse_previous_report(
         }
     }
     (timings, json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal but valid `generate_html_report` summary with a given per-system
+    /// alloc array and per-tick bytes total.
+    fn alloc_summary(systems: serde_json::Value, total_bytes_per_tick: f64) -> serde_json::Value {
+        serde_json::json!({
+            "config": {
+                "cities": 12, "units_per_city": 5, "initial_units": 10000,
+                "map_size": 1000, "total_units_initial": 10000, "total_units_recruited": 11680,
+                "ticks": 500, "seed": 42, "measured_runs": 3, "warmup_ticks": 200,
+                "bench_prev": null, "detailed_systems": []
+            },
+            "results": {
+                "wall_time_ms": 1000.0, "avg_system_ms": 10.0, "avg_overhead_ms": 0.5,
+                "units_remaining": 8775, "avg_movers_per_tick": 8655.0, "avg_combats_per_tick": 585.0,
+                "allocs_per_tick": 15784.0, "bytes_per_tick": total_bytes_per_tick,
+                "avg_alloc_size": 1280.0, "max_alloc_size": 1880000.0
+            },
+            "latency": { "avg_ms": 16.8, "min_ms": 5.0, "max_ms": 40.0,
+                "p50_ms": 12.0, "p90_ms": 20.0, "p95_ms": 25.0, "p99_ms": 30.0 },
+            "overhead": { "p50_ms": 0.4, "p95_ms": 0.8, "p99_ms": 1.2 },
+            "system_timings": [],
+            "detailed_timings": [],
+            "system_allocs": { "ticks": 500, "systems": systems },
+            "microbenchmarks": { "benchmarks": [] }
+        })
+    }
+
+    /// The `<tr>…</tr>` segment (up to the next `<tr>`) that contains `needle`.
+    fn row_containing<'a>(html: &'a str, needle: &str) -> Option<&'a str> {
+        html.split("<tr>").find(|seg| seg.contains(needle))
+    }
+
+    #[test]
+    fn alloc_table_shows_prev_deltas_and_new_flag() {
+        // Previous report: beta_sys heavy (7.14 MB/tick), alpha_sys light (5 MB/tick).
+        let prev = alloc_summary(
+            serde_json::json!([
+                { "name": "beta_sys",  "allocs_per_tick": 1172.0, "bytes_per_tick": 7140000.0,
+                  "avg_allocs": 390.67, "avg_bytes": 2380000.0, "call_count": 1500 },
+                { "name": "alpha_sys", "allocs_per_tick": 572.0, "bytes_per_tick": 5000000.0,
+                  "avg_allocs": 190.67, "avg_bytes": 1666666.0, "call_count": 1500 }
+            ]),
+            15000000.0,
+        );
+
+        // Current: beta_sys shrank (green), alpha_sys grew (red), gamma_sys added.
+        let current = alloc_summary(
+            serde_json::json!([
+                { "name": "beta_sys",  "allocs_per_tick": 500.0, "bytes_per_tick": 3000000.0,
+                  "avg_allocs": 333.33, "avg_bytes": 1000000.0, "call_count": 1500 },
+                { "name": "alpha_sys", "allocs_per_tick": 700.0, "bytes_per_tick": 7350000.0,
+                  "avg_allocs": 233.33, "avg_bytes": 2450000.0, "call_count": 1500 },
+                { "name": "gamma_sys", "allocs_per_tick": 0.2, "bytes_per_tick": 100.0,
+                  "avg_allocs": 0.2, "avg_bytes": 100.0, "call_count": 500 }
+            ]),
+            20000000.0,
+        );
+
+        // Write the previous report as a fake HTML file (JSON lives in <pre>).
+        let path = std::env::temp_dir().join("war_of_dots_alloc_test_prev.html");
+        std::fs::write(
+            &path,
+            format!("<html><body><pre>{}</pre></body></html>", prev),
+        )
+        .expect("write temp prev report");
+
+        let results = BenchmarkResults {
+            config: BenchmarkConfig::default(),
+            tick_data: Vec::new(),
+            summary: current,
+        };
+        let html = generate_html_report(&results, Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            html.contains("Per-System Allocations"),
+            "alloc table header missing"
+        );
+
+        // beta_sys shrank 7.14→3.00 MB/tick: green + downward arrow + ≈-58%.
+        let beta = row_containing(&html, "beta_sys").expect("beta_sys row");
+        assert!(
+            beta.contains("#0f0"),
+            "beta_sys should be green (decrease): {beta}"
+        );
+        assert!(
+            beta.contains("▼"),
+            "beta_sys should show a downward arrow: {beta}"
+        );
+        assert!(
+            beta.contains("-58.0%"),
+            "beta_sys bytes delta ≈ -58%: {beta}"
+        );
+
+        // alpha_sys grew 5.00→7.35 MB/tick: red + upward arrow + ≈+47%.
+        let alpha = row_containing(&html, "alpha_sys").expect("alpha_sys row");
+        assert!(
+            alpha.contains("#f44"),
+            "alpha_sys should be red (increase): {alpha}"
+        );
+        assert!(
+            alpha.contains("▲"),
+            "alpha_sys should show an upward arrow: {alpha}"
+        );
+        assert!(
+            alpha.contains("+47.0%"),
+            "alpha_sys bytes delta ≈ +47%: {alpha}"
+        );
+
+        // gamma_sys is new: flagged, and carries no delta arrows.
+        let gamma = row_containing(&html, "gamma_sys").expect("gamma_sys row");
+        assert!(
+            gamma.contains("<i>new</i>"),
+            "gamma_sys should be flagged new: {gamma}"
+        );
+        assert!(
+            !gamma.contains("▲") && !gamma.contains("▼"),
+            "gamma_sys should have no delta arrows: {gamma}"
+        );
+    }
+
+    #[test]
+    fn alloc_table_has_no_deltas_without_prev() {
+        // No previous report → values render, but no delta arrows anywhere in the table.
+        let current = alloc_summary(
+            serde_json::json!([
+                { "name": "beta_sys", "allocs_per_tick": 500.0, "bytes_per_tick": 3000000.0,
+                  "avg_allocs": 333.33, "avg_bytes": 1000000.0, "call_count": 1500 }
+            ]),
+            3000000.0,
+        );
+        let results = BenchmarkResults {
+            config: BenchmarkConfig::default(),
+            tick_data: Vec::new(),
+            summary: current,
+        };
+        let html = generate_html_report(&results, None);
+        let row = row_containing(&html, "beta_sys").expect("beta_sys row");
+        assert!(
+            !row.contains("▲") && !row.contains("▼"),
+            "no prev → no delta arrows: {row}"
+        );
+        assert!(!row.contains("new"), "no prev → no 'new' flag: {row}");
+    }
 }
