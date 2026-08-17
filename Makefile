@@ -39,6 +39,15 @@ all: check fmt-check clippy test deny frontend-build frontend-check
 build-release:
 	cargo build --release --target x86_64-unknown-linux-musl
 
+# ─── Benchmark with allocation profiling ────────────────────────────────
+bench-alloc:
+	cargo run --release --features microbenchmarks,bench-alloc -- \
+		--benchmark --bench-html benchmark-alloc.html
+
+# ─── Verify hot loops were auto-vectorized ──────────────────────────────
+check-vectorization:
+	bash scripts/check_vectorization.sh
+
 # Build the reusable SWE-Bench harness image used by docker.images.swebench_harness
 swebench-harness-image:
 	docker build -f docker/swebench-harness/Dockerfile -t llm-benchmark-runner/swebench-harness:latest docker/swebench-harness

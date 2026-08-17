@@ -30,6 +30,9 @@ pub const MEASURED_RUNS: u32 = 3;
 /// Warmup ticks per measured run (discarded; warms caches/archetypes and lets
 /// the battle front converge so measured ticks start near steady state).
 pub const BENCH_WARMUP_TICKS: u64 = 200;
+/// Number of players the battle is run between. Cities are round-robin
+/// assigned among these players (one city each when cities == players).
+pub const BENCH_PLAYERS: u32 = 4;
 
 /// Per-tick benchmark data point
 #[derive(Default, Clone)]
@@ -43,6 +46,12 @@ pub struct TickData {
     pub movers: u32,
     /// Number of engaged combat pairs this tick (combat.rs engaged_pairs)
     pub combats: u32,
+    /// Allocation calls during this tick (0 when bench-alloc is off).
+    pub allocs: u64,
+    /// Heap bytes allocated during this tick (0 when bench-alloc is off).
+    pub bytes: u64,
+    /// Biggest single allocation (bytes) during this tick (0 when bench-alloc is off).
+    pub max_alloc: u64,
 }
 
 /// Benchmark configuration
@@ -233,8 +242,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
     let total_cities = map_cfg.cities.len();
     println!(
-        "  Cities: {}, Players created: {}",
-        total_cities, total_cities
+        "  Cities: {}, Players: {} (cities round-robin across them)",
+        total_cities, BENCH_PLAYERS
     );
 
     // Benchmark protocol: one warmup pass per run, then MEASURED_RUNS measured
@@ -278,10 +287,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         println!("  ── Run {}/{} ──", run + 1, MEASURED_RUNS);
         let map = Map::from_config(&map_cfg);
         let settings = settings_template.clone();
-        let mut game = Game::new(map, settings, total_cities);
+        let mut game = Game::new(map, settings, BENCH_PLAYERS as usize);
         let cities = game.query_cities();
         for (i, city) in cities.iter().enumerate() {
-            let player_id = format!("player_{}", i % 4);
+            let player_id = format!("player_{}", i % (BENCH_PLAYERS as usize));
             game.assign_city_owner(&city.id, &player_id);
         }
 
@@ -345,12 +354,27 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
         for _ in 0..config.ticks {
             let tick_start = Instant::now();
+
+            #[cfg(feature = "bench-alloc")]
+            let alloc_base = crate::bench_alloc::snapshot();
+
             sim.tick(&mut game, &config);
             game.tick_game();
-            let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+            // World read-back + counters are part of the per-tick work, so they
+            // are timed: this keeps total_ms (systems + overhead) reconciling
+            // with the wall-clock avg tick, and counts their allocations.
             let unit_count = game.query_all_units().len() as u32;
             let movers = game.last_mover_count() as u32;
             let combats = game.last_engaged_pairs() as u32;
+            let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+
+            #[cfg(feature = "bench-alloc")]
+            let (td_allocs, td_bytes, td_max) = {
+                let d = crate::bench_alloc::snapshot().diff(alloc_base);
+                (d.allocs, d.bytes, d.max_alloc)
+            };
+            #[cfg(not(feature = "bench-alloc"))]
+            let (td_allocs, td_bytes, td_max) = (0u64, 0u64, 0u64);
 
             // Accumulate combat diagnostics (averaged at the end).
             let diag = game.combat_diag();
@@ -382,6 +406,9 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     system_sum_ms,
                     movers,
                     combats,
+                    allocs: td_allocs,
+                    bytes: td_bytes,
+                    max_alloc: td_max,
                 }
             } else {
                 TickData {
@@ -391,6 +418,9 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     system_sum_ms: 0.0,
                     movers,
                     combats,
+                    allocs: td_allocs,
+                    bytes: td_bytes,
+                    max_alloc: td_max,
                 }
             };
 
@@ -402,6 +432,9 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 system_sum_ms: 0.0,
                 movers,
                 combats,
+                allocs: td_allocs,
+                bytes: td_bytes,
+                max_alloc: td_max,
             };
 
             run_tick_data.push(td);
@@ -482,6 +515,20 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     .iter()
                     .map(|r| r[i].combats as f64)
                     .sum::<f64>();
+                let sum_allocs = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].allocs as f64)
+                    .sum::<f64>();
+                let sum_bytes = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].bytes as f64)
+                    .sum::<f64>();
+                // "Biggest" aggregates as the max across runs (peak single alloc at this tick).
+                let max_max_alloc = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].max_alloc)
+                    .max()
+                    .unwrap_or(0);
                 TickData {
                     total_ms: sum_total / n,
                     entity_count: (sum_entity / n).round() as u32,
@@ -489,6 +536,9 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     system_sum_ms: sum_sys / n,
                     movers: (sum_movers / n).round() as u32,
                     combats: (sum_combats / n).round() as u32,
+                    allocs: (sum_allocs / n).round() as u64,
+                    bytes: (sum_bytes / n).round() as u64,
+                    max_alloc: max_max_alloc,
                 }
             })
             .collect()
@@ -567,6 +617,59 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         avg_combats
     );
     println!("  Total combat-tick count: {}", total_combats);
+
+    // Allocation stats (only when bench-alloc is on)
+    {
+        let total_a: u64 = tick_data.iter().map(|td| td.allocs).sum();
+        let total_b: u64 = tick_data.iter().map(|td| td.bytes).sum();
+        let avg_a = total_a as f64 / tick_data.len().max(1) as f64;
+        let avg_b = total_b as f64 / tick_data.len().max(1) as f64;
+        let avg_alloc_size = if total_a > 0 {
+            total_b as f64 / total_a as f64
+        } else {
+            0.0
+        };
+        let max_alloc = tick_data.iter().map(|td| td.max_alloc).max().unwrap_or(0);
+        if avg_a > 0.0 {
+            println!("  Avg allocs/tick: {:.1}", avg_a);
+            println!("  Avg bytes/tick: {}", fmt_bytes(avg_b));
+            println!(
+                "  Avg alloc size: {} (bytes per allocation)",
+                fmt_bytes(avg_alloc_size)
+            );
+            println!(
+                "  Biggest alloc:  {} (largest single allocation)",
+                fmt_bytes(max_alloc as f64)
+            );
+        }
+    }
+
+    // Stack-resident scratch struct sizes (static, zero cost)
+    println!("  Stack-resident sizes:");
+    println!(
+        "    Game:               {}",
+        fmt_bytes(std::mem::size_of::<crate::game::game::Game>() as f64)
+    );
+    println!(
+        "    MovementScratch:    {}",
+        fmt_bytes(std::mem::size_of::<crate::game::systems::movement::MovementScratch>() as f64)
+    );
+    println!(
+        "    CombatScratch:      {}",
+        fmt_bytes(std::mem::size_of::<crate::game::systems::combat::CombatScratch>() as f64)
+    );
+    println!(
+        "    InfluenceScratch:   {}",
+        fmt_bytes(std::mem::size_of::<crate::game::systems::influence::InfluenceScratch>() as f64)
+    );
+    println!(
+        "    SupplyScratch:      {}",
+        fmt_bytes(std::mem::size_of::<crate::game::systems::supply::SupplyScratch>() as f64)
+    );
+    println!(
+        "    TickContext:        {}",
+        fmt_bytes(std::mem::size_of::<crate::game::game::TickContext>() as f64)
+    );
     let ticks_f = tick_data.len() as f64;
     println!(
         "  Combat diagnostics (avg/tick): candidates {:.1}, attackers {:.1}, pairs scanned {:.1}",
@@ -676,6 +779,28 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         total_combat_ticks as f64 / tick_data.len() as f64
     };
 
+    // Allocation stats (per tick, 0 when bench-alloc is off)
+    let total_alloc_ticks: u64 = tick_data.iter().map(|td| td.allocs).sum();
+    let avg_allocs_per_tick = if tick_data.is_empty() {
+        0.0
+    } else {
+        total_alloc_ticks as f64 / tick_data.len() as f64
+    };
+    let total_alloc_bytes: u64 = tick_data.iter().map(|td| td.bytes).sum();
+    let avg_bytes_per_tick = if tick_data.is_empty() {
+        0.0
+    } else {
+        total_alloc_bytes as f64 / tick_data.len() as f64
+    };
+    // Average single-allocation size (bytes/alloc) and the biggest single
+    // allocation observed anywhere in the benchmark. 0 when bench-alloc is off.
+    let avg_alloc_size = if total_alloc_ticks > 0 {
+        total_alloc_bytes as f64 / total_alloc_ticks as f64
+    } else {
+        0.0
+    };
+    let max_alloc_size = tick_data.iter().map(|td| td.max_alloc).max().unwrap_or(0);
+
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
@@ -695,6 +820,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "total_mover_ticks": total_mover_ticks,
             "avg_combats_per_tick": avg_combats_per_tick,
             "total_combat_ticks": total_combat_ticks,
+            "allocs_per_tick": avg_allocs_per_tick,
+            "bytes_per_tick": avg_bytes_per_tick,
+            "avg_alloc_size": avg_alloc_size,
+            "max_alloc_size": max_alloc_size,
         },
         "latency": {
             "avg_ms": avg_tick, "min_ms": min_tick, "max_ms": max_tick,
@@ -715,6 +844,30 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "tick_durations_ms": avg_tick_data.iter().map(|td| td.total_ms).collect::<Vec<f64>>(),
         "movers_per_tick": avg_tick_data.iter().map(|td| td.movers).collect::<Vec<_>>(),
         "combats_per_tick": avg_tick_data.iter().map(|td| td.combats).collect::<Vec<_>>(),
+        "allocs_per_tick_series": avg_tick_data.iter().map(|td| td.allocs as f64).collect::<Vec<f64>>(),
+        "bytes_per_tick_series": avg_tick_data.iter().map(|td| td.bytes as f64).collect::<Vec<f64>>(),
+        "avg_alloc_size_series": avg_tick_data
+            .iter()
+            .map(|td| {
+                if td.allocs > 0 {
+                    td.bytes as f64 / td.allocs as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<f64>>(),
+        "max_alloc_per_tick_series": avg_tick_data
+            .iter()
+            .map(|td| td.max_alloc as f64)
+            .collect::<Vec<f64>>(),
+        "stack": {
+            "Game": std::mem::size_of::<crate::game::game::Game>(),
+            "MovementScratch": std::mem::size_of::<crate::game::systems::movement::MovementScratch>(),
+            "CombatScratch": std::mem::size_of::<crate::game::systems::combat::CombatScratch>(),
+            "InfluenceScratch": std::mem::size_of::<crate::game::systems::influence::InfluenceScratch>(),
+            "SupplyScratch": std::mem::size_of::<crate::game::systems::supply::SupplyScratch>(),
+            "TickContext": std::mem::size_of::<crate::game::game::TickContext>(),
+        },
         "combat_diag": {
             "avg_candidates_per_tick": diag_candidates as f64 / tick_data.len() as f64,
             "avg_attackers_per_tick": diag_attackers as f64 / tick_data.len() as f64,
@@ -737,6 +890,29 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         tick_data: avg_tick_data,
         summary,
     }
+}
+
+/// Human-readable byte size: B for <1KB, then KB/MB/GB/TB (base 1024).
+/// e.g. 24 -> "24 B", 1456 -> "1.42 KB", 434267 -> "424.09 KB".
+fn fmt_bytes(b: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{:.0} B", v)
+    } else {
+        format!("{:.2} {}", v, UNITS[i])
+    }
+}
+
+/// Signed variant of [fmt_bytes] for deltas: "+4.9 KB" / "-2.1 KB".
+fn fmt_bytes_signed(b: f64) -> String {
+    let sign = if b < 0.0 { "-" } else { "+" };
+    format!("{sign}{}", fmt_bytes(b.abs()))
 }
 
 fn percentile(values: &[f64], p: u32) -> f64 {
@@ -949,6 +1125,31 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
                 format!(
                     " <span style='color:{};font-size:11px'>{}{:+.3}{} ({:+.1}%)</span>",
                     color, emoji, change, unit, pct
+                )
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Inline delta for a byte-valued card whose magnitude is rendered
+    /// human-readable (KB/MB/…) so it matches the card value's scale.
+    fn delta_bytes_html(current: f64, previous: Option<f64>, abs_threshold: f64) -> String {
+        match previous {
+            Some(prev) if (current - prev).abs() > abs_threshold => {
+                let change = current - prev;
+                let pct = if prev.abs() > 1e-9 {
+                    change / prev * 100.0
+                } else {
+                    0.0
+                };
+                let emoji = if change < 0.0 { "🟢" } else { "🔴" };
+                let color = if change < 0.0 { "#0f0" } else { "#f44" };
+                format!(
+                    " <span style='color:{};font-size:11px'>{}{} ({:+.1}%)</span>",
+                    color,
+                    emoji,
+                    fmt_bytes_signed(change),
+                    pct
                 )
             }
             _ => String::new(),
@@ -1345,6 +1546,160 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         ("[]".to_string(), "[]".to_string())
     };
 
+    // Allocation per-tick chart data (only rendered when bench-alloc produced data).
+    let allocs_series: Vec<f64> = results
+        .tick_data
+        .iter()
+        .map(|td| td.allocs as f64)
+        .collect();
+    let bytes_series: Vec<f64> = results.tick_data.iter().map(|td| td.bytes as f64).collect();
+    let avg_alloc_size_series: Vec<f64> = results
+        .tick_data
+        .iter()
+        .map(|td| {
+            if td.allocs > 0 {
+                td.bytes as f64 / td.allocs as f64
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let max_alloc_series: Vec<f64> = results
+        .tick_data
+        .iter()
+        .map(|td| td.max_alloc as f64)
+        .collect();
+    let has_alloc_data =
+        allocs_series.iter().any(|&v| v > 0.0) || bytes_series.iter().any(|&v| v > 0.0);
+    let allocs_series_json =
+        serde_json::to_string(&allocs_series).unwrap_or_else(|_| "[]".to_string());
+    let bytes_series_json =
+        serde_json::to_string(&bytes_series).unwrap_or_else(|_| "[]".to_string());
+    let avg_alloc_size_series_json =
+        serde_json::to_string(&avg_alloc_size_series).unwrap_or_else(|_| "[]".to_string());
+    let max_alloc_series_json =
+        serde_json::to_string(&max_alloc_series).unwrap_or_else(|_| "[]".to_string());
+
+    // Previous alloc series (if --bench-prev given and previous report has alloc data).
+    let prev_allocs_series: Option<Vec<f64>> = prev_json
+        .get("allocs_per_tick_series")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+    let prev_bytes_series: Option<Vec<f64>> = prev_json
+        .get("bytes_per_tick_series")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+    let prev_avg_alloc_size_series: Option<Vec<f64>> = prev_json
+        .get("avg_alloc_size_series")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+    let prev_max_alloc_series: Option<Vec<f64>> = prev_json
+        .get("max_alloc_per_tick_series")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+    let prev_allocs_json = prev_allocs_series
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let prev_bytes_json = prev_bytes_series
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let prev_avg_alloc_size_json = prev_avg_alloc_size_series
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let prev_max_alloc_json = prev_max_alloc_series
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let prev_alloc_note = if prev_allocs_series.is_some() || prev_bytes_series.is_some() {
+        "Grey dashed = previous benchmark."
+    } else {
+        ""
+    };
+
+    // Avg alloc/bytes per tick for summary cards (with prev comparison).
+    let avg_allocs_tick = results.summary["results"]["allocs_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let avg_bytes_tick = results.summary["results"]["bytes_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let avg_alloc_size_tick = results.summary["results"]["avg_alloc_size"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let max_alloc_size_tick = results.summary["results"]["max_alloc_size"]
+        .as_u64()
+        .unwrap_or(0);
+    let prev_avg_allocs = prev_json
+        .get("results")
+        .and_then(|r| r.get("allocs_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_bytes = prev_json
+        .get("results")
+        .and_then(|r| r.get("bytes_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_alloc_size = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_alloc_size"))
+        .and_then(|v| v.as_f64());
+    let prev_max_alloc_size = prev_json
+        .get("results")
+        .and_then(|r| r.get("max_alloc_size"))
+        .and_then(|v| v.as_u64());
+    let avg_allocs_delta = delta_html(avg_allocs_tick, prev_avg_allocs, "", COUNT);
+    let avg_bytes_delta = delta_bytes_html(avg_bytes_tick, prev_avg_bytes, 0.5);
+    let avg_alloc_size_delta = delta_bytes_html(avg_alloc_size_tick, prev_avg_alloc_size, 0.01);
+    let max_alloc_size_delta = delta_bytes_html(
+        max_alloc_size_tick as f64,
+        prev_max_alloc_size.map(|v| v as f64),
+        1.0,
+    );
+
+    // Stack size table HTML (always present, zero cost).
+    let stack_json = &results.summary["stack"];
+    let stack_rows: Vec<String> = stack_json
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .map(|(name, size)| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td></tr>",
+                        name,
+                        fmt_bytes(size.as_u64().unwrap_or(0) as f64)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let stack_table_html = if stack_rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h3>Stack-Resident Scratch Sizes</h3>\n         <table>\n         <thead><tr><th>Struct</th><th>Size</th></tr></thead>\n         <tbody>{}\n         </tbody>\n         </table>",
+            stack_rows.join("\n         ")
+        )
+    };
+
+    // Alloc chart HTML section (only when bench-alloc data is present).
+    let alloc_chart_html = if has_alloc_data {
+        let bytes_human = fmt_bytes(avg_bytes_tick);
+        let alloc_size_human = fmt_bytes(avg_alloc_size_tick);
+        let max_alloc_human = fmt_bytes(max_alloc_size_tick as f64);
+        format!(
+            "<h2>📦 Allocation Profile</h2>\n         <p class='note'>Allocation activity per tick (averaged across {} runs). {}</p>\n         <div class='metrics'>\n         <div class='metric'><div class='value'>{:.1}{}</div><div class='label'>Avg Allocs/Tick</div></div>\n         <div class='metric'><div class='value'>{}{}</div><div class='label'>Avg Bytes/Tick</div></div>\n         <div class='metric'><div class='value'>{}{}</div><div class='label'>Avg Alloc Size</div></div>\n         <div class='metric'><div class='value'>{}{}</div><div class='label'>Biggest Single Alloc</div></div>\n         </div>\n         <div style='display:flex;gap:20px;flex-wrap:wrap;'>\n         <div class='chart-container' style='flex:1;min-width:300px;'><canvas id='allocChart' height='120'></canvas></div>\n         <div class='chart-container' style='flex:1;min-width:300px;'><canvas id='bytesChart' height='120'></canvas></div>\n         </div>\n         <div style='display:flex;gap:20px;flex-wrap:wrap;margin-top:10px;'>\n         <div class='chart-container' style='flex:1;min-width:300px;'><canvas id='avgAllocSizeChart' height='120'></canvas></div>\n         <div class='chart-container' style='flex:1;min-width:300px;'><canvas id='maxAllocChart' height='120'></canvas></div>\n         </div>",
+            measured_runs_str,
+            prev_alloc_note,
+            avg_allocs_tick, avg_allocs_delta,
+            bytes_human, avg_bytes_delta,
+            alloc_size_human, avg_alloc_size_delta,
+            max_alloc_human, max_alloc_size_delta,
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -1383,7 +1738,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         <table>
             <tr><td>Map</td><td>200×200 (40,000 tiles)</td></tr>
             <tr><td>Cities</td><td>{cities}</td></tr>
-            <tr><td>Players</td><td>4 (round-robin city assignment)</td></tr>
+            <tr><td>Players</td><td>{bench_players} (cities round-robin)</td></tr>
             <tr><td>Units per city</td><td>{units_per_city}</td></tr>
             <tr><td>Initial units</td><td>{units_initial}</td></tr>
             <tr><td>Ticks</td><td>{ticks}</td></tr>
@@ -1444,6 +1799,10 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
 
         <h3>Entity, Unit, Mover & Combat Counts Over Time</h3>
         <div class="chart-container"><canvas id="entityChart" height="120"></canvas></div>
+
+        {alloc_chart_html}
+
+        {stack_table_html}
 
         <h2>System Timing Breakdown</h2>
         {comparison_note}
@@ -1606,6 +1965,149 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
                 animation: {{ duration: 0 }},
             }}
         }});
+
+        // Human-readable bytes helper for chart axes and tooltips
+        function fmtBytes(v) {{
+            if (v >= 1073741824) return (v / 1073741824).toFixed(2) + ' GB';
+            if (v >= 1048576) return (v / 1048576).toFixed(2) + ' MB';
+            if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+            return v.toFixed(0) + ' B';
+        }}
+
+        // Allocation per-tick charts (only rendered when bench-alloc data is present)
+        if (document.getElementById('allocChart')) {{
+            const allocsData = {allocs_series_json};
+            const prevAllocs = {prev_allocs_json};
+            const allocDatasets = [{{
+                label: 'Allocs/Tick', data: allocsData,
+                borderColor: '#e74c3c', backgroundColor: 'rgba(231,76,60,0.1)',
+                borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3,
+            }}];
+            if (prevAllocs && prevAllocs.length > 0) {{
+                allocDatasets.push({{
+                    label: 'Previous', data: prevAllocs,
+                    borderColor: '#888', borderWidth: 1, pointRadius: 0,
+                    borderDash: [4, 4], fill: false, tension: 0.3,
+                }});
+            }}
+            new Chart(document.getElementById('allocChart'), {{
+                type: 'line',
+                data: {{ labels: allocsData.map((_, i) => i), datasets: allocDatasets }},
+                options: {{
+                    responsive: true, plugins: {{ title: {{ display: true, text: 'Allocs/Tick', color: '#e74c3c' }}, legend: {{ labels: {{ color: '#aaa' }} }} }},
+                    scales: {{
+                        x: {{ title: {{ display: true, text: 'Tick' }}, ticks: {{ color: '#666' }}, grid: {{ color: '#333' }} }},
+                        y: {{ title: {{ display: true, text: 'Allocs' }}, ticks: {{ color: '#666' }}, grid: {{ color: '#333' }} }}
+                    }},
+                    animation: {{ duration: 0 }},
+                }}
+            }});
+        }}
+        if (document.getElementById('bytesChart')) {{
+            const bytesData = {bytes_series_json};
+            const prevBytes = {prev_bytes_json};
+            const bytesDatasets = [{{
+                label: 'Bytes/Tick', data: bytesData,
+                borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,0.1)',
+                borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3,
+            }}];
+            if (prevBytes && prevBytes.length > 0) {{
+                bytesDatasets.push({{
+                    label: 'Previous', data: prevBytes,
+                    borderColor: '#888', borderWidth: 1, pointRadius: 0,
+                    borderDash: [4, 4], fill: false, tension: 0.3,
+                }});
+            }}
+            new Chart(document.getElementById('bytesChart'), {{
+                type: 'line',
+                data: {{ labels: bytesData.map((_, i) => i), datasets: bytesDatasets }},
+                options: {{
+                    responsive: true, plugins: {{
+                        title: {{ display: true, text: 'Bytes/Tick', color: '#3498db' }},
+                        legend: {{ labels: {{ color: '#aaa' }} }},
+                        tooltip: {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label + ': ' + fmtBytes(ctx.parsed.y); }} }} }}
+                    }},
+                    scales: {{
+                        x: {{ title: {{ display: true, text: 'Tick' }}, ticks: {{ color: '#666' }}, grid: {{ color: '#333' }} }},
+                        y: {{
+                            title: {{ display: true, text: 'Bytes' }}, ticks: {{ color: '#666', callback: function(v) {{ return fmtBytes(v); }} }},
+                            grid: {{ color: '#333' }}
+                        }}
+                    }},
+                    animation: {{ duration: 0 }},
+                }}
+            }});
+        }}
+        if (document.getElementById('avgAllocSizeChart')) {{
+            const avgSizeData = {avg_alloc_size_series_json};
+            const prevAvgSize = {prev_avg_alloc_size_json};
+            const avgSizeDatasets = [{{
+                label: 'Avg Alloc Size/Tick', data: avgSizeData,
+                borderColor: '#f39c12', backgroundColor: 'rgba(243,156,18,0.1)',
+                borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3,
+            }}];
+            if (prevAvgSize && prevAvgSize.length > 0) {{
+                avgSizeDatasets.push({{
+                    label: 'Previous', data: prevAvgSize,
+                    borderColor: '#888', borderWidth: 1, pointRadius: 0,
+                    borderDash: [4, 4], fill: false, tension: 0.3,
+                }});
+            }}
+            new Chart(document.getElementById('avgAllocSizeChart'), {{
+                type: 'line',
+                data: {{ labels: avgSizeData.map((_, i) => i), datasets: avgSizeDatasets }},
+                options: {{
+                    responsive: true, plugins: {{
+                        title: {{ display: true, text: 'Avg Allocation Size per Tick', color: '#f39c12' }},
+                        legend: {{ labels: {{ color: '#aaa' }} }},
+                        tooltip: {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label + ': ' + fmtBytes(ctx.parsed.y); }} }} }}
+                    }},
+                    scales: {{
+                        x: {{ title: {{ display: true, text: 'Tick' }}, ticks: {{ color: '#666' }}, grid: {{ color: '#333' }} }},
+                        y: {{
+                            title: {{ display: true, text: 'Avg Size' }}, ticks: {{ color: '#666', callback: function(v) {{ return fmtBytes(v); }} }},
+                            grid: {{ color: '#333' }}
+                        }}
+                    }},
+                    animation: {{ duration: 0 }},
+                }}
+            }});
+        }}
+        if (document.getElementById('maxAllocChart')) {{
+            const maxAllocData = {max_alloc_series_json};
+            const prevMaxAlloc = {prev_max_alloc_json};
+            const maxAllocDatasets = [{{
+                label: 'Biggest Alloc/Tick', data: maxAllocData,
+                borderColor: '#9b59b6', backgroundColor: 'rgba(155,89,182,0.1)',
+                borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3,
+            }}];
+            if (prevMaxAlloc && prevMaxAlloc.length > 0) {{
+                maxAllocDatasets.push({{
+                    label: 'Previous', data: prevMaxAlloc,
+                    borderColor: '#888', borderWidth: 1, pointRadius: 0,
+                    borderDash: [4, 4], fill: false, tension: 0.3,
+                }});
+            }}
+            new Chart(document.getElementById('maxAllocChart'), {{
+                type: 'line',
+                data: {{ labels: maxAllocData.map((_, i) => i), datasets: maxAllocDatasets }},
+                options: {{
+                    responsive: true, plugins: {{
+                        title: {{ display: true, text: 'Biggest Single Alloc per Tick', color: '#9b59b6' }},
+                        legend: {{ labels: {{ color: '#aaa' }} }},
+                        tooltip: {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label + ': ' + fmtBytes(ctx.parsed.y); }} }} }}
+                    }},
+                    scales: {{
+                        x: {{ title: {{ display: true, text: 'Tick' }}, ticks: {{ color: '#666' }}, grid: {{ color: '#333' }} }},
+                        y: {{
+                            title: {{ display: true, text: 'Size' }}, ticks: {{ color: '#666', callback: function(v) {{ return fmtBytes(v); }} }},
+                            grid: {{ color: '#333' }}
+                        }}
+                    }},
+                    animation: {{ duration: 0 }},
+                }}
+            }});
+        }}
     </script>
 </body>
 </html>"#,
@@ -1672,6 +2174,17 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         overhead_durations_json = overhead_durations_json,
         pie_labels_json = pie_labels,
         pie_data_json = pie_data,
+        allocs_series_json = allocs_series_json,
+        bytes_series_json = bytes_series_json,
+        avg_alloc_size_series_json = avg_alloc_size_series_json,
+        max_alloc_series_json = max_alloc_series_json,
+        prev_allocs_json = prev_allocs_json,
+        prev_bytes_json = prev_bytes_json,
+        prev_avg_alloc_size_json = prev_avg_alloc_size_json,
+        prev_max_alloc_json = prev_max_alloc_json,
+        alloc_chart_html = alloc_chart_html,
+        stack_table_html = stack_table_html,
+        bench_players = BENCH_PLAYERS,
     )
 }
 

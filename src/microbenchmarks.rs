@@ -43,6 +43,14 @@ pub struct MicrobenchmarkResult {
     pub p99_ns: f64,
     /// Number of iterations.
     pub n: u32,
+
+    /// Allocation calls per iteration (None when bench-alloc is off).
+    #[allow(dead_code)]
+    pub allocs_per_iter: Option<f64>,
+
+    /// Heap bytes allocated per iteration (None when bench-alloc is off).
+    #[allow(dead_code)]
+    pub bytes_per_iter: Option<f64>,
 }
 
 // ============================================================================
@@ -145,6 +153,10 @@ fn run_bench(
 
     // Timed iterations
     let mut durations = Vec::with_capacity(config.timed);
+
+    #[cfg(feature = "bench-alloc")]
+    let alloc_base = crate::bench_alloc::snapshot();
+
     for _ in 0..config.timed {
         setup();
         let start = Instant::now();
@@ -154,7 +166,7 @@ fn run_bench(
     }
 
     let stats = compute_stats(&durations);
-    MicrobenchmarkResult {
+    let result = MicrobenchmarkResult {
         mean_ns: stats.mean,
         std_dev_ns: stats.std_dev,
         median_ns: stats.median,
@@ -163,7 +175,20 @@ fn run_bench(
         p99_ns: stats.p99,
         n: durations.len() as u32,
         ..MicrobenchmarkResult::default_empty()
-    }
+    };
+
+    #[cfg(feature = "bench-alloc")]
+    let result = {
+        let d = crate::bench_alloc::snapshot().diff(alloc_base);
+        let n = durations.len() as f64;
+        MicrobenchmarkResult {
+            allocs_per_iter: Some(d.allocs as f64 / n),
+            bytes_per_iter: Some(d.bytes as f64 / n),
+            ..result
+        }
+    };
+
+    result
 }
 
 /// Variant of [run_bench] that runs `setup` outside the timer.
@@ -189,6 +214,10 @@ where
 
     // Timed iterations — fixture creation is NOT timed
     let mut durations = Vec::with_capacity(config.timed);
+
+    #[cfg(feature = "bench-alloc")]
+    let alloc_base = crate::bench_alloc::snapshot();
+
     for _ in 0..config.timed {
         let mut f = setup();
         let start = Instant::now();
@@ -198,7 +227,7 @@ where
     }
 
     let stats = compute_stats(&durations);
-    MicrobenchmarkResult {
+    let result = MicrobenchmarkResult {
         mean_ns: stats.mean,
         std_dev_ns: stats.std_dev,
         median_ns: stats.median,
@@ -207,7 +236,20 @@ where
         p99_ns: stats.p99,
         n: durations.len() as u32,
         ..MicrobenchmarkResult::default_empty()
-    }
+    };
+
+    #[cfg(feature = "bench-alloc")]
+    let result = {
+        let d = crate::bench_alloc::snapshot().diff(alloc_base);
+        let n = durations.len() as f64;
+        MicrobenchmarkResult {
+            allocs_per_iter: Some(d.allocs as f64 / n),
+            bytes_per_iter: Some(d.bytes as f64 / n),
+            ..result
+        }
+    };
+
+    result
 }
 
 /// Cumulative benchmark for sub-10µs operations.
@@ -234,6 +276,8 @@ fn run_bench_cumulative(
         p90_ns: result.p90_ns / repeats as f64,
         p99_ns: result.p99_ns / repeats as f64,
         n: result.n,
+        allocs_per_iter: result.allocs_per_iter.map(|v| v / repeats as f64),
+        bytes_per_iter: result.bytes_per_iter.map(|v| v / repeats as f64),
         ..result
     }
 }
@@ -265,6 +309,8 @@ where
         p90_ns: result.p90_ns / repeats as f64,
         p99_ns: result.p99_ns / repeats as f64,
         n: result.n,
+        allocs_per_iter: result.allocs_per_iter.map(|v| v / repeats as f64),
+        bytes_per_iter: result.bytes_per_iter.map(|v| v / repeats as f64),
         ..result
     }
 }
@@ -281,6 +327,8 @@ impl MicrobenchmarkResult {
             p90_ns: 0.0,
             p99_ns: 0.0,
             n: 0,
+            allocs_per_iter: None,
+            bytes_per_iter: None,
         }
     }
 }
@@ -1584,6 +1632,8 @@ pub fn results_to_json(results: &[MicrobenchmarkResult]) -> serde_json::Value {
             "p90_ns": r.p90_ns,
             "p99_ns": r.p99_ns,
             "n": r.n,
+            "allocs_per_iter": r.allocs_per_iter,
+            "bytes_per_iter": r.bytes_per_iter,
         })).collect::<Vec<_>>(),
         "count": results.len()
     })

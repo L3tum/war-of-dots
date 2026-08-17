@@ -39,6 +39,10 @@ smallvec = "1"
 default = []
 debug-overlay = []
 microbenchmarks = []
+bench-alloc = []
+
+[dev-dependencies]
+dhat = "0.3"
 
 [[bin]]
 name = "console_client"

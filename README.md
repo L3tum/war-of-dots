@@ -106,6 +106,62 @@ replay_path = "replays"
 - Encircled units have increased surrender chance
 - Surrendered equipment converts to funds for capturer
 
+## Profiling
+
+### Benchmark with Allocation Profiling
+
+Run the full benchmark with the counting allocator enabled to measure per-tick heap allocation:
+
+```bash
+make bench-alloc
+# or equivalently:
+cargo run --release --features microbenchmarks,bench-alloc -- \
+    --benchmark --bench-html benchmark-alloc.html
+```
+
+The HTML report will include:
+- **Allocation Per Tick** section: two line charts (Allocs/Tick, Bytes/Tick) with previous-comparison overlay when `--bench-prev` is given
+- **Stack-Resident Scratch Sizes** table: static `size_of` for all major scratch structs
+- Per-benchmark `allocs_per_iter` / `bytes_per_iter` in the microbenchmark table
+
+Compare against a previous run:
+```bash
+make bench-alloc
+# then:
+cargo run --release --features microbenchmarks,bench-alloc -- \
+    --benchmark --bench-html benchmark-alloc.html --bench-prev benchmark-alloc.html
+```
+
+### CPU Microarchitecture (perf stat)
+
+For instruction-level profiling (IPC, cache misses, branch mispredicts):
+
+```bash
+perf stat cargo run --release -- --benchmark --bench-html /dev/null
+```
+
+### Verify Auto-Vectorization
+
+Check whether hot loops were auto-vectorized to AVX2 in the release binary:
+
+```bash
+make build-release
+make check-vectorization
+```
+
+This disassembles the release binary and greps known hot functions (`influence::run`, `nearby_enemies::run`) for SIMD instructions. A positive result is evidence (not per-loop proof); a negative (0 vector ops) IS meaningful. For definitive per-loop verification, use:
+
+```bash
+cargo rustc --release -- --emit asm | less
+```
+
+### Notes
+
+- `bench-alloc` is incompatible with Miri (replaces the global allocator). Run `make miri` without the feature.
+- The counting allocator adds ~1 atomic add per allocation (~0.5 ns overhead). Negligible vs. tick cost.
+- Dynamic peak-stack measurement is out of scope; `heaptrack` is the escape hatch if needed.
+- The AVX2 build config (`target-cpu=x86-64-v3`) is verified by the `x86_64_build_targets_avx2` unit test on every `cargo test`.
+
 ## License
 
 MIT
