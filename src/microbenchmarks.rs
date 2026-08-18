@@ -769,6 +769,7 @@ impl SurrenderFixture {
 struct DeathCleanupFixture {
     world: World,
     dead_entities: Vec<hecs::Entity>,
+    scratch: crate::game::systems::death_cleanup::DeathCleanupScratch,
 }
 
 impl DeathCleanupFixture {
@@ -793,6 +794,7 @@ impl DeathCleanupFixture {
         Self {
             world,
             dead_entities,
+            scratch: Default::default(),
         }
     }
 }
@@ -1207,10 +1209,14 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         50000,
         || {
             let (world, world_entity) = make_world(20, 20, 2);
-            (world, world_entity)
+            (
+                world,
+                world_entity,
+                crate::game::systems::water::WaterScratch::default(),
+            )
         },
-        |f: &mut (World, hecs::Entity)| {
-            crate::game::systems::water::run(&mut f.0, f.1);
+        |f: &mut (World, hecs::Entity, crate::game::systems::water::WaterScratch)| {
+            crate::game::systems::water::run(&mut f.0, f.1, &mut f.2);
             black_box(0);
         },
     );
@@ -1318,8 +1324,9 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
             let mut entity_reverse: HashMap<hecs::Entity, String> = HashMap::new();
             crate::game::systems::death_cleanup::run(
                 &mut f.world,
-                f.dead_entities.clone(),
+                &[&f.dead_entities[..]],
                 &mut entity_reverse,
+                &mut f.scratch,
             );
             black_box(f.dead_entities.len());
         },

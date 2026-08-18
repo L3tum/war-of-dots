@@ -43,6 +43,9 @@ pub struct GridIndexScratch {
     pub entries: Vec<CellEntry>,
     pub cell_offsets: Vec<usize>,
     pub cell_sizes: Vec<usize>,
+    /// All-unit records for this tick, cleared and reused each run (capacity
+    /// preserved). All-pub element types, so a `pub` field is fine.
+    pub units: Vec<(Entity, UnitPosition, u8, bool)>,
 }
 
 impl GridIndexScratch {
@@ -51,16 +54,7 @@ impl GridIndexScratch {
             entries: Vec::new(),
             cell_offsets: Vec::new(),
             cell_sizes: Vec::new(),
-        }
-    }
-
-    /// Grow the per-cell buffers to at least `total` cells (no-op when enough).
-    fn ensure(&mut self, total: usize) {
-        if self.cell_offsets.len() < total {
-            self.cell_offsets.resize(total, 0);
-        }
-        if self.cell_sizes.len() < total {
-            self.cell_sizes.resize(total, 0);
+            units: Vec::new(),
         }
     }
 }
@@ -82,13 +76,21 @@ struct GridIndex {
 }
 
 impl GridIndex {
-    /// Build grid from units array, filling the reusable `scratch` buffers.
+    /// Build grid from units array, filling the reusable grid buffers passed by
+    /// mutable reference. `units` is borrowed disjointly from those buffers so
+    /// the caller can hold it (as `grid_scratch.units`) while `build` mutates
+    /// entries/offsets/sizes.
     /// `units` carries compact owner IDs (u8) from TickContext — no dedup needed.
     ///
     /// Buffers are reused in place: `cell_offsets`/`cell_sizes` grow only on
     /// expansion (a no-op at steady state), and `entries` is resized without a
     /// per-slot default write since every slot is overwritten in pass 2.
-    fn build(units: &[(Entity, UnitPosition, u8, bool)], scratch: &mut GridIndexScratch) -> Self {
+    fn build(
+        units: &[(Entity, UnitPosition, u8, bool)],
+        entries: &mut Vec<CellEntry>,
+        cell_offsets: &mut Vec<usize>,
+        cell_sizes: &mut Vec<usize>,
+    ) -> Self {
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
@@ -112,9 +114,17 @@ impl GridIndex {
         let height = (max_y - min_y + 2) as usize;
         let total = width * height;
 
-        scratch.ensure(total);
-        let cell_sizes = &mut scratch.cell_sizes[..total];
-        let cell_offsets = &mut scratch.cell_offsets[..total];
+        // Grow the per-cell buffers to at least `total` cells (no-op when
+        // enough) — inlined from the former `ensure` so `build` can borrow the
+        // fields disjointly from `units`.
+        if cell_offsets.len() < total {
+            cell_offsets.resize(total, 0);
+        }
+        if cell_sizes.len() < total {
+            cell_sizes.resize(total, 0);
+        }
+        let cell_sizes = &mut cell_sizes[..total];
+        let cell_offsets = &mut cell_offsets[..total];
 
         // Pass 1: count entries per cell (zeroed first for reuse).
         cell_sizes.fill(0);
@@ -133,7 +143,6 @@ impl GridIndex {
         // Pass 2: fill entries in place. `cell_sizes` doubles as a per-cell
         // cursor (reset to 0); each write advances it, so after the pass it
         // again holds the final per-cell counts — no `cell_offsets.clone()`.
-        let entries = &mut scratch.entries;
         entries.resize(
             units.len(),
             CellEntry {
@@ -191,27 +200,39 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext, grid_scratch: &mut GridIn
     // 1. Collect all living unit data in one ECS query (no &UnitOwner —
     //    owner IDs come from the shared TickContext lookup).
     //    Each entry: (entity, position, compact_owner_id, is_moved).
-    let units: Vec<(Entity, UnitPosition, u8, bool)> = world
-        .query::<(Entity, &UnitPosition, &UnitFlags)>()
-        .iter()
-        .filter_map(|(e, pos, flags)| {
-            debug_assert!(
-                ctx.owner_id_by_entity.contains_key(&e),
-                "entity {:?} missing from owner_id_by_entity — TickContext stale?",
-                e
-            );
-            let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
-            Some((e, *pos, owner_id, flags.moved))
-        })
-        .collect();
+    //    Written into the reused scratch buffer so steady-state ticks do not
+    //    grow/allocate the Vec.
+    grid_scratch.units.clear();
+    grid_scratch.units.extend(
+        world
+            .query::<(Entity, &UnitPosition, &UnitFlags)>()
+            .iter()
+            .filter_map(|(e, pos, flags)| {
+                debug_assert!(
+                    ctx.owner_id_by_entity.contains_key(&e),
+                    "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                    e
+                );
+                let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
+                Some((e, *pos, owner_id, flags.moved))
+            }),
+    );
 
-    let n = units.len();
+    let n = grid_scratch.units.len();
     if n == 0 {
         return;
     }
 
-    // 2. Build grid index into the reused scratch buffers.
-    let grid = GridIndex::build(&units, grid_scratch);
+    // 2. Build grid index into the reused scratch buffers. `units` is a separate
+    //    field from the grid buffers, so we can borrow it immutably while build
+    //    mutates entries/offsets/sizes (disjoint field borrows).
+    let grid = GridIndex::build(
+        &grid_scratch.units,
+        &mut grid_scratch.entries,
+        &mut grid_scratch.cell_offsets,
+        &mut grid_scratch.cell_sizes,
+    );
+    let units = &grid_scratch.units[..];
 
     // Reuse buffer to avoid per-unit allocation.
     let mut enemies = Vec::with_capacity(16);
@@ -246,12 +267,19 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext, grid_scratch: &mut GridIn
         }
 
         // Write/update NearbyEnemies.
-        // Drain the shared scratch into the (stack-backed) SmallVec field; the
-        // scratch `enemies` Vec keeps its buffer (empty) and is reused next unit,
-        // so no fresh per-unit allocation happens.
+        // Move the collected entities into the (stack-backed) SmallVec field in
+        // O(k) with no allocation once `nb.entities` capacity >= the enemy count
+        // (SmallVec keeps its heap buffer across clear()). This is the
+        // `SmallVec::append` equivalent for a `Vec` source and leaves `enemies`
+        // empty for the next unit — content-identical to the old
+        // `= enemies.drain(..).collect()`, but no per-tick alloc for the
+        // >8-enemy case.
         let has_enemies = !enemies.is_empty();
         if let Ok((nb,)) = world.query_one_mut::<(&mut NearbyEnemies,)>(entity) {
-            nb.entities = enemies.drain(..).collect();
+            nb.entities.clear();
+            for e in enemies.drain(..) {
+                nb.entities.push(e);
+            }
             nb.initialized = true;
         } else {
             let _ = world.insert(

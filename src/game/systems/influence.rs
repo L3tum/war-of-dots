@@ -63,40 +63,56 @@ fn circle_spans() -> &'static Vec<Vec<(i32, i32, i32)>> {
 /// - `city_positions`: per-player filtered city list (typically ≤ 20 entries).
 /// - `player_influence`: one reused per-player influence buffer (folded straight
 ///   into the running territory, never stored per player).
-/// - `territory` / `territory_max`: running dominant-player + max-influence
-///   accumulators for the per-player territory fold.
+/// - `territory_pool` / `territory_max`: double-buffered running dominant-player
+///   accumulator + max-influence scratch for the per-player territory fold.
+/// - `vision_pool` / `vision_gen`: double-buffered per-player vision slots. The
+///   run writes slot `(1 - vision_gen)` via `Arc::make_mut` and publishes an Arc
+///   clone of it.
+///
+/// Double-buffer invariant (both pools): the slot being written was published
+/// two dirty ticks ago and is no longer referenced by `wb.vision.grids` /
+/// `wb.territory.grid`, so `Arc::make_mut` is a strong-count-1 in-place fill
+/// (zero allocs at steady state). If a stale reader still holds that Arc, make_mut
+/// clones once (~1 MB) and correctness is preserved — the buffer being written can
+/// never be the allocation inside a live published Arc. Flip the gen AFTER all
+/// players publish.
 pub struct InfluenceScratch {
     pub city_positions: Vec<(f32, f32)>,
     pub player_influence: Vec<u16>,
-    pub territory: Vec<u8>,
     pub territory_max: Vec<u16>,
-    /// Reused per-player vision stamp buffer; `fill(false)`'d before each
-    /// player and cloned into the published Arc (no fresh alloc + zero-init).
-    pub vision: Vec<bool>,
+    pub vision_pool: HashMap<String, [Arc<Vec<bool>>; 2]>,
+    pub vision_gen: u8,
+    pub territory_pool: [Arc<Vec<u8>>; 2],
+    pub territory_gen: u8,
 }
 impl InfluenceScratch {
     pub fn new() -> Self {
         Self {
             city_positions: Vec::new(),
             player_influence: Vec::new(),
-            territory: Vec::new(),
             territory_max: Vec::new(),
-            vision: Vec::new(),
+            vision_pool: HashMap::new(),
+            vision_gen: 0,
+            territory_pool: [Arc::new(Vec::new()), Arc::new(Vec::new())],
+            territory_gen: 0,
         }
     }
     /// Grow the per-tick buffers to `grid_size` once (no-op when already sized).
+    /// Vision slots are eagerly sized to `grid_size` per player on first sight in `run`.
     fn ensure(&mut self, grid_size: usize) {
         if self.player_influence.len() != grid_size {
             self.player_influence.resize(grid_size, 0);
         }
-        if self.territory.len() != grid_size {
-            self.territory.resize(grid_size, NONE);
-        }
         if self.territory_max.len() != grid_size {
             self.territory_max.resize(grid_size, 0);
         }
-        if self.vision.len() != grid_size {
-            self.vision.resize(grid_size, false);
+        // Lazily size the territory double-buffer slots (one-time ~1 MB alloc
+        // per slot); steady-state ticks are a no-op.
+        for slot in self.territory_pool.iter_mut() {
+            let v = Arc::make_mut(slot);
+            if v.len() != grid_size {
+                v.resize(grid_size, NONE);
+            }
         }
     }
 }
@@ -315,50 +331,83 @@ pub fn run(
     let mut sorted_players: Vec<&String> = ctx.units_by_player.keys().collect();
     sorted_players.sort();
 
-    // Size scratch buffers once; reset the territory accumulators for this run.
+    // Size scratch buffers once.
     scratch.ensure(grid_size);
-    scratch.territory.fill(NONE);
     scratch.territory_max.fill(0);
+    // The territory accumulator we fold into this run: the double-buffer slot
+    // at (1 - territory_gen), reset for this run.
+    let terr_gen = 1 - scratch.territory_gen as usize;
+    let terr = Arc::make_mut(&mut scratch.territory_pool[terr_gen]);
+    if terr.len() != grid_size {
+        terr.resize(grid_size, NONE);
+    }
+    terr.fill(NONE);
 
-    let mut updated_vision: HashMap<String, Vec<bool>> =
+    let mut updated_vision: HashMap<String, Arc<Vec<bool>>> =
         HashMap::with_capacity(sorted_players.len());
+    let vision_gen = scratch.vision_gen as usize;
 
     for (idx, &player_id) in sorted_players.iter().enumerate() {
         let units = ctx.units_by_player.get(player_id).unwrap();
-        // Compute into the reused scratch buffers (disjoint field borrows).
-        // Vision is stamped into `scratch.vision`, then cloned into the
-        // published HashMap (one clone per player per dirty tick, no fresh
-        // alloc + zero-init).
-        compute_player(
-            &mut scratch.city_positions,
-            &terrain_grid,
-            player_id,
-            units,
-            &ctx.cities,
-            settings,
-            w,
-            h,
-            &mut scratch.player_influence,
-            &mut scratch.vision[..],
-        );
+        // Vision: stamp into the double-buffered per-player slot (1 - vision_gen).
+        // Both slots are eagerly sized to `grid_size` on first sight of the player
+        // (a one-time alloc per slot), so a single dirty run fully allocates the
+        // pool and later runs are allocation-free.
+        let pair = scratch
+            .vision_pool
+            .entry(player_id.clone())
+            .or_insert_with(|| {
+                [
+                    Arc::new(vec![false; grid_size]),
+                    Arc::new(vec![false; grid_size]),
+                ]
+            });
+        let slot_gen = 1 - vision_gen;
+        {
+            let slot = Arc::make_mut(&mut pair[slot_gen]);
+            if slot.len() != grid_size {
+                slot.resize(grid_size, false);
+            }
+            compute_player(
+                &mut scratch.city_positions,
+                &terrain_grid,
+                player_id,
+                units,
+                &ctx.cities,
+                settings,
+                w,
+                h,
+                &mut scratch.player_influence,
+                &mut slot[..],
+            );
+        }
         // A1: fold this player's influence straight into the running territory
-        // (index = sorted position), then discard the buffer.
+        // (index = sorted position), then discard the influence buffer.
         fold_influence_into(
-            &mut scratch.territory,
+            terr,
             &mut scratch.territory_max,
             &scratch.player_influence,
             idx as u8,
         );
-        updated_vision.insert(player_id.clone(), scratch.vision.clone());
+        // Publish a clone of the slot's Arc (steady state: in-place fill, so a
+        // cheap refcount bump, not a ~1 MB grid clone).
+        updated_vision.insert(player_id.clone(), Arc::clone(&pair[slot_gen]));
     }
 
     // Publish. `borders.grids` is production-dead (only `#[cfg(test)]` reads it)
     // and is no longer written; the per-player influence grids are folded above
-    // and discarded. Territory is cloned into a fresh Arc since the world owns it.
+    // and discarded. The outer vision HashMap + per-player String keys are
+    // intentionally fresh (a few KB with ≤ a handful of players); the inner
+    // grids are the reused pool slots.
     if let Some(wb) = world.world_data_mut(ctx.world_entity) {
         wb.vision.grids = Arc::new(updated_vision);
-        wb.territory.grid = Arc::new(scratch.territory.clone());
+        wb.territory.grid = Arc::clone(&scratch.territory_pool[terr_gen]);
     }
+
+    // Flip the gen after all players publish, so the next dirty run writes the
+    // other (now-unpublished) slot — the double-buffer invariant.
+    scratch.vision_gen ^= 1;
+    scratch.territory_gen ^= 1;
 }
 
 #[cfg(test)]

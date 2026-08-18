@@ -19,6 +19,10 @@ struct MovementChange {
     new_path: Option<UnitPath>,
     new_org: Option<f32>,
     moved: bool,
+    /// When the unit reached its first waypoint, the apply phase pops the head
+    /// of the path in place (avoids the per-waypoint SmallVec clone + O(path)
+    /// remove(0) memmove in phase 1). Never set together with a Some(new_path).
+    pop_head: bool,
 }
 
 /// Pre-allocated mover record for spatialty — `.clear()`'d each tick, capacity
@@ -31,6 +35,10 @@ struct MovementChange {
 pub struct MovementScratch {
     /// Units that moved this tick: (entity, pre-move pos, post-move pos).
     pub movers: Vec<(hecs::Entity, UnitPosition, UnitPosition)>,
+    /// Per-unit computed changes, cleared and reused each tick (capacity
+    /// preserved so steady-state ticks do not grow/allocate the Vec). Private
+    /// because `MovementChange` is module-private. (Compile rule R1.)
+    changes: Vec<(hecs::Entity, MovementChange)>,
 }
 
 /// Returns the number of units that moved this tick.
@@ -65,40 +73,43 @@ pub fn run(
     // into `settings.unit_types`) built once per `Game` — no per-tick HashMap build.
     let t1 = Instant::now();
 
-    // Phase 1: query all components, compute movement changes
-    let changes: Vec<(hecs::Entity, MovementChange)> = world
-        .query::<(
-            Entity,
-            &UnitPosition,
-            &UnitPath,
-            &UnitFlags,
-            &UnitTypeId,
-            &UnitStats,
-            &UnitEquipment,
-        )>()
-        .iter()
-        .filter_map(|(entity, pos, path, flags, utype, stats, equipment)| {
-            if path.path.is_empty() || flags.on_water {
-                return None;
-            }
-            compute_movement(
-                *pos,
-                path,
-                utype,
-                stats,
-                equipment,
-                &terrain,
-                terrain_width,
-                unit_types_index,
-                settings,
-            )
-            .map(|change| (entity, change))
-        })
-        .collect();
+    // Phase 1: query all components, compute movement changes into the reused
+    // scratch buffer so steady-state ticks do not grow/allocate the Vec.
+    scratch.changes.clear();
+    scratch.changes.extend(
+        world
+            .query::<(
+                Entity,
+                &UnitPosition,
+                &UnitPath,
+                &UnitFlags,
+                &UnitTypeId,
+                &UnitStats,
+                &UnitEquipment,
+            )>()
+            .iter()
+            .filter_map(|(entity, pos, path, flags, utype, stats, equipment)| {
+                if path.path.is_empty() || flags.on_water {
+                    return None;
+                }
+                compute_movement(
+                    *pos,
+                    path,
+                    utype,
+                    stats,
+                    equipment,
+                    &terrain,
+                    terrain_width,
+                    unit_types_index,
+                    settings,
+                )
+                .map(|change| (entity, change))
+            }),
+    );
 
     // Phase 2: apply changes
     // Only units that actually moved count as movers (drives spatialty).
-    let mover_count = changes.iter().filter(|(_, c)| c.moved).count();
+    let mover_count = scratch.changes.iter().filter(|(_, c)| c.moved).count();
     let t2 = Instant::now();
     // Get map bounds for clamping
     let (map_w, map_h) = match world.world_data(world_entity) {
@@ -106,7 +117,8 @@ pub fn run(
         None => return 0,
     };
 
-    for (entity, change) in changes {
+    for (entity, change) in &scratch.changes {
+        let entity = *entity;
         if change.moved {
             // Record this mover for spatialty: (entity, pre-move pos, post-move
             // pos). Spatialty uses these directly for hash remove/insert, so no
@@ -120,9 +132,19 @@ pub fn run(
             mpos.x = change.new_pos.x.clamp(0.0, map_w - 1.0);
             mpos.y = change.new_pos.y.clamp(0.0, map_h - 1.0);
         }
-        if let Some(new_path) = change.new_path {
+        if let Some(new_path) = &change.new_path {
             if let Ok((mpath,)) = world.query_one_mut::<(&mut UnitPath,)>(entity) {
-                *mpath = new_path;
+                *mpath = (*new_path).clone();
+            }
+        } else if change.pop_head {
+            // Reached first waypoint: pop the head of the path in place. Guarded
+            // + asserted because compute only sets pop_head after `path.first()?`
+            // succeeded and no other system writes UnitPath mid-tick.
+            if let Ok((mpath,)) = world.query_one_mut::<(&mut UnitPath,)>(entity) {
+                debug_assert!(!mpath.path.is_empty());
+                if !mpath.path.is_empty() {
+                    mpath.path.remove(0);
+                }
             }
         }
         if let Some(new_org) = change.new_org {
@@ -187,11 +209,10 @@ fn compute_movement(
         }
     }
 
-    let (new_pos, new_path) = if dist < speed {
-        // Reached waypoint
-        let mut new_path_copy = (*path).clone();
-        new_path_copy.path.remove(0);
-        (UnitPosition { x: *nx, y: *ny }, Some(new_path_copy))
+    let (new_pos, new_path, pop_head) = if dist < speed {
+        // Reached waypoint: pop the head of the path in the apply phase (no
+        // SmallVec copy here, no O(path) remove(0) memmove in phase 1).
+        (UnitPosition { x: *nx, y: *ny }, None, true)
     } else {
         // Moving towards waypoint
         let ratio = speed / dist;
@@ -201,6 +222,7 @@ fn compute_movement(
                 y: pos.y + dy * ratio,
             },
             None,
+            false,
         )
     };
 
@@ -223,6 +245,7 @@ fn compute_movement(
         new_path,
         new_org,
         moved: actually_moved,
+        pop_head,
     })
 }
 
@@ -426,8 +449,10 @@ mod tests {
         let change = change.unwrap();
         assert_eq!(change.new_pos.x, 5.05);
         assert_eq!(change.new_pos.y, 5.0);
-        assert!(change.new_path.is_some());
-        assert!(change.new_path.unwrap().path.is_empty());
+        // Reaching a waypoint now pops the path head in the apply phase rather
+        // than materializing a cloned path here.
+        assert!(change.new_path.is_none());
+        assert!(change.pop_head);
         assert!(change.moved);
     }
 

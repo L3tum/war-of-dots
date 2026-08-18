@@ -178,6 +178,8 @@ pub struct Game {
     /// Pre-allocated movement scratch, cleared and reused each tick. Holds the
     /// mover records that movement system uses.
     movement_scratch: systems::movement::MovementScratch,
+    /// Pre-allocated water scratch, cleared and reused each tick.
+    water_scratch: systems::water::WaterScratch,
     /// Number of units that moved in the most recent tick (from movement.rs).
     /// Used by benchmark/status reporting to gauge spatialty work.
     last_mover_count: usize,
@@ -209,6 +211,8 @@ pub struct Game {
     encirclement_dirty: bool,
     /// Pre-allocated influence scratch, cleared and reused each influence run.
     influence_scratch: systems::influence::InfluenceScratch,
+    /// Pre-allocated death-cleanup scratch, cleared and reused each run.
+    death_cleanup_scratch: systems::death_cleanup::DeathCleanupScratch,
 }
 
 /// Neighbour-graph snapshot: how nearby_enemies left the world this tick.
@@ -508,6 +512,7 @@ impl Game {
             encirclement_scratch: systems::encirclement::EncirclementScratch::new(),
             economy_earned: Vec::new(),
             movement_scratch: systems::movement::MovementScratch::default(),
+            water_scratch: systems::water::WaterScratch::default(),
             last_mover_count: 0,
             last_engaged_pairs: 0,
             ctx,
@@ -516,6 +521,7 @@ impl Game {
             influence_dirty: true,
             encirclement_dirty: true,
             influence_scratch: systems::influence::InfluenceScratch::new(),
+            death_cleanup_scratch: systems::death_cleanup::DeathCleanupScratch::default(),
         }
     }
 
@@ -699,7 +705,7 @@ impl Game {
             "water",
             &mut self.world,
             self.world_entity,
-            systems::water::run(&mut self.world, self.world_entity)
+            systems::water::run(&mut self.world, self.world_entity, &mut self.water_scratch)
         );
 
         // Movement returns count of units that moved this tick.
@@ -874,18 +880,19 @@ impl Game {
             Vec::new()
         };
 
-        // Unified death cleanup: chain all dead entities from combat, attrition, and surrender
-        let all_dead: Vec<hecs::Entity> = combat_dead
-            .into_iter()
-            .chain(supply_dead)
-            .chain(surrender_dead)
-            .collect();
-
+        // Unified death cleanup: process dead entities from combat, attrition,
+        // and surrender (order preserved for determinism) via slice views so no
+        // fresh `all_dead` Vec is collected each tick.
         let death_count = tick_system!(
             "death_cleanup",
             &mut self.world,
             self.world_entity,
-            systems::death_cleanup::run(&mut self.world, all_dead, &mut self.entity_reverse,)
+            systems::death_cleanup::run(
+                &mut self.world,
+                &[&combat_dead[..], &supply_dead[..], &surrender_dead[..]],
+                &mut self.entity_reverse,
+                &mut self.death_cleanup_scratch,
+            )
         );
 
         // Dead entities are despawned from the ECS — stale owner map entries are

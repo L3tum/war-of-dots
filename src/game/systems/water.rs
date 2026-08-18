@@ -20,29 +20,46 @@ enum WaterChange {
     },
 }
 
-pub fn run(world: &mut World, world_entity: hecs::Entity) {
-    // Phase 1: query all components, compute changes
-    let changes: Vec<(hecs::Entity, WaterChange)> = world
-        .query::<(
-            hecs::Entity,
-            &UnitWaterTransition,
-            &UnitFlags,
-            &UnitPosition,
-        )>()
-        .iter()
-        .filter_map(|(entity, wt, flags, pos)| compute_water_change(entity, wt, flags, pos))
-        .collect();
+/// Grow-only scratch buffer owned by `Game`, reused each tick. The `changes`
+/// field is module-private (`WaterChange` is private) so only `run` touches it;
+/// `Game` merely passes `&mut WaterScratch`. (Compile rule R1.)
+pub struct WaterScratch {
+    changes: Vec<(hecs::Entity, WaterChange)>,
+}
+
+impl Default for WaterScratch {
+    fn default() -> Self {
+        Self { changes: Vec::new() }
+    }
+}
+
+pub fn run(world: &mut World, world_entity: hecs::Entity, scratch: &mut WaterScratch) {
+    // Phase 1: query all components, compute changes into the reused scratch
+    // buffer so steady-state ticks do not grow/allocate the Vec.
+    scratch.changes.clear();
+    scratch.changes.extend(
+        world
+            .query::<(
+                hecs::Entity,
+                &UnitWaterTransition,
+                &UnitFlags,
+                &UnitPosition,
+            )>()
+            .iter()
+            .filter_map(|(entity, wt, flags, pos)| compute_water_change(entity, wt, flags, pos)),
+    );
 
     // Phase 2: apply changes
-    for (entity, change) in changes {
+    for (entity, change) in scratch.changes.iter() {
+        let entity = *entity;
         match change {
             WaterChange::Timer { new_wt, new_flags } => {
                 if let Ok((mwt,)) = world.query_one_mut::<(&mut UnitWaterTransition,)>(entity) {
-                    *mwt = new_wt;
+                    *mwt = (*new_wt).clone();
                 }
                 if let Some(new_flags) = new_flags {
                     if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
-                        *mf = new_flags;
+                        *mf = *new_flags;
                     }
                 }
             }
@@ -55,7 +72,7 @@ pub fn run(world: &mut World, world_entity: hecs::Entity) {
                     if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
                         mf.on_water = false;
                     }
-                } else if !current_on_water {
+                } else if !*current_on_water {
                     if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
                         mf.on_water = true;
                     }

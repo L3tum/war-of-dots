@@ -8,27 +8,48 @@ use std::collections::HashMap;
 
 use crate::game::components::NearbyEnemies;
 
+/// Grow-only scratch for death cleanup: the dead-entity set is `clear()`'d each
+/// run (capacity preserved), so a death-spike tick's size is retained and later
+/// spikes free the HashSet rebuild + 3-way collect. `clear()` keeps capacity.
+#[derive(Default)]
+pub struct DeathCleanupScratch {
+    pub dead_set: std::collections::HashSet<hecs::Entity>,
+}
+
 pub fn run(
     world: &mut hecs::World,
-    all_dead: Vec<hecs::Entity>,
+    dead_lists: &[&[hecs::Entity]],
     entity_reverse: &mut HashMap<hecs::Entity, String>,
+    scratch: &mut DeathCleanupScratch,
 ) -> usize {
-    if all_dead.is_empty() {
+    if dead_lists.iter().all(|l| l.is_empty()) {
         return 0;
     }
 
-    let dead_count = all_dead.len();
-    let dead_set: std::collections::HashSet<hecs::Entity> = all_dead.iter().copied().collect();
+    // Sum of list lengths — do NOT dedupe. An entity appearing in two lists is
+    // `entity_reverse.remove`+`despawn`'d twice (second `.ok()`-swallowed) and
+    // counted twice, matching the pre-change semantics. List order is preserved
+    // (combat -> supply -> surrender) so processing is bit-identical.
+    let dead_count: usize = dead_lists.iter().map(|l| l.len()).sum();
+
+    scratch.dead_set.clear();
+    for list in dead_lists {
+        for e in *list {
+            scratch.dead_set.insert(*e);
+        }
+    }
 
     // Clean NearbyEnemies references (single pass, O(total entries) amortized)
     for (_entity, nearby) in world.query::<(hecs::Entity, &mut NearbyEnemies)>().iter() {
-        nearby.entities.retain(|e| !dead_set.contains(e));
+        nearby.entities.retain(|e| !scratch.dead_set.contains(e));
     }
 
     // Despawn + cleanup entity registry (despawn removes all components)
-    for dead in &all_dead {
-        entity_reverse.remove(dead);
-        world.despawn(*dead).ok();
+    for list in dead_lists {
+        for dead in *list {
+            entity_reverse.remove(dead);
+            world.despawn(*dead).ok();
+        }
     }
 
     dead_count
@@ -70,7 +91,9 @@ mod tests {
         }
 
         let mut entity_reverse = HashMap::new();
-        run(&mut world, vec![dead1, dead2], &mut entity_reverse);
+        let mut scratch = DeathCleanupScratch::default();
+        let deads = [dead1, dead2];
+        run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
 
         // alive unit's NearbyEnemies should no longer contain dead entities
         let nearby = world.get::<&NearbyEnemies>(alive).unwrap();
@@ -99,8 +122,10 @@ mod tests {
         },));
 
         let mut entity_reverse = HashMap::new();
+        let mut scratch = DeathCleanupScratch::default();
+        let empty: Vec<hecs::Entity> = Vec::new();
         // Empty input should not affect anything
-        run(&mut world, vec![], &mut entity_reverse);
+        run(&mut world, &[&empty[..]], &mut entity_reverse, &mut scratch);
 
         // Entity should still exist
         assert!(
@@ -120,7 +145,9 @@ mod tests {
         let mut entity_reverse: HashMap<hecs::Entity, String> = HashMap::new();
         entity_reverse.insert(dead, "unit_123".to_string());
 
-        run(&mut world, vec![dead], &mut entity_reverse);
+        let mut scratch = DeathCleanupScratch::default();
+        let deads = [dead];
+        run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
 
         assert!(
             entity_reverse.is_empty(),

@@ -26,6 +26,21 @@ pub struct CombatScratch {
     fought: HashSet<hecs::Entity>,
     dead_set: HashSet<hecs::Entity>,
     dead: Vec<hecs::Entity>,
+    /// Candidate unit snapshots for this tick, cleared and reused each run
+    /// (capacity preserved). Named `candidate_units` (NOT `candidates`) to avoid
+    /// colliding with the `pub candidates: usize` diagnostic counter (compile
+    /// rule R2).
+    /// `NearbyEnemies` is deliberately NOT in this tuple: the resolution loop
+    /// re-reads each unit's nearby list live (a unit only ever attacks ONE enemy,
+    /// so cloning the full — often ~10KB+ in dense melees — list per candidate
+    /// was a ~7 MB/tick allocation hotspot).
+    pub candidate_units: Vec<(
+        hecs::Entity,
+        UnitPosition,
+        u8,
+        UnitStats,
+        UnitFlags,
+    )>,
     // Diagnostic counters (benchmark/status): reset each tick alongside clear().
     pub candidates: usize,
     pub attackers: usize,
@@ -42,6 +57,7 @@ impl CombatScratch {
             fought: HashSet::new(),
             dead_set: HashSet::new(),
             dead: Vec::new(),
+            candidate_units: Vec::new(),
             candidates: 0,
             attackers: 0,
             pairs_scanned: 0,
@@ -57,6 +73,7 @@ impl CombatScratch {
         self.fought.clear();
         self.dead_set.clear();
         self.dead.clear();
+        self.candidate_units.clear();
         self.candidates = 0;
         self.attackers = 0;
         self.pairs_scanned = 0;
@@ -83,31 +100,22 @@ impl Default for CombatScratch {
 // Attrition Helper
 // ============================================================================
 
-/// Build the post-combat equipment array for a unit taking `dmg`, or `None` when
-/// there is no damage to apply or the unit carries no equipment. Only allocates
-/// when the equipment actually changes.
-fn attrition_from(
-    eq: &UnitEquipment,
-    dmg: f32,
-    attr_rate: f32,
-) -> Option<Vec<crate::game::unit::Equipment>> {
+/// Apply equipment attrition to `eq` **in place**, reducing each item's `count`.
+/// Returns `false` (leaving `eq` untouched) when there is no damage to apply or
+/// the unit carries no equipment — preserving `attrition_from`'s `Option`
+/// contract. Attrition never adds/removes items or changes `name`/`max_count`/
+/// `cost_per_item`, so an in-place count update is bit-identical to the old
+/// "build a fresh `Vec<Equipment>` and reassign" path, but allocates **nothing**
+/// (no `Vec` buffer, no per-item `name` `String` clone).
+fn attrition_in_place(eq: &mut UnitEquipment, dmg: f32, attr_rate: f32) -> bool {
     if dmg <= 0.0 || eq.equipment.is_empty() {
-        return None;
+        return false;
     }
-    Some(
-        eq.equipment
-            .iter()
-            .map(|e| {
-                let loss = (dmg * attr_rate).min(e.count as f32);
-                crate::game::unit::Equipment {
-                    name: e.name.clone(),
-                    count: (e.count as f32 - loss).max(0.0) as u32,
-                    max_count: e.max_count,
-                    cost_per_item: e.cost_per_item,
-                }
-            })
-            .collect(),
-    )
+    for e in eq.equipment.iter_mut() {
+        let loss = (dmg * attr_rate).min(e.count as f32);
+        e.count = (e.count as f32 - loss).max(0.0) as u32;
+    }
+    true
 }
 
 // ============================================================================
@@ -175,39 +183,37 @@ pub fn run(
     // it has any enemy in its NearbyEnemies list (`attacking`/`fighting` add
     // movers + previously-engaged units). This is what keeps two adjacent units
     // fighting every tick even when neither moved.
-    let candidates: Vec<(
-        hecs::Entity,
-        UnitPosition,
-        u8,
-        UnitStats,
-        UnitFlags,
-        NearbyEnemies,
-    )> = world
-        .query::<(
-            Entity,
-            &UnitPosition,
-            &UnitFlags,
-            &UnitStats,
-            &NearbyEnemies,
-        )>()
+    scratch.candidate_units.clear();
+    scratch.candidate_units.extend(
+        world
+            .query::<(
+                Entity,
+                &UnitPosition,
+                &UnitFlags,
+                &UnitStats,
+                &NearbyEnemies,
+            )>()
+            .iter()
+            .filter(|(_, _, flags, stats, nearby)| {
+                stats.men > 0.0 && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
+            })
+            .filter_map(|(e, pos, flags, stats, _nearby)| {
+                debug_assert!(
+                    ctx.owner_id_by_entity.contains_key(&e),
+                    "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                    e
+                );
+                let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
+                // No `nearby.clone()`: store just the entity; the resolution loop
+                // re-reads the nearby list live (see candidate_units doc).
+                Some((e, *pos, owner_id, *stats, *flags))
+            }),
+    );
+    scratch.candidates = scratch.candidate_units.len();
+    scratch.attackers = scratch
+        .candidate_units
         .iter()
-        .filter(|(_, _, flags, stats, nearby)| {
-            stats.men > 0.0 && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
-        })
-        .filter_map(|(e, pos, flags, stats, nearby)| {
-            debug_assert!(
-                ctx.owner_id_by_entity.contains_key(&e),
-                "entity {:?} missing from owner_id_by_entity — TickContext stale?",
-                e
-            );
-            let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
-            Some((e, *pos, owner_id, *stats, *flags, nearby.clone()))
-        })
-        .collect();
-    scratch.candidates = candidates.len();
-    scratch.attackers = candidates
-        .iter()
-        .filter(|(_, _, _, _, flags, _)| flags.attacking)
+        .filter(|(_, _, _, _, flags)| flags.attacking)
         .count();
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     _t_ue.finish(world, world_entity);
@@ -219,260 +225,279 @@ pub fn run(
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_stats = crate::game::debug_stats::DetailedTimer::new("combat/stats_update");
 
-    for (entity1, pos1, owner1, _, _, nearby) in &candidates {
+    for (entity1, pos1, owner1, _, _) in &scratch.candidate_units {
         // A unit that died during this tick (as a defender) should not go on to
         // attack other enemies in the same tick.
         if scratch.dead_set.contains(entity1) {
             continue;
         }
 
-        for entity2 in nearby.entities.iter().copied() {
-            scratch.pairs_scanned += 1;
-            if entity2 == *entity1 {
-                continue;
-            }
-
-            // Resolve each normalized (entity1, entity2) pair at most once per tick,
-            // so the same two units never fight twice. Each unit makes at most ONE
-            // attack per tick (classic RTS model): a full "every adjacent pair"
-            // resolution was O(n^2) in dense melees and dominated the tick budget.
-            // Units can still be *attacked* by many enemies — see the `break` below.
-            let pair = if entity1.id() < entity2.id() {
-                (*entity1, entity2)
-            } else {
-                (entity2, *entity1)
-            };
-            if scratch.resolved.contains(&pair) {
-                scratch.pairs_already_resolved += 1;
-                continue;
-            }
-
-            // Same-owner check via shared TickContext lookup (O(1) u8 equality,
-            // no per-pair ECS borrow + String comparison).
-            let same_owner = match ctx.owner_id_by_entity.get(&entity2) {
-                Some(other_id) => *owner1 == *other_id,
-                None => {
-                    debug_assert!(
-                        false,
-                        "entity {:?} missing from owner_id_by_entity during same-owner check",
-                        entity2
-                    );
-                    continue;
-                }
-            };
-            if same_owner {
-                scratch.pairs_same_owner += 1;
-                continue;
-            }
-
-            let pos2 = match world.get::<&UnitPosition>(entity2) {
-                Ok(p) => *p,
+        // Find the first enemy entity1 attacks this tick. Every check in the scan
+        // is a read (ctx / scratch / world.get), so we hold the immutable
+        // `world.get(&NearbyEnemies)` borrow across the whole scan and drop it at
+        // the block's end — BEFORE any mutation below. (The candidate snapshot no
+        // longer clones the full NearbyEnemies list; each unit only ever attacks
+        // ONE enemy, so cloning the whole — often ~10KB+ in dense melees — list
+        // per candidate was a ~7 MB/tick allocation hotspot.)
+        let target: Option<Entity> = {
+            let nearby = match world.get::<&NearbyEnemies>(*entity1) {
+                Ok(n) => n,
                 Err(_) => continue,
             };
-            // Squared distance check — avoids sqrt()
-            let dx = pos1.x - pos2.x;
-            let dy = pos1.y - pos2.y;
-            let dist_sq = dx * dx + dy * dy;
-            if dist_sq >= crate::game::constants::COMBAT_RANGE_SQ {
-                scratch.pairs_out_of_range += 1;
-                continue;
-            }
-
-            // Mark that entity1 fought someone this tick (tracked via scratch.fought,
-            // which is already populated below)
-
-            // Re-fetch entity1's CURRENT stats/flags before attacking. A unit may
-            // have already taken damage this tick (attacked by another unit before
-            // its own turn), so the stale candidate snapshot would overwrite that
-            // accumulated damage instead of building on it.
-            let (s1, f1) = {
+            let mut found: Option<Entity> = None;
+            for &entity2 in nearby.entities.iter() {
+                scratch.pairs_scanned += 1;
+                if entity2 == *entity1 {
+                    continue;
+                }
+                // Resolve each normalized (entity1, entity2) pair at most once per
+                // tick, so the same two units never fight twice.
+                let pair = if entity1.id() < entity2.id() {
+                    (*entity1, entity2)
+                } else {
+                    (entity2, *entity1)
+                };
+                if scratch.resolved.contains(&pair) {
+                    scratch.pairs_already_resolved += 1;
+                    continue;
+                }
+                // Same-owner check via shared TickContext lookup (O(1) u8 equality,
+                // no per-pair ECS borrow + String comparison).
+                let same_owner = match ctx.owner_id_by_entity.get(&entity2) {
+                    Some(other_id) => *owner1 == *other_id,
+                    None => {
+                        debug_assert!(
+                            false,
+                            "entity {:?} missing from owner_id_by_entity during same-owner check",
+                            entity2
+                        );
+                        continue;
+                    }
+                };
+                if same_owner {
+                    scratch.pairs_same_owner += 1;
+                    continue;
+                }
+                let pos2 = match world.get::<&UnitPosition>(entity2) {
+                    Ok(p) => *p,
+                    Err(_) => continue,
+                };
+                // Squared distance check — avoids sqrt()
+                let dx = pos1.x - pos2.x;
+                let dy = pos1.y - pos2.y;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq >= crate::game::constants::COMBAT_RANGE_SQ {
+                    scratch.pairs_out_of_range += 1;
+                    continue;
+                }
+                // Re-fetch entity1's CURRENT stats: it may have taken damage from an
+                // earlier engagement this tick. If it died, stop attacking.
                 let s1 = match world.get::<&UnitStats>(*entity1) {
                     Ok(s) => *s,
                     Err(_) => break,
                 };
                 if s1.men <= 0.0 {
-                    // Entity1 died to an earlier engagement this tick — stop attacking.
                     break;
                 }
-                let f1 = match world.get::<&UnitFlags>(*entity1) {
-                    Ok(f) => *f,
-                    Err(_) => break,
-                };
-                (s1, f1)
-            };
-
-            let s2 = match world.get::<&UnitStats>(entity2) {
-                Ok(s) => *s,
-                Err(_) => continue,
-            };
-            let f2 = match world.get::<&UnitFlags>(entity2) {
-                Ok(f) => *f,
-                Err(_) => continue,
-            };
-
-            let a_soft = 10.0
-                * (s1.men / s1.max_men.max(0.1))
-                * (s1.organisation / 100.0)
-                * if f1.on_water { 0.75 } else { 1.0 };
-            let d_soft = 10.0
-                * (s2.men / s2.max_men.max(0.1))
-                * (s2.organisation / 100.0)
-                * if f2.on_water { 0.75 } else { 1.0 };
-
-            // a_eff: attacker's offensive strength relative to defender's defense
-            // Higher a_eff means defender takes more damage
-            let a_eff = a_soft / (d_soft + 0.1);
-            // d_eff: defender's counter-attack strength relative to attacker's offense
-            // Higher d_eff means attacker takes more damage from counter-attack
-            let d_eff = d_soft / (a_soft + 0.1);
-
-            // Under-supplied units fight less effectively: strength scales with
-            // equipment carried vs required (0% equipment → 40% strength; 100%+
-            // → full). This punishes armies whose supply lines can't keep them
-            // equipped.
-            let (a_eff_malus, d_eff_malus) = {
-                let (eq1, eq2) = match (
-                    world.get::<&UnitEquipment>(*entity1),
-                    world.get::<&UnitEquipment>(entity2),
-                ) {
-                    (Ok(a), Ok(b)) => (a, b),
-                    _ => continue,
-                };
-                (equipment_effectiveness(&eq1), equipment_effectiveness(&eq2))
-            };
-
-            // Each unit uses the terrain it stands on — fixes asymmetry where both
-            // sides would get the attacker's terrain modifier.
-            let a_terrain = terrain
-                .get((pos1.y as usize) * terrain_w + (pos1.x as usize))
-                .copied()
-                .unwrap_or(crate::game::unit::Terrain::Plains);
-            let d_terrain = terrain
-                .get((pos2.y as usize) * terrain_w + (pos2.x as usize))
-                .copied()
-                .unwrap_or(crate::game::unit::Terrain::Plains);
-            let a_terrain_mod = terrain_modifier(&a_terrain);
-            let d_terrain_mod = terrain_modifier(&d_terrain);
-
-            // dmg_to_defender: damage applied TO the defender (based on attacker effectiveness)
-            let dmg_to_defender = a_eff * a_terrain_mod * 5.0 * a_eff_malus;
-            // dmg_to_attacker: damage applied TO the attacker (based on defender's counter-attack)
-            let dmg_to_attacker = d_eff * d_terrain_mod * 5.0 * d_eff_malus;
-
-            let a_men = (s1.men - dmg_to_attacker).max(0.0);
-            let d_men = (s2.men - dmg_to_defender).max(0.0);
-
-            // Fetch both units' unit-type configs for attrition rates. Uses the
-            // cached index so this is O(1) per engagement.
-            let (a_attr_rate, d_attr_rate) = {
-                let a_rate = world
-                    .get::<&UnitTypeId>(*entity1)
-                    .ok()
-                    .and_then(|ut| {
-                        unit_types_index
-                            .get(&ut.name)
-                            .map(|&i| &settings.unit_types[i])
-                    })
-                    .map(|ut| ut.fighting_attrition)
-                    .unwrap_or(1.0);
-                let d_rate = world
-                    .get::<&UnitTypeId>(entity2)
-                    .ok()
-                    .and_then(|ut| {
-                        unit_types_index
-                            .get(&ut.name)
-                            .map(|&i| &settings.unit_types[i])
-                    })
-                    .map(|ut| ut.fighting_attrition)
-                    .unwrap_or(1.0);
-                (a_rate, d_rate)
-            };
-
-            // Fetch both units' equipment once (borrowed, no deep clone). The pair
-            // is only resolved when both units carry an equipment component — same
-            // conditional as before, without the intermediate full clones. The
-            // borrows are scoped to this block so they (and their Drop guards) are
-            // released before the mutation writes below.
-            let (a_eq, d_eq) = {
-                let (eq1, eq2) = match (
-                    world.get::<&UnitEquipment>(*entity1),
-                    world.get::<&UnitEquipment>(entity2),
-                ) {
-                    (Ok(a), Ok(b)) => (a, b),
-                    _ => continue,
-                };
-                (
-                    attrition_from(&eq1, dmg_to_attacker, a_attr_rate),
-                    attrition_from(&eq2, dmg_to_defender, d_attr_rate),
-                )
-            };
-
-            if let Ok((ms, me, mf)) = world
-                .query_one_mut::<(&mut UnitStats, &mut UnitEquipment, &mut UnitFlags)>(*entity1)
-            {
-                ms.men = a_men;
-                // Org loss proportional to men lost in this engagement.
-                let a_men_lost = s1.men - a_men;
-                let a_org_loss = 10.0 * (a_men_lost / s1.men.max(0.1));
-                ms.organisation = (ms.organisation - a_org_loss).max(0.0);
-                if let Some(a_eq) = a_eq {
-                    me.equipment = a_eq;
+                // Presence-only checks (values re-fetched in the resolve phase).
+                if world.get::<&UnitFlags>(*entity1).is_err() {
+                    break;
                 }
-                // Combat consumes supply proportional to damage taken
-                let supply_loss = (dmg_to_attacker * a_attr_rate).max(1.0);
-                me.supply = (me.supply - supply_loss).max(0.0);
-                mf.fighting = true;
-            }
-            if let Ok((ms, me, mf)) =
-                world.query_one_mut::<(&mut UnitStats, &mut UnitEquipment, &mut UnitFlags)>(entity2)
-            {
-                ms.men = d_men;
-                // Org loss proportional to men lost in this engagement.
-                let d_men_lost = s2.men - d_men;
-                let d_org_loss = 10.0 * (d_men_lost / s2.men.max(0.1));
-                ms.organisation = (ms.organisation - d_org_loss).max(0.0);
-                if let Some(d_eq) = d_eq {
-                    me.equipment = d_eq;
+                if world.get::<&UnitStats>(entity2).is_err() {
+                    continue;
                 }
-                // Combat consumes supply proportional to damage taken
-                let supply_loss = (dmg_to_defender * d_attr_rate).max(1.0);
-                me.supply = (me.supply - supply_loss).max(0.0);
-                mf.fighting = true;
+                if world.get::<&UnitFlags>(entity2).is_err() {
+                    continue;
+                }
+                // Pair is only resolved when both units carry equipment (same skip
+                // semantics as the original effectiveness check's `_ => continue`).
+                if world.get::<&UnitEquipment>(*entity1).is_err()
+                    || world.get::<&UnitEquipment>(entity2).is_err()
+                {
+                    continue;
+                }
+                found = Some(entity2);
+                break;
             }
+            found
+        };
+        // Immutable `nearby` world borrow is dropped above — safe to mutate now.
+        let Some(entity2) = target else {
+            continue;
+        };
+        let pair = if entity1.id() < entity2.id() {
+            (*entity1, entity2)
+        } else {
+            (entity2, *entity1)
+        };
 
-            if a_men <= 0.0 {
-                scratch.dead.push(*entity1);
-                scratch.dead_set.insert(*entity1);
-            }
-            if d_men <= 0.0 {
-                scratch.dead.push(entity2);
-                scratch.dead_set.insert(entity2);
-            }
-
-            scratch.resolved.insert(pair);
-            scratch.fought.insert(*entity1);
-            scratch.fought.insert(entity2);
-
-            // Each unit makes at most ONE attack per tick (see the pair comment above);
-            // a unit can still be *attacked* — and take counter-damage from — many
-            // enemies within the same tick.
-            break;
+        // ---- Resolve the (entity1, entity2) engagement (mutation phase) ----
+        // Re-fetch the current stats/flags/position (identical to the scan's reads —
+        // no mutation happened between the scan and this resolve for entity1).
+        let s1 = match world.get::<&UnitStats>(*entity1) {
+            Ok(s) => *s,
+            Err(_) => continue,
+        };
+        if s1.men <= 0.0 {
+            continue;
         }
+        let f1 = match world.get::<&UnitFlags>(*entity1) {
+            Ok(f) => *f,
+            Err(_) => continue,
+        };
+        let s2 = match world.get::<&UnitStats>(entity2) {
+            Ok(s) => *s,
+            Err(_) => continue,
+        };
+        let f2 = match world.get::<&UnitFlags>(entity2) {
+            Ok(f) => *f,
+            Err(_) => continue,
+        };
+        let pos2 = match world.get::<&UnitPosition>(entity2) {
+            Ok(p) => *p,
+            Err(_) => continue,
+        };
+
+        let a_soft = 10.0
+            * (s1.men / s1.max_men.max(0.1))
+            * (s1.organisation / 100.0)
+            * if f1.on_water { 0.75 } else { 1.0 };
+        let d_soft = 10.0
+            * (s2.men / s2.max_men.max(0.1))
+            * (s2.organisation / 100.0)
+            * if f2.on_water { 0.75 } else { 1.0 };
+
+        // a_eff: attacker's offensive strength relative to defender's defense
+        let a_eff = a_soft / (d_soft + 0.1);
+        // d_eff: defender's counter-attack strength relative to attacker's offense
+        let d_eff = d_soft / (a_soft + 0.1);
+
+        // Under-supplied units fight less effectively (0% equipment → 40% strength;
+        // 100%+ → full). Both units are guaranteed to have equipment (checked in
+        // the scan), so this `_ => continue` is defensive.
+        let (a_eff_malus, d_eff_malus) = {
+            let (eq1, eq2) = match (
+                world.get::<&UnitEquipment>(*entity1),
+                world.get::<&UnitEquipment>(entity2),
+            ) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => continue,
+            };
+            (equipment_effectiveness(&eq1), equipment_effectiveness(&eq2))
+        };
+
+        // Each unit uses the terrain it stands on — fixes asymmetry where both
+        // sides would get the attacker's terrain modifier.
+        let a_terrain = terrain
+            .get((pos1.y as usize) * terrain_w + (pos1.x as usize))
+            .copied()
+            .unwrap_or(crate::game::unit::Terrain::Plains);
+        let d_terrain = terrain
+            .get((pos2.y as usize) * terrain_w + (pos2.x as usize))
+            .copied()
+            .unwrap_or(crate::game::unit::Terrain::Plains);
+        let a_terrain_mod = terrain_modifier(&a_terrain);
+        let d_terrain_mod = terrain_modifier(&d_terrain);
+
+        // dmg_to_defender: damage applied TO the defender (attacker effectiveness)
+        let dmg_to_defender = a_eff * a_terrain_mod * 5.0 * a_eff_malus;
+        // dmg_to_attacker: damage applied TO the attacker (defender counter-attack)
+        let dmg_to_attacker = d_eff * d_terrain_mod * 5.0 * d_eff_malus;
+
+        let a_men = (s1.men - dmg_to_attacker).max(0.0);
+        let d_men = (s2.men - dmg_to_defender).max(0.0);
+
+        // Fetch both units' unit-type configs for attrition rates (O(1) via index).
+        let (a_attr_rate, d_attr_rate) = {
+            let a_rate = world
+                .get::<&UnitTypeId>(*entity1)
+                .ok()
+                .and_then(|ut| {
+                    unit_types_index
+                        .get(&ut.name)
+                        .map(|&i| &settings.unit_types[i])
+                })
+                .map(|ut| ut.fighting_attrition)
+                .unwrap_or(1.0);
+            let d_rate = world
+                .get::<&UnitTypeId>(entity2)
+                .ok()
+                .and_then(|ut| {
+                    unit_types_index
+                        .get(&ut.name)
+                        .map(|&i| &settings.unit_types[i])
+                })
+                .map(|ut| ut.fighting_attrition)
+                .unwrap_or(1.0);
+            (a_rate, d_rate)
+        };
+
+        if let Ok((ms, me, mf)) = world
+            .query_one_mut::<(&mut UnitStats, &mut UnitEquipment, &mut UnitFlags)>(*entity1)
+        {
+            ms.men = a_men;
+            // Org loss proportional to men lost in this engagement.
+            let a_men_lost = s1.men - a_men;
+            let a_org_loss = 10.0 * (a_men_lost / s1.men.max(0.1));
+            ms.organisation = (ms.organisation - a_org_loss).max(0.0);
+            // Equipment attrition: reduce each item's count in place (no Vec
+            // buffer, no per-item name clone).
+            attrition_in_place(me, dmg_to_attacker, a_attr_rate);
+            // Combat consumes supply proportional to damage taken
+            let supply_loss = (dmg_to_attacker * a_attr_rate).max(1.0);
+            me.supply = (me.supply - supply_loss).max(0.0);
+            mf.fighting = true;
+        }
+        if let Ok((ms, me, mf)) =
+            world.query_one_mut::<(&mut UnitStats, &mut UnitEquipment, &mut UnitFlags)>(entity2)
+        {
+            ms.men = d_men;
+            // Org loss proportional to men lost in this engagement.
+            let d_men_lost = s2.men - d_men;
+            let d_org_loss = 10.0 * (d_men_lost / s2.men.max(0.1));
+            ms.organisation = (ms.organisation - d_org_loss).max(0.0);
+            attrition_in_place(me, dmg_to_defender, d_attr_rate);
+            // Combat consumes supply proportional to damage taken
+            let supply_loss = (dmg_to_defender * d_attr_rate).max(1.0);
+            me.supply = (me.supply - supply_loss).max(0.0);
+            mf.fighting = true;
+        }
+
+        if a_men <= 0.0 {
+            scratch.dead.push(*entity1);
+            scratch.dead_set.insert(*entity1);
+        }
+        if d_men <= 0.0 {
+            scratch.dead.push(entity2);
+            scratch.dead_set.insert(entity2);
+        }
+
+        scratch.resolved.insert(pair);
+        scratch.fought.insert(*entity1);
+        scratch.fought.insert(entity2);
+
+        // Each unit makes at most ONE attack per tick; it can still be *attacked*
+        // by many enemies (and take counter-damage) within the same tick.
     }
 
     // Retreat check: clear fighting for units that found no nearby enemy
     // Reads from NearbyEnemies component directly
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     let _t_retreat = crate::game::debug_stats::DetailedTimer::new("combat/retreat_check");
-    for (entity, _, _, _, flags, nearby) in &candidates {
+    for (entity, _, _, _, flags) in &scratch.candidate_units {
         if scratch.fought.contains(entity) {
             continue;
         }
         if !flags.fighting {
             continue;
         }
-        // If nearby entities exist, the unit has enemies — keep fighting
-        if !nearby.entities.is_empty() {
+        // If nearby entities exist, the unit has enemies — keep fighting. Re-read
+        // the nearby list live (no clone in the candidate snapshot).
+        let has_enemies = match world.get::<&NearbyEnemies>(*entity) {
+            Ok(n) => !n.entities.is_empty(),
+            Err(_) => false,
+        };
+        if has_enemies {
             continue;
         }
         if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(*entity) {
@@ -489,7 +514,10 @@ pub fn run(
         _t_stats.finish(world, world_entity);
     }
 
-    scratch.dead.clone()
+    // `take` empties `scratch.dead` but keeps its capacity, so the returned Vec
+    // (consumed by the caller's death cleanup) costs no allocation in steady
+    // state (mirror of supply.rs).
+    std::mem::take(&mut scratch.dead)
 }
 
 #[cfg(test)]

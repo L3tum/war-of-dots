@@ -1438,7 +1438,12 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         } else {
             format!("{:+.3}ms", change / 1_000_000.0)
         };
-        format!("<div class='delta' style='color:{color}'>{arrow}{val}</div>")
+        let pct = if prev.abs() > 1e-9 {
+            change / prev * 100.0
+        } else {
+            0.0
+        };
+        format!("<div class='delta' style='color:{color}'>{arrow}{val} ({pct:+.1}%)</div>")
     }
 
     // ms thresholds keep the previous 0.0005ms; count/rate thresholds per D8.
