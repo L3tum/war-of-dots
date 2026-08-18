@@ -99,20 +99,18 @@ impl InfluenceScratch {
     }
     /// Grow the per-tick buffers to `grid_size` once (no-op when already sized).
     /// Vision slots are eagerly sized to `grid_size` per player on first sight in `run`.
+    ///
+    /// The territory double-buffer is intentionally NOT sized here: `make_mut`-ing
+    /// a slot that is currently published to `wb.territory.grid` (refcount 2) would
+    /// clone the whole ~1 MB `Vec<u8>` on every dirty run. The write path instead
+    /// sizes the single back-buffer slot it uses (which is refcount 1 at write
+    /// time, so `make_mut` is in-place) — see `run`.
     fn ensure(&mut self, grid_size: usize) {
         if self.player_influence.len() != grid_size {
             self.player_influence.resize(grid_size, 0);
         }
         if self.territory_max.len() != grid_size {
             self.territory_max.resize(grid_size, 0);
-        }
-        // Lazily size the territory double-buffer slots (one-time ~1 MB alloc
-        // per slot); steady-state ticks are a no-op.
-        for slot in self.territory_pool.iter_mut() {
-            let v = Arc::make_mut(slot);
-            if v.len() != grid_size {
-                v.resize(grid_size, NONE);
-            }
         }
     }
 }

@@ -346,20 +346,38 @@ impl TickContext {
 
     /// Rebuild units_by_player from ECS (positions, entity set).
     /// Called just-in-time before influence/encirclement when positions have changed.
+    ///
+    /// Reuses the persistent map and does a *borrowed-key* lookup per unit
+    /// (`HashMap<String, V>::get_mut(&str)`), so no transient `String` is cloned
+    /// per unit. A `String` key is only allocated for a genuinely new player id
+    /// (rare in steady state). `Vec` capacity is preserved across rebuilds.
     pub fn rebuild_units_by_player(&mut self, world: &World) {
-        let mut new_units: HashMap<String, Vec<UnitHandle>> = HashMap::new();
+        for v in self.units_by_player.values_mut() {
+            v.clear();
+        }
 
-        for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
-            new_units
-                .entry(owner.player_id.clone())
-                .or_default()
+        for (entity, owner, pos) in world
+            .query::<(Entity, &UnitOwner, &UnitPosition)>()
+            .iter()
+        {
+            let pid = owner.player_id.as_str();
+            if self.units_by_player.get_mut(pid).is_none() {
+                // New player id this tick — insert a String key once.
+                self.units_by_player.entry(pid.to_string()).or_default();
+            }
+            self.units_by_player
+                .get_mut(pid)
+                .unwrap()
                 .push(UnitHandle {
                     entity,
                     pos: (*pos).as_tuple(),
                 });
         }
 
-        self.units_by_player = new_units;
+        // A player appears in units_by_player iff it has ≥1 unit this tick
+        // (matches the old fresh-HashMap semantics, where only players with
+        // units ever got a key).
+        self.units_by_player.retain(|_, v| !v.is_empty());
     }
 
     /// Combined rebuild of player_id_to_index, owner_id_by_entity, AND units_by_player
