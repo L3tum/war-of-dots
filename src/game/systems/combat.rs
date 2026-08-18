@@ -34,13 +34,7 @@ pub struct CombatScratch {
     /// re-reads each unit's nearby list live (a unit only ever attacks ONE enemy,
     /// so cloning the full — often ~10KB+ in dense melees — list per candidate
     /// was a ~7 MB/tick allocation hotspot).
-    pub candidate_units: Vec<(
-        hecs::Entity,
-        UnitPosition,
-        u8,
-        UnitStats,
-        UnitFlags,
-    )>,
+    pub candidate_units: Vec<(hecs::Entity, UnitPosition, u8, UnitStats, UnitFlags)>,
     // Diagnostic counters (benchmark/status): reset each tick alongside clear().
     pub candidates: usize,
     pub attackers: usize,
@@ -195,7 +189,8 @@ pub fn run(
             )>()
             .iter()
             .filter(|(_, _, flags, stats, nearby)| {
-                stats.men > 0.0 && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
+                stats.men > 0.0
+                    && (flags.attacking || flags.fighting || !nearby.entities.is_empty())
             })
             .filter_map(|(e, pos, flags, stats, _nearby)| {
                 debug_assert!(
@@ -432,8 +427,8 @@ pub fn run(
             (a_rate, d_rate)
         };
 
-        if let Ok((ms, me, mf)) = world
-            .query_one_mut::<(&mut UnitStats, &mut UnitEquipment, &mut UnitFlags)>(*entity1)
+        if let Ok((ms, me, mf)) =
+            world.query_one_mut::<(&mut UnitStats, &mut UnitEquipment, &mut UnitFlags)>(*entity1)
         {
             ms.men = a_men;
             // Org loss proportional to men lost in this engagement.

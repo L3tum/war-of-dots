@@ -23,14 +23,9 @@ enum WaterChange {
 /// Grow-only scratch buffer owned by `Game`, reused each tick. The `changes`
 /// field is module-private (`WaterChange` is private) so only `run` touches it;
 /// `Game` merely passes `&mut WaterScratch`. (Compile rule R1.)
+#[derive(Default)]
 pub struct WaterScratch {
     changes: Vec<(hecs::Entity, WaterChange)>,
-}
-
-impl Default for WaterScratch {
-    fn default() -> Self {
-        Self { changes: Vec::new() }
-    }
 }
 
 pub fn run(world: &mut World, world_entity: hecs::Entity, scratch: &mut WaterScratch) {

@@ -356,22 +356,16 @@ impl TickContext {
             v.clear();
         }
 
-        for (entity, owner, pos) in world
-            .query::<(Entity, &UnitOwner, &UnitPosition)>()
-            .iter()
-        {
+        for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
             let pid = owner.player_id.as_str();
             if self.units_by_player.get_mut(pid).is_none() {
                 // New player id this tick — insert a String key once.
                 self.units_by_player.entry(pid.to_string()).or_default();
             }
-            self.units_by_player
-                .get_mut(pid)
-                .unwrap()
-                .push(UnitHandle {
-                    entity,
-                    pos: (*pos).as_tuple(),
-                });
+            self.units_by_player.get_mut(pid).unwrap().push(UnitHandle {
+                entity,
+                pos: (*pos).as_tuple(),
+            });
         }
 
         // A player appears in units_by_player iff it has ≥1 unit this tick

@@ -1215,7 +1215,11 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 crate::game::systems::water::WaterScratch::default(),
             )
         },
-        |f: &mut (World, hecs::Entity, crate::game::systems::water::WaterScratch)| {
+        |f: &mut (
+            World,
+            hecs::Entity,
+            crate::game::systems::water::WaterScratch,
+        )| {
             crate::game::systems::water::run(&mut f.0, f.1, &mut f.2);
             black_box(0);
         },
