@@ -5,6 +5,7 @@ pub mod constants;
 pub mod debug_stats;
 #[allow(clippy::module_inception)]
 pub mod game;
+pub mod spatial;
 pub mod systems;
 pub mod world_ext;
 

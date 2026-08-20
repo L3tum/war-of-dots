@@ -1,279 +1,69 @@
-//! NearbyEnemies — grid-based neighbour rebuild every tick.
+//! NearbyEnemies — consume the movement-built spatial grid.
 //!
-//! Uses a coarse spatial grid (cell_size = COMBAT_RANGE = 2.0) so each unit only
-//! checks the ~1-5 entities in its 3×3 cell neighbourhood instead of every
-//! other unit. No HashMap-based SpatialHash, no incremental maintenance.
+//! `movement` builds a **post-move** spatial grid (see `spatial.rs`) and hands
+//! it off via `Game.grid_index_scratch`. This system does **not** rebuild the
+//! grid — it only runs the 3×3 enemy-collection query against it, filtering
+//! enemies within `COMBAT_DISTANCE` (circle intersection, `dist < 2×radius`),
+//! and writes each unit's `NearbyEnemies` list + the `attacking` flag.
 //!
-//! Pipeline:
-//!   1. Collect all unit data in one ECS query.
-//!   2. Build grid index: each cell stores (entity, position, owner_idx).
-//!   3. For each unit, query 3×3 cell neighbourhood, filter enemies within
-//!      COMBAT_RANGE using the owner index (no linear scan!), write NearbyEnemies
-//!      and `attacking` flag.
+//! Pipeline (per unit):
+//!   1. `spatial::for_each_within` over the grid (3×3 cell scan + dist² filter).
+//!   2. Skip self + same-owner (compact `owner_idx` u8 equality, no String
+//!      comparison, no per-pair ECS borrow).
+//!   3. Write `NearbyEnemies` (SmallVec field, in-place, no per-tick alloc once
+//!      capacity is sufficient) and, for movers only, the `attacking` flag.
 //!
-//! Complexity: O(n × c) where c ≈ entities per 3×3 cell neighbourhood.
-//! At game scale (500 units on 200×200 grid), c is very small (~2-3), so
-//! this is ~150-250 distance checks vs 250,000 for brute-force O(n²).
+//! Complexity: O(n × c) where c ≈ entities in the 3×3 neighbourhood. Because
+//! unit density is bounded by the occupancy rule (centers ≥ MIN_UNIT_DISTANCE
+//! apart), c is O(1) — this system stays cheap even at high unit counts.
 
 use crate::game::components::*;
-use crate::game::constants::COMBAT_RANGE_SQ;
-use crate::game::game::TickContext;
-use hecs::Entity;
+use crate::game::constants::COMBAT_DISTANCE_SQ;
+use crate::game::spatial::{self, GridIndexScratch};
 
-/// Cell size equals COMBAT_RANGE (sqrt(4.0) = 2.0).
-const CELL_SIZE: f32 = 2.0;
-
-/// Data stored per entity in a grid cell.
-/// owner_idx is the compact owner ID from TickContext (u8).
-/// Enables O(1) owner comparison with a single-byte integer equality.
-#[derive(Clone, Copy)]
-pub struct CellEntry {
-    entity: Entity,
-    pos: UnitPosition,
-    owner_idx: u8,
-}
-
-/// Coarse spatial grid: flat-buffer 1D array of cell buckets.
-/// Uses prefix-sum offsets + sizes instead of per-cell Vecs to reduce allocations.
-/// Reused flat-buffer spatial grid buffers, owned by `Game` and passed by
-/// `&mut` into `GridIndex::build`. `entries`/`cell_offsets`/`cell_sizes` are
-/// resized only on growth, so a steady-state tick does no heap allocation for
-/// the grid (the per-cell buffers are overwritten in place).
-pub struct GridIndexScratch {
-    pub entries: Vec<CellEntry>,
-    pub cell_offsets: Vec<usize>,
-    pub cell_sizes: Vec<usize>,
-    /// All-unit records for this tick, cleared and reused each run (capacity
-    /// preserved). All-pub element types, so a `pub` field is fine.
-    pub units: Vec<(Entity, UnitPosition, u8, bool)>,
-}
-
-impl GridIndexScratch {
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            cell_offsets: Vec::new(),
-            cell_sizes: Vec::new(),
-            units: Vec::new(),
-        }
-    }
-}
-
-impl Default for GridIndexScratch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Coarse spatial grid metadata: the cell bounds + dimensions. The dense
-/// buffers (entries/offsets/sizes) live in `GridIndexScratch` and are read
-/// directly by the caller after `build`.
-struct GridIndex {
-    min_x: i32,
-    min_y: i32,
-    width: usize,
-    height: usize,
-}
-
-impl GridIndex {
-    /// Build grid from units array, filling the reusable grid buffers passed by
-    /// mutable reference. `units` is borrowed disjointly from those buffers so
-    /// the caller can hold it (as `grid_scratch.units`) while `build` mutates
-    /// entries/offsets/sizes.
-    /// `units` carries compact owner IDs (u8) from TickContext — no dedup needed.
-    ///
-    /// Buffers are reused in place: `cell_offsets`/`cell_sizes` grow only on
-    /// expansion (a no-op at steady state), and `entries` is resized without a
-    /// per-slot default write since every slot is overwritten in pass 2.
-    fn build(
-        units: &[(Entity, UnitPosition, u8, bool)],
-        entries: &mut Vec<CellEntry>,
-        cell_offsets: &mut Vec<usize>,
-        cell_sizes: &mut Vec<usize>,
-    ) -> Self {
-        let mut min_x = i32::MAX;
-        let mut min_y = i32::MAX;
-        let mut max_x = i32::MIN;
-        let mut max_y = i32::MIN;
-        for &(_, pos, _, _) in units {
-            let c = cell_for(pos);
-            if c.0 < min_x {
-                min_x = c.0;
-            }
-            if c.1 < min_y {
-                min_y = c.1;
-            }
-            if c.0 > max_x {
-                max_x = c.0;
-            }
-            if c.1 > max_y {
-                max_y = c.1;
-            }
-        }
-        let width = (max_x - min_x + 2) as usize;
-        let height = (max_y - min_y + 2) as usize;
-        let total = width * height;
-
-        // Grow the per-cell buffers to at least `total` cells (no-op when
-        // enough) — inlined from the former `ensure` so `build` can borrow the
-        // fields disjointly from `units`.
-        if cell_offsets.len() < total {
-            cell_offsets.resize(total, 0);
-        }
-        if cell_sizes.len() < total {
-            cell_sizes.resize(total, 0);
-        }
-        let cell_sizes = &mut cell_sizes[..total];
-        let cell_offsets = &mut cell_offsets[..total];
-
-        // Pass 1: count entries per cell (zeroed first for reuse).
-        cell_sizes.fill(0);
-        for &(_, pos, _, _) in units {
-            let c = cell_for(pos);
-            let cx = ((c.0 - min_x) as usize).min(width - 1);
-            let cy = ((c.1 - min_y) as usize).min(height - 1);
-            cell_sizes[cy * width + cx] += 1;
-        }
-
-        // Build prefix-sum offsets.
-        for i in 1..total {
-            cell_offsets[i] = cell_offsets[i - 1] + cell_sizes[i - 1];
-        }
-
-        // Pass 2: fill entries in place. `cell_sizes` doubles as a per-cell
-        // cursor (reset to 0); each write advances it, so after the pass it
-        // again holds the final per-cell counts — no `cell_offsets.clone()`.
-        entries.resize(
-            units.len(),
-            CellEntry {
-                entity: Entity::from_bits(1u64 << 32).unwrap(),
-                pos: UnitPosition::default(),
-                owner_idx: 0,
-            },
-        );
-        cell_sizes.fill(0);
-        for &(e, pos, owner_id, _) in units.iter() {
-            let c = cell_for(pos);
-            let cx = ((c.0 - min_x) as usize).min(width - 1);
-            let cy = ((c.1 - min_y) as usize).min(height - 1);
-            let idx = cy * width + cx;
-            let slot = cell_offsets[idx] + cell_sizes[idx];
-            entries[slot] = CellEntry {
-                entity: e,
-                pos,
-                owner_idx: owner_id,
-            };
-            cell_sizes[idx] += 1;
-        }
-
-        Self {
-            min_x,
-            min_y,
-            width,
-            height,
-        }
-    }
-
-    #[inline]
-    fn cell_idx(&self, cx: i32, cy: i32) -> Option<usize> {
-        let x = (cx - self.min_x) as isize;
-        let y = (cy - self.min_y) as isize;
-        let w = self.width as isize;
-        let h = self.height as isize;
-        if (0..w).contains(&x) && (0..h).contains(&y) {
-            Some((y * w + x) as usize)
-        } else {
-            None
-        }
-    }
-}
-
-#[inline]
-fn cell_for(pos: UnitPosition) -> (i32, i32) {
-    (
-        (pos.x / CELL_SIZE).floor() as i32,
-        (pos.y / CELL_SIZE).floor() as i32,
-    )
-}
-
-pub fn run(world: &mut hecs::World, ctx: &TickContext, grid_scratch: &mut GridIndexScratch) {
-    // 1. Collect all living unit data in one ECS query (no &UnitOwner —
-    //    owner IDs come from the shared TickContext lookup).
-    //    Each entry: (entity, position, compact_owner_id, is_moved).
-    //    Written into the reused scratch buffer so steady-state ticks do not
-    //    grow/allocate the Vec.
-    grid_scratch.units.clear();
-    grid_scratch.units.extend(
-        world
-            .query::<(Entity, &UnitPosition, &UnitFlags)>()
-            .iter()
-            .filter_map(|(e, pos, flags)| {
-                debug_assert!(
-                    ctx.owner_id_by_entity.contains_key(&e),
-                    "entity {:?} missing from owner_id_by_entity — TickContext stale?",
-                    e
-                );
-                let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
-                Some((e, *pos, owner_id, flags.moved))
-            }),
-    );
-
+/// Runs every tick against the grid `movement` just built (fresh, post-move).
+/// Every unit's `NearbyEnemies` list is rebuilt from the grid of currently
+/// living units. This full-rebuild-every-tick behavior keeps the lists fresh
+/// and symmetric — a load-bearing invariant for `death_cleanup`'s reverse
+/// lookup and for the upcoming conditional rebuild.
+pub fn run(world: &mut hecs::World, grid_scratch: &mut GridIndexScratch) {
     let n = grid_scratch.units.len();
     if n == 0 {
         return;
     }
 
-    // 2. Build grid index into the reused scratch buffers. `units` is a separate
-    //    field from the grid buffers, so we can borrow it immutably while build
-    //    mutates entries/offsets/sizes (disjoint field borrows).
-    let grid = GridIndex::build(
-        &grid_scratch.units,
-        &mut grid_scratch.entries,
-        &mut grid_scratch.cell_offsets,
-        &mut grid_scratch.cell_sizes,
-    );
-    let units = &grid_scratch.units[..];
+    // The grid metadata + dense buffers are the post-move grid built by
+    // movement. `grid` borrows `grid_scratch.index`; both are read-only here.
+    let grid = &grid_scratch.index;
 
     // Reuse buffer to avoid per-unit allocation.
     let mut enemies = Vec::with_capacity(16);
 
-    // 3. For each unit, query 3×3 neighbourhood and build NearbyEnemies.
-    for &(entity, pos, my_owner, is_moved) in units.iter() {
-        let c = cell_for(pos);
-
-        // Collect 3×3 neighbourhood entries — no HashMap lookups, no linear scans.
+    // For each unit, run the 3×3 neighbourhood circle query and collect its
+    // enemy entities. No grid rebuild, no HashMap lookups, no linear scans.
+    for &(entity, pos, my_owner) in grid_scratch.units.iter() {
         enemies.clear();
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                if let Some(idx) = grid.cell_idx(c.0 + dx, c.1 + dy) {
-                    let start = grid_scratch.cell_offsets[idx];
-                    let count = grid_scratch.cell_sizes[idx];
-                    for entry in &grid_scratch.entries[start..start + count] {
-                        if entry.entity == entity {
-                            continue;
-                        }
-                        // Fast owner comparison — direct u8 equality.
-                        if entry.owner_idx == my_owner {
-                            continue;
-                        }
-                        let dx_pos = pos.x - entry.pos.x;
-                        let dy_pos = pos.y - entry.pos.y;
-                        if dx_pos * dx_pos + dy_pos * dy_pos < COMBAT_RANGE_SQ {
-                            enemies.push(entry.entity);
-                        }
-                    }
+        spatial::for_each_within(
+            grid,
+            grid_scratch,
+            pos,
+            COMBAT_DISTANCE_SQ,
+            |other_ent, _, other_owner| {
+                if other_ent == entity {
+                    return; // skip self
                 }
-            }
-        }
+                // Fast owner comparison — direct u8 equality.
+                if other_owner == my_owner {
+                    return;
+                }
+                enemies.push(other_ent);
+            },
+        );
 
         // Write/update NearbyEnemies.
         // Move the collected entities into the (stack-backed) SmallVec field in
-        // O(k) with no allocation once `nb.entities` capacity >= the enemy count
-        // (SmallVec keeps its heap buffer across clear()). This is the
-        // `SmallVec::append` equivalent for a `Vec` source and leaves `enemies`
-        // empty for the next unit — content-identical to the old
-        // `= enemies.drain(..).collect()`, but no per-tick alloc for the
-        // >8-enemy case.
+        // O(k) with no allocation once capacity >= the enemy count (SmallVec
+        // keeps its heap buffer across clear()).
         let has_enemies = !enemies.is_empty();
         if let Ok((nb,)) = world.query_one_mut::<(&mut NearbyEnemies,)>(entity) {
             nb.entities.clear();
@@ -291,9 +81,11 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext, grid_scratch: &mut GridIn
             );
         }
 
-        // Set `attacking` flag for movers only.
-        if is_moved {
-            if let Ok((mut_flags,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
+        // Set `attacking` flag for movers only (non-movers keep their sticky
+        // value — movement cleared `moved` this tick, so `moved` marks exactly
+        // the applied movers).
+        if let Ok((mut_flags,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
+            if mut_flags.moved {
                 mut_flags.attacking = has_enemies;
             }
         }
@@ -304,8 +96,9 @@ pub fn run(world: &mut hecs::World, ctx: &TickContext, grid_scratch: &mut GridIn
 mod tests {
     use super::*;
     use crate::config::CityUpgradeSettings;
-    use crate::game::game::TickContext;
+    use crate::game::spatial::GridIndex;
     use crate::game::world_ext::WorldExt;
+    use std::collections::HashMap;
 
     fn setup() -> (hecs::World, hecs::Entity) {
         let mut world = hecs::World::new();
@@ -340,11 +133,40 @@ mod tests {
         ))
     }
 
-    /// Helper: build TickContext and run the system (used by most tests).
-    fn build_ctx_and_run(world: &mut hecs::World, world_entity: hecs::Entity) {
-        let ctx = TickContext::build_full(world, world_entity);
-        let mut grid_scratch = GridIndexScratch::new();
-        run(world, &ctx, &mut grid_scratch);
+    /// Build the spatial grid the same way `movement` does (populate
+    /// `(entity, pos, owner_idx)` + build index), then run nearby_enemies.
+    /// Owner idx is assigned deterministically per player string (query order:
+    /// P1→0, P2→1, P3→2) — same owner ⇒ same idx, so the same-owner filter is
+    /// exercised exactly as in the real flow.
+    fn build_grid_and_run(world: &mut hecs::World, grid_scratch: &mut GridIndexScratch) {
+        let mut idx_map: HashMap<String, u8> = HashMap::new();
+        let mut next: u8 = 0;
+        grid_scratch.units.clear();
+        for (e, owner, pos) in world
+            .query::<(hecs::Entity, &UnitOwner, &UnitPosition)>()
+            .iter()
+        {
+            let idx = *idx_map.entry(owner.player_id.clone()).or_insert_with(|| {
+                let i = next;
+                next += 1;
+                i
+            });
+            grid_scratch.units.push((e, *pos, idx));
+        }
+        grid_scratch.index = GridIndex::build(
+            &grid_scratch.units,
+            &mut grid_scratch.entries,
+            &mut grid_scratch.cell_offsets,
+            &mut grid_scratch.cell_sizes,
+        );
+        run(world, grid_scratch);
+    }
+
+    /// Helper: build the grid and run the system with a fresh scratch (used by
+    /// most tests).
+    fn build_ctx_and_run(world: &mut hecs::World, _world_entity: hecs::Entity) {
+        let mut grid_scratch = GridIndexScratch::default();
+        build_grid_and_run(world, &mut grid_scratch);
     }
 
     #[test]

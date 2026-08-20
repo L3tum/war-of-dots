@@ -82,7 +82,9 @@ fn warm_game() -> Game {
     for city in &cities {
         let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
         for _ in 0..10 {
-            let _ = game.recruit_unit(&city.id, &ut, &owner);
+            // Bypass the circle gate: this fixture stacks 10 units per city
+            // point to build a dense warm game for allocation measurement.
+            let _ = game.recruit_unit_at(&ut, &owner, city.position);
         }
     }
 

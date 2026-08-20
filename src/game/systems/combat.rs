@@ -281,7 +281,7 @@ pub fn run(
                 let dx = pos1.x - pos2.x;
                 let dy = pos1.y - pos2.y;
                 let dist_sq = dx * dx + dy * dy;
-                if dist_sq >= crate::game::constants::COMBAT_RANGE_SQ {
+                if dist_sq >= crate::game::constants::COMBAT_DISTANCE_SQ {
                     scratch.pairs_out_of_range += 1;
                     continue;
                 }
@@ -630,7 +630,7 @@ mod tests {
     }
 
     /// Populate NearbyEnemies.entities for each unit with enemy entities
-    /// within COMBAT_RANGE. Replaces the old SpatialHash-based approach.
+    /// within COMBAT_DISTANCE. Replaces the old SpatialHash-based approach.
     fn populate_nearby_enemies(world: &mut World) {
         let units: Vec<(hecs::Entity, UnitPosition, String)> = world
             .query::<(Entity, &UnitPosition, &UnitOwner)>()
@@ -648,7 +648,7 @@ mod tests {
                 }
                 let dx = pos.x - other_pos.x;
                 let dy = pos.y - other_pos.y;
-                if dx * dx + dy * dy < crate::game::constants::COMBAT_RANGE_SQ {
+                if dx * dx + dy * dy < crate::game::constants::COMBAT_DISTANCE_SQ {
                     nearby.push(*other);
                 }
             }

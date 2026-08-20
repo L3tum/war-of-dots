@@ -509,7 +509,9 @@ fn make_game_with_units(units_per_city: usize) -> Game {
     for city in &cities {
         let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
         for _ in 0..units_per_city {
-            let _ = game.recruit_unit(&city.id, &ut, &owner);
+            // Bypass the circle gate: stack units_per_city units per city point
+            // to reach the intended fixture scale (100/200/500 units).
+            let _ = game.recruit_unit_at(&ut, &owner, city.position);
         }
     }
 
@@ -525,14 +527,19 @@ fn make_game_with_units(units_per_city: usize) -> Game {
 struct MovementFixture {
     world: World,
     world_entity: hecs::Entity,
+    ctx: TickContext,
+    grid_scratch: crate::game::spatial::GridIndexScratch,
 }
 
 impl MovementFixture {
     fn new_empty(width: u32, height: u32, num_players: usize) -> Self {
         let (world, world_entity) = make_world(width, height, num_players);
+        let ctx = TickContext::build_full(&world, world_entity);
         Self {
             world,
             world_entity,
+            ctx,
+            grid_scratch: Default::default(),
         }
     }
 
@@ -549,9 +556,12 @@ impl MovementFixture {
         if with_paths {
             add_paths_to_entities(&mut world, &entities);
         }
+        let ctx = TickContext::build_full(&world, world_entity);
         Self {
             world,
             world_entity,
+            ctx,
+            grid_scratch: Default::default(),
         }
     }
 }
@@ -611,9 +621,8 @@ impl SupplyFixture {
 /// Pre-built fixture for nearby_enemies benchmarks.
 struct NearbyEnemiesFixture {
     world: World,
-    world_entity: hecs::Entity,
     entity_ids: Vec<hecs::Entity>,
-    grid_scratch: crate::game::systems::nearby_enemies::GridIndexScratch,
+    grid_scratch: crate::game::spatial::GridIndexScratch,
 }
 
 impl NearbyEnemiesFixture {
@@ -626,11 +635,22 @@ impl NearbyEnemiesFixture {
     ) -> Self {
         let (mut world, world_entity) = make_world(width, height, num_players);
         let entity_ids = spawn_n_units(&mut world, world_entity, unit_type, count);
+        // Build the spatial grid once (un-timed setup). `nearby_enemies::run`
+        // now only *consumes* the grid (movement builds it in the real tick
+        // loop), so this fixture pre-builds it to isolate the collection cost.
+        let ctx = TickContext::build_full(&world, world_entity);
+        let mut grid_scratch = crate::game::spatial::GridIndexScratch::default();
+        crate::game::systems::movement::populate_grid_units(&world, &ctx, &mut grid_scratch);
+        grid_scratch.index = crate::game::spatial::GridIndex::build(
+            &grid_scratch.units,
+            &mut grid_scratch.entries,
+            &mut grid_scratch.cell_offsets,
+            &mut grid_scratch.cell_sizes,
+        );
         Self {
             world,
-            world_entity,
             entity_ids,
-            grid_scratch: crate::game::systems::nearby_enemies::GridIndexScratch::new(),
+            grid_scratch,
         }
     }
 }
@@ -777,6 +797,26 @@ impl DeathCleanupFixture {
         let (mut world, world_entity) = make_world(30, 30, 2);
         let ut = bench_unit_type();
         let all_entities = spawn_n_units(&mut world, world_entity, &ut, total);
+        // Populate NearbyEnemies lists so the reverse-lookup cleanup path is
+        // genuinely exercised (the old flat-retain benchmark never had lists
+        // at all — see the R6 note in the plan). `setup_nearby_enemies` gives
+        // each unit a 5-entry list of opposite-parity enemies; the first
+        // `dead_count` entities are the dead ones. Because the dead entities
+        // are the *first* indices, their parity-only lists point at other
+        // dead entities; to mirror the real (symmetric) architecture — dead
+        // units list their alive neighbours — also point each dead unit at
+        // one alive unit, so the targeted `retain` pass has live candidates.
+        setup_nearby_enemies(&mut world, &all_entities);
+        for (i, &dead) in all_entities.iter().take(dead_count).enumerate() {
+            if let Ok(nb) =
+                world.query_one_mut::<(&mut crate::game::components::NearbyEnemies,)>(dead)
+            {
+                let alive_ref = all_entities[dead_count + i];
+                if !nb.0.entities.contains(&alive_ref) {
+                    nb.0.entities.push(alive_ref);
+                }
+            }
+        }
         for &e in all_entities.iter().take(dead_count) {
             world
                 .insert_one(
@@ -999,6 +1039,8 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &settings,
                 &mut scratch,
                 &ut_index,
+                &f.ctx,
+                &mut f.grid_scratch,
             );
             black_box(scratch.movers.len());
         },
@@ -1021,6 +1063,8 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &settings,
                 &mut scratch,
                 &ut_index,
+                &f.ctx,
+                &mut f.grid_scratch,
             );
             black_box(scratch.movers.len());
         },
@@ -1043,6 +1087,8 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &settings,
                 &mut scratch,
                 &ut_index,
+                &f.ctx,
+                &mut f.grid_scratch,
             );
             black_box(scratch.movers.len());
         },
@@ -1060,8 +1106,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 100),
         |f: &mut NearbyEnemiesFixture| {
-            let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx, &mut f.grid_scratch);
+            crate::game::systems::nearby_enemies::run(&mut f.world, &mut f.grid_scratch);
             black_box(f.entity_ids.len());
         },
     );
@@ -1076,8 +1121,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(30, 30, 2, &ut, 200),
         |f: &mut NearbyEnemiesFixture| {
-            let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx, &mut f.grid_scratch);
+            crate::game::systems::nearby_enemies::run(&mut f.world, &mut f.grid_scratch);
             black_box(f.entity_ids.len());
         },
     );
@@ -1092,8 +1136,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         cfg,
         || NearbyEnemiesFixture::new_movers(40, 40, 2, &ut, 500),
         |f: &mut NearbyEnemiesFixture| {
-            let ctx = TickContext::build_full(&f.world, f.world_entity);
-            crate::game::systems::nearby_enemies::run(&mut f.world, &ctx, &mut f.grid_scratch);
+            crate::game::systems::nearby_enemies::run(&mut f.world, &mut f.grid_scratch);
             black_box(f.entity_ids.len());
         },
     );
@@ -1663,4 +1706,189 @@ pub fn results_to_json(results: &[MicrobenchmarkResult]) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "count": results.len()
     })
+}
+
+// ============================================================================
+// Phase-level measurement for death_cleanup — run manually:
+//   cargo test --release --features microbenchmarks dc_phase_measurement -- --nocapture
+// Builds a realistic world (10000 dense units, ~60-entry enemy lists) and
+// times each phase of death_cleanup separately, plus the ORIGINAL flat-retain
+// for direct comparison. Reports min/median over iters on fresh worlds.
+// ============================================================================
+#[cfg(test)]
+mod dc_measure {
+    use super::*;
+    use crate::game::systems::death_cleanup::{run, DeathCleanupScratch};
+
+    const N: usize = 4_000; // total units in world
+    const CLUSTER: usize = 3_000; // dense engaged cluster (first units)
+    const LIST: usize = 1_000; // entries per cluster unit's enemy list
+
+    // Build a dense battle: first CLUSTER units each list LIST other cluster
+    // units (opposite parity) as enemies. This mirrors the real combat state
+    // where engaged units carry ~1000-entry lists (total_nearby_entries /
+    // with-enemies ≈ 588146/577 ≈ 1018).
+    fn build_world() -> (World, Vec<hecs::Entity>) {
+        let (mut world, we) = make_world(100, 100, 4);
+        let ut = bench_unit_type();
+        let units = spawn_n_units(&mut world, we, &ut, N);
+        for (i, &e) in units.iter().enumerate().take(CLUSTER) {
+            let is_p0 = i % 2 == 0;
+            let enemies = units
+                .iter()
+                .enumerate()
+                .take(CLUSTER)
+                .filter(|&(j, _)| (j % 2 == 0) != is_p0 && j != i)
+                .map(|(_, x)| *x)
+                .take(LIST)
+                .collect::<Vec<_>>();
+            let _ = world.insert_one(
+                e,
+                (NearbyEnemies {
+                    entities: enemies.into_iter().collect(),
+                    initialized: true,
+                },),
+            );
+        }
+        (world, units)
+    }
+
+    fn entity_reverse_of(units: &[hecs::Entity]) -> HashMap<hecs::Entity, String> {
+        let mut m = HashMap::with_capacity(units.len());
+        for e in units {
+            m.insert(*e, "owner".to_string());
+        }
+        m
+    }
+
+    fn time_us<F: FnMut()>(iters: usize, mut f: F) -> (f64, f64) {
+        let mut v = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            f();
+            v.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[0], v[v.len() / 2]) // (min, median) in µs
+    }
+
+    /// Build a fresh world (UNTIMED) each iteration, then time ONLY `op`.
+    /// Mirrors the real benchmark: the world is built once and death_cleanup
+    /// runs on the persistent world (no per-tick spawn cost in the timing).
+    fn measure<F: FnMut(&mut World, &[hecs::Entity])>(
+        iters: usize,
+        dead_count: usize,
+        mut op: F,
+    ) -> (f64, f64) {
+        let mut v = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let (mut w, units) = build_world();
+            let dead = &units[..dead_count];
+            let t = Instant::now();
+            op(&mut w, dead);
+            v.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[0], v[v.len() / 2])
+    }
+
+    #[test]
+    fn dc_phase_measurement() {
+        let dead_counts = [100usize, 500, 1000, 2000];
+        let iters = 12;
+        let (bm, _) = time_us(5, || {
+            let (w, units) = build_world();
+            black_box(w.len());
+            black_box(units.len());
+        });
+        eprintln!(
+            "\n=== DC PHASE MEASUREMENT  N={} LIST={}  (µs, min/med over {}) ===",
+            N, LIST, iters
+        );
+        eprintln!(
+            "  [build_world itself = {:8.1} µs — EXCLUDED from below]",
+            bm
+        );
+        for &dead_count in &dead_counts {
+            eprintln!("\ndead_count = {}", dead_count);
+
+            // (A) Full real run()
+            let (mn, med) = measure(iters, dead_count, |w, dead| {
+                let all: Vec<hecs::Entity> =
+                    w.query::<(hecs::Entity,)>().iter().map(|(e,)| e).collect();
+                let mut er = entity_reverse_of(&all);
+                let dl: Vec<&[_]> = vec![dead];
+                let mut scratch = DeathCleanupScratch::default();
+                let _ = run(w, &dl, &mut er, &mut scratch);
+            });
+            eprintln!("  full_run         min={:9.1}  med={:9.1}", mn, med);
+
+            // (B) Original flat world-wide retain (pre-change behavior)
+            let (mn, med) = measure(iters, dead_count, |w, dead| {
+                let mut ds = std::collections::HashSet::new();
+                for &e in dead {
+                    ds.insert(e);
+                }
+                for (_e, nb) in w.query::<(hecs::Entity, &mut NearbyEnemies)>().iter() {
+                    nb.entities.retain(|e| !ds.contains(e));
+                }
+                black_box(w.query::<(&NearbyEnemies,)>().iter().count());
+            });
+            eprintln!("  flat_retain(old) min={:9.1}  med={:9.1}", mn, med);
+
+            // (C) Reverse lookup only (step 2)
+            let (mn, med) = measure(iters, dead_count, |w, dead| {
+                let mut seen = std::collections::HashSet::new();
+                for &dead in dead {
+                    if let Ok((nb,)) = w.query_one_mut::<(&NearbyEnemies,)>(dead) {
+                        for &u in nb.entities.iter() {
+                            seen.insert(u);
+                        }
+                    }
+                }
+                black_box(seen.len());
+            });
+            eprintln!("  reverse_lookup   min={:9.1}  med={:9.1}", mn, med);
+
+            // (D) Query pass + targeted retain only (step 3)
+            let (mn, med) = measure(iters, dead_count, |w, dead| {
+                let mut seen = std::collections::HashSet::new();
+                for &d in dead {
+                    if let Ok((nb,)) = w.query_one_mut::<(&NearbyEnemies,)>(d) {
+                        for &u in nb.entities.iter() {
+                            seen.insert(u);
+                        }
+                    }
+                }
+                let mut ds = std::collections::HashSet::new();
+                for &d in dead {
+                    ds.insert(d);
+                }
+                let mut remaining = 0usize;
+                for (entity, nb) in w.query::<(hecs::Entity, &mut NearbyEnemies)>().iter() {
+                    if seen.contains(&entity) {
+                        nb.entities.retain(|e| {
+                            let keep = !ds.contains(e);
+                            if keep {
+                                remaining += 1;
+                            }
+                            keep
+                        });
+                    }
+                }
+                black_box(remaining);
+            });
+            eprintln!("  query+retain     min={:9.1}  med={:9.1}", mn, med);
+
+            // (E) Despawn only (step 4) — isolates hecs despawn cost
+            let (mn, med) = measure(iters, dead_count, |w, dead| {
+                for &d in dead {
+                    let _ = w.despawn(d);
+                }
+                black_box(w.len());
+            });
+            eprintln!("  despawn          min={:9.1}  med={:9.1}", mn, med);
+        }
+        eprintln!("\n=== done ===\n");
+    }
 }

@@ -75,24 +75,8 @@ impl DebugSystemGuard {
             if let Some(wb) = world.world_data_mut(self.world_entity) {
                 let ds = &mut wb.debug_stats;
                 let timings = &mut ds.system_timings;
-                let entry = timings.entry(system_name.to_string()).or_insert_with(|| {
-                    super::components::SystemTimings {
-                        total_ms: 0.0,
-                        call_count: 0,
-                        last_ms: 0.0,
-                        avg_ms: 0.0,
-                        durations_ms: Vec::new(),
-                    }
-                });
-                entry.total_ms += duration_ms;
-                entry.call_count += 1;
-                entry.last_ms = duration_ms;
-                entry.avg_ms = entry.total_ms / entry.call_count as f64;
-                // Keep bounded buffer for P90/P99
-                if entry.durations_ms.len() > 200 {
-                    entry.durations_ms.remove(0);
-                }
-                entry.durations_ms.push(duration_ms);
+                let entry = timings.entry(system_name.to_string()).or_default();
+                entry.record(duration_ms);
             }
         }
     }
@@ -110,23 +94,8 @@ impl DebugSystemGuard {
                     return;
                 }
                 let timings = &mut ds.detailed_timings;
-                let entry = timings.entry(key.to_string()).or_insert_with(|| {
-                    super::components::SystemTimings {
-                        total_ms: 0.0,
-                        call_count: 0,
-                        last_ms: 0.0,
-                        avg_ms: 0.0,
-                        durations_ms: Vec::new(),
-                    }
-                });
-                entry.total_ms += duration_ms;
-                entry.call_count += 1;
-                entry.last_ms = duration_ms;
-                entry.avg_ms = entry.total_ms / entry.call_count as f64;
-                if entry.durations_ms.len() > 200 {
-                    entry.durations_ms.remove(0);
-                }
-                entry.durations_ms.push(duration_ms);
+                let entry = timings.entry(key.to_string()).or_default();
+                entry.record(duration_ms);
             }
         }
     }
@@ -189,24 +158,8 @@ pub fn record_system_timing(
     if let Some(wb) = world.world_data_mut(world_entity) {
         let ds = &mut wb.debug_stats;
         let timings = &mut ds.system_timings;
-        let entry = timings.entry(system_name.to_string()).or_insert_with(|| {
-            super::components::SystemTimings {
-                total_ms: 0.0,
-                call_count: 0,
-                last_ms: 0.0,
-                avg_ms: 0.0,
-                durations_ms: Vec::new(),
-            }
-        });
-        entry.total_ms += duration_ms;
-        entry.call_count += 1;
-        entry.last_ms = duration_ms;
-        entry.avg_ms = entry.total_ms / entry.call_count as f64;
-        // Keep bounded buffer for P90/P99
-        if entry.durations_ms.len() > 200 {
-            entry.durations_ms.remove(0);
-        }
-        entry.durations_ms.push(duration_ms);
+        let entry = timings.entry(system_name.to_string()).or_default();
+        entry.record(duration_ms);
     }
 }
 
@@ -236,6 +189,35 @@ pub fn record_system_alloc(
     }
 }
 
+/// Run-wide percentile from a `SystemTimings` log histogram.
+///
+/// `rank = p × total_calls`; returns the **upper edge** of the first bucket
+/// whose cumulative count reaches the rank (see `system_timings_bucket_upper_edge`).
+/// Semantics: run-wide (all calls since start), and the value is a bucket
+/// edge, so it overestimates the true percentile by at most the bucket factor
+/// 10^(1/3) ≈ 1.21. Returns 0.0 for an empty histogram.
+pub fn hist_percentile(
+    hist: &[u32; super::components::SYSTEM_TIMINGS_HIST_BUCKETS],
+    p: f64,
+) -> f64 {
+    let total: u64 = hist.iter().map(|&c| c as u64).sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let p = p.clamp(0.0, 1.0);
+    let rank = (p * total as f64).floor().max(1.0) as u64;
+    let mut cumulative = 0u64;
+    for (i, &count) in hist.iter().enumerate() {
+        cumulative += count as u64;
+        if cumulative >= rank {
+            return super::components::system_timings_bucket_upper_edge(i);
+        }
+    }
+    // Unreachable (cumulative reaches total ≥ rank), but keep a defined
+    // fallback for the last bucket's upper edge.
+    super::components::system_timings_bucket_upper_edge(hist.len() - 1)
+}
+
 /// Get debug stats as JSON-serializable structure.
 pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serde_json::Value> {
     let wb_ref = world.world_data(world_entity)?;
@@ -255,26 +237,12 @@ pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serd
             .system_timings
             .iter()
             .map(|(name, timing)| {
-                let mut durations_sorted = timing.durations_ms.clone();
-                durations_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let p50 = if durations_sorted.is_empty() {
-                    0.0
-                } else {
-                    durations_sorted[((durations_sorted.len() as f64 * 0.5) as usize)
-                        .min(durations_sorted.len() - 1)]
-                };
-                let p90 = if durations_sorted.is_empty() {
-                    0.0
-                } else {
-                    durations_sorted[((durations_sorted.len() as f64 * 0.9) as usize)
-                        .min(durations_sorted.len() - 1)]
-                };
-                let p99 = if durations_sorted.is_empty() {
-                    0.0
-                } else {
-                    durations_sorted[((durations_sorted.len() as f64 * 0.99) as usize)
-                        .min(durations_sorted.len() - 1)]
-                };
+                // Run-wide percentiles from the log histogram: the value is
+                // the upper edge of the bucket holding the rank-th call, so
+                // it overestimates the true percentile by at most ×1.21.
+                let p50 = hist_percentile(&timing.hist, 0.5);
+                let p90 = hist_percentile(&timing.hist, 0.9);
+                let p99 = hist_percentile(&timing.hist, 0.99);
                 serde_json::json!({
                     "name": name,
                     "total_ms": timing.total_ms,
@@ -293,26 +261,9 @@ pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serd
             .detailed_timings
             .iter()
             .map(|(key, timing)| {
-                let mut durations_sorted = timing.durations_ms.clone();
-                durations_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let p50 = if durations_sorted.is_empty() {
-                    0.0
-                } else {
-                    durations_sorted[((durations_sorted.len() as f64 * 0.5) as usize)
-                        .min(durations_sorted.len() - 1)]
-                };
-                let p90 = if durations_sorted.is_empty() {
-                    0.0
-                } else {
-                    durations_sorted[((durations_sorted.len() as f64 * 0.9) as usize)
-                        .min(durations_sorted.len() - 1)]
-                };
-                let p99 = if durations_sorted.is_empty() {
-                    0.0
-                } else {
-                    durations_sorted[((durations_sorted.len() as f64 * 0.99) as usize)
-                        .min(durations_sorted.len() - 1)]
-                };
+                let p50 = hist_percentile(&timing.hist, 0.5);
+                let p90 = hist_percentile(&timing.hist, 0.9);
+                let p99 = hist_percentile(&timing.hist, 0.99);
                 serde_json::json!({
                     "name": key,
                     "total_ms": timing.total_ms,
@@ -374,5 +325,84 @@ pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serd
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::components::{
+        system_timings_bucket_index, SystemTimings, SYSTEM_TIMINGS_HIST_BUCKETS,
+    };
+    use super::hist_percentile;
+
+    #[test]
+    fn record_updates_scalars_and_histogram_bucket() {
+        let mut t = SystemTimings::default();
+        t.record(1.0);
+        t.record(1.0);
+        t.record(100.0);
+        assert_eq!(t.call_count, 3);
+        assert!((t.total_ms - 102.0).abs() < 1e-12);
+        assert!((t.last_ms - 100.0).abs() < 1e-12);
+        assert!((t.avg_ms - 102.0 / 3.0).abs() < 1e-12);
+        let total_hist: u64 = t.hist.iter().map(|&c| c as u64).sum();
+        assert_eq!(total_hist, 3);
+        assert_eq!(t.hist[system_timings_bucket_index(1.0)], 2);
+        assert_eq!(t.hist[system_timings_bucket_index(100.0)], 1);
+    }
+
+    #[test]
+    fn record_clamps_out_of_range_durations() {
+        let mut t = SystemTimings::default();
+        t.record(0.0005); // below the first edge (0.001 ms) → bucket 0
+        t.record(99999.0); // ≥ 10 s → last bucket
+        t.record(0.0); // zero → bucket 0 (no NaN in the index math)
+        assert_eq!(t.hist[0], 2);
+        assert_eq!(t.hist[SYSTEM_TIMINGS_HIST_BUCKETS - 1], 1);
+    }
+
+    #[test]
+    fn bucket_index_is_monotonic_and_decadal() {
+        // 3 buckets per decade: 0.001 ms → 0, 0.01 → 3, 0.1 → 6, 1 → 9,
+        // 10 → 12, 100 → 15, 1000 → 18, 10000 → 21, 99999 → 23 (clamped).
+        assert_eq!(system_timings_bucket_index(0.001), 0);
+        assert_eq!(system_timings_bucket_index(0.01), 3);
+        assert_eq!(system_timings_bucket_index(0.1), 6);
+        assert_eq!(system_timings_bucket_index(1.0), 9);
+        assert_eq!(system_timings_bucket_index(10.0), 12);
+        assert_eq!(system_timings_bucket_index(100.0), 15);
+        assert_eq!(system_timings_bucket_index(1000.0), 18);
+        assert_eq!(system_timings_bucket_index(10000.0), 21);
+        assert_eq!(
+            system_timings_bucket_index(99999.0),
+            SYSTEM_TIMINGS_HIST_BUCKETS - 1
+        );
+    }
+
+    #[test]
+    fn hist_percentile_returns_bucket_edges() {
+        // 100 calls, all in the 1 ms bucket (index 9): every percentile is
+        // that bucket's upper edge (≈1.259 ms = 10^(1/3) ms).
+        let mut hist = [0u32; SYSTEM_TIMINGS_HIST_BUCKETS];
+        hist[9] = 100;
+        let edge = super::super::components::system_timings_bucket_upper_edge(9);
+        assert!((hist_percentile(&hist, 0.5) - edge).abs() < 1e-9);
+        assert!((hist_percentile(&hist, 0.9) - edge).abs() < 1e-9);
+        assert!((hist_percentile(&hist, 0.99) - edge).abs() < 1e-9);
+
+        // 90 calls in bucket 9, 10 in bucket 15 (100 ms bucket): p50/p90 hit
+        // bucket 9's edge, p99 hits bucket 15's edge.
+        let mut hist2 = [0u32; SYSTEM_TIMINGS_HIST_BUCKETS];
+        hist2[9] = 90;
+        hist2[15] = 10;
+        let edge9 = super::super::components::system_timings_bucket_upper_edge(9);
+        let edge15 = super::super::components::system_timings_bucket_upper_edge(15);
+        assert!((hist_percentile(&hist2, 0.5) - edge9).abs() < 1e-9);
+        assert!((hist_percentile(&hist2, 0.9) - edge9).abs() < 1e-9);
+        assert!((hist_percentile(&hist2, 0.99) - edge15).abs() < 1e-9);
+
+        // Empty histogram → 0.0.
+        let empty = [0u32; SYSTEM_TIMINGS_HIST_BUCKETS];
+        assert_eq!(hist_percentile(&empty, 0.5), 0.0);
     }
 }

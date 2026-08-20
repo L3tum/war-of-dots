@@ -3,7 +3,9 @@
 //! Uses two-phase pattern: query + collect changes → apply mutations in batch.
 
 use crate::game::components::*;
-use crate::game::game::GameSettings;
+use crate::game::constants::MIN_UNIT_DISTANCE_SQ;
+use crate::game::game::{GameSettings, TickContext};
+use crate::game::spatial::{self, GridIndexScratch};
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use hecs::Entity;
@@ -48,6 +50,8 @@ pub fn run(
     settings: &GameSettings,
     scratch: &mut MovementScratch,
     unit_types_index: &HashMap<String, usize>,
+    ctx: &TickContext,
+    grid_scratch: &mut GridIndexScratch,
 ) -> usize {
     // Scratch is filled by the apply loop below; clear the previous tick's
     // records up front so a fresh population happens every tick.
@@ -107,9 +111,21 @@ pub fn run(
             }),
     );
 
-    // Phase 2: apply changes
-    // Only units that actually moved count as movers (drives spatialty).
-    let mover_count = scratch.changes.iter().filter(|(_, c)| c.moved).count();
+    // Phase 2: apply changes.
+    //
+    // Occupancy (circle model): a unit may not move so that any *other* unit's
+    // center comes within `MIN_UNIT_DISTANCE` of its target. The gate is checked
+    // against a **pre-move** spatial grid built from everyone's current
+    // positions. A blocked unit is skipped entirely — no position write, no
+    // waypoint pop (it did not reach its waypoint), no mover record, no `moved`
+    // flag, no org drain — and retries next tick. Because centers can't approach
+    // closer than `MIN_UNIT_DISTANCE`, unit density is bounded, which is what
+    // keeps every `NearbyEnemies` list O(constant).
+    //
+    // Soft equilibrium (documented): two units converging on the *same* point in
+    // the *same* tick both pass the pre-move check (neither is there yet) and may
+    // overlap for one tick; the next tick one is blocked and resolves. Harmless —
+    // combat treats them as engaged regardless (dist < COMBAT_DISTANCE).
     let t2 = Instant::now();
     // Get map bounds for clamping
     let (map_w, map_h) = match world.world_data(world_entity) {
@@ -117,12 +133,52 @@ pub fn run(
         None => return 0,
     };
 
+    // Build the PRE-move spatial grid (reused buffers, in place, no alloc at
+    // steady state). The gate queries it; nearby_enemies later consumes the
+    // post-move grid built at the end of this function.
+    populate_grid_units(world, ctx, grid_scratch);
+    let pre_grid = spatial::GridIndex::build(
+        &grid_scratch.units,
+        &mut grid_scratch.entries,
+        &mut grid_scratch.cell_offsets,
+        &mut grid_scratch.cell_sizes,
+    );
+
+    // Only units that actually moved count as movers (drives spatialty).
+    let mut applied_movers = 0usize;
     for (entity, change) in &scratch.changes {
         let entity = *entity;
         if change.moved {
+            // Gate against the pre-move grid: block if any *other* unit is within
+            // MIN_UNIT_DISTANCE of the (clamped) target. Self-exclusion is
+            // required — the grid holds this unit at its OLD position, a small
+            // step away, which must not block the unit itself.
+            let target = UnitPosition {
+                x: change.new_pos.x.clamp(0.0, map_w - 1.0),
+                y: change.new_pos.y.clamp(0.0, map_h - 1.0),
+            };
+            let mut blocked = false;
+            spatial::for_each_within(
+                &pre_grid,
+                grid_scratch,
+                target,
+                MIN_UNIT_DISTANCE_SQ,
+                |other, _, _| {
+                    if other != entity {
+                        blocked = true;
+                    }
+                },
+            );
+            if blocked {
+                // Skip the move entirely: no position write, no waypoint pop, no
+                // mover record, no moved flag. The unit stays put and retries next
+                // tick (movement recomputes from the path every tick).
+                continue;
+            }
+            applied_movers += 1;
             // Record this mover for spatialty: (entity, pre-move pos, post-move
-            // pos). Spatialty uses these directly for hash remove/insert, so no
-            // marker component is written to the ECS.
+            // pos). Spatialty uses these directly — no marker component, no
+            // extra ECS writes.
             scratch
                 .movers
                 .push((entity, change.old_pos, change.new_pos));
@@ -160,14 +216,54 @@ pub fn run(
     }
     let t4 = Instant::now();
 
+    // Build the POST-move spatial grid (reflecting applied positions) — this is
+    // the grid `nearby_enemies`/`combat` consume this tick (fresh, post-move).
+    populate_grid_units(world, ctx, grid_scratch);
+    grid_scratch.index = spatial::GridIndex::build(
+        &grid_scratch.units,
+        &mut grid_scratch.entries,
+        &mut grid_scratch.cell_offsets,
+        &mut grid_scratch.cell_sizes,
+    );
+    let t5 = Instant::now();
+
     // Record per-phase timings (keyed under "movement/..."; no-op if not
     // enabled or without the debug-overlay feature).
     let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     world.record_detailed(world_entity, "movement/p1_setup", to_ms(t1 - t0));
     world.record_detailed(world_entity, "movement/p2_query", to_ms(t2 - t1));
     world.record_detailed(world_entity, "movement/p3_apply", to_ms(t4 - t2));
+    world.record_detailed(world_entity, "movement/p4_spatial", to_ms(t5 - t4));
 
-    mover_count
+    applied_movers
+}
+
+/// Repopulate `grid_scratch.units` with every living unit's
+/// `(entity, position, owner_idx)`. `owner_idx` comes from the shared
+/// `TickContext` compact-owner lookup. Units missing an owner entry are skipped
+/// (all living units have one — `recruit_unit` inserts synchronously), matching
+/// the prior `nearby_enemies` behaviour.
+/// Public so the microbenchmark fixtures (which run systems without the full
+/// `Game` tick loop) can build the same grid movement would build.
+#[doc(hidden)]
+pub fn populate_grid_units(world: &World, ctx: &TickContext, grid_scratch: &mut GridIndexScratch) {
+    grid_scratch.units.clear();
+    grid_scratch
+        .units
+        .extend(
+            world
+                .query::<(Entity, &UnitPosition)>()
+                .iter()
+                .filter_map(|(e, pos)| {
+                    debug_assert!(
+                        ctx.owner_id_by_entity.contains_key(&e),
+                        "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                        e
+                    );
+                    let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
+                    Some((e, *pos, owner_id))
+                }),
+        );
 }
 
 #[allow(clippy::too_many_arguments)] // Pure per-unit computation: pos/path/components + cached unit-type index/settings
@@ -586,5 +682,165 @@ mod tests {
         assert!(change.is_some());
         let change = change.unwrap();
         assert!(change.new_org.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // run() — occupancy gate (circle model, MIN_UNIT_DISTANCE)
+    // ---------------------------------------------------------------------------
+
+    /// Build a minimal hecs world + world_entity (all-Plains terrain) for
+    /// `run()`-level tests (the gate lives in `run`, not `compute_movement`).
+    fn make_run_world(width: u32, height: u32) -> (World, Entity) {
+        let mut world = World::new();
+        let mut funds = HashMap::new();
+        funds.insert("player_0".to_string(), 1000);
+        funds.insert("player_1".to_string(), 1000);
+        let terrain = vec![vec![Terrain::Plains; height as usize]; width as usize];
+        let world_entity = world.spawn_world(
+            terrain,
+            width,
+            height,
+            crate::config::CityUpgradeSettings::default(),
+            funds,
+            vec![],
+        );
+        (world, world_entity)
+    }
+
+    /// Spawn a unit; if `path` is non-empty, install it (replacing the default
+    /// empty path, turning the unit into a mover). An empty path leaves the
+    /// unit static (skipped by the movement query).
+    fn spawn_mover(
+        world: &mut World,
+        utype: &crate::game::economy::UnitType,
+        owner: &str,
+        pos: (f32, f32),
+        path: &[(f32, f32)],
+    ) -> Entity {
+        let e = world.spawn_unit(utype, owner, pos);
+        if !path.is_empty() {
+            // `insert` errors when the component already exists (spawn_unit made
+            // an empty `UnitPath`), so overwrite in place instead.
+            if let Ok((mpath,)) = world.query_one_mut::<(&mut UnitPath,)>(e) {
+                mpath.path = path.iter().copied().collect();
+            }
+        }
+        e
+    }
+
+    /// Run one movement tick on the harness; returns the applied-mover count.
+    fn tick(
+        world: &mut World,
+        world_entity: Entity,
+        settings: &GameSettings,
+        ctx: &TickContext,
+        grid_scratch: &mut GridIndexScratch,
+    ) -> usize {
+        let mut scratch = MovementScratch::default();
+        run(
+            world,
+            world_entity,
+            settings,
+            &mut scratch,
+            &ut_index(settings),
+            ctx,
+            grid_scratch,
+        )
+    }
+
+    /// A lone unit in empty space must move: the gate must NOT be tripped by
+    /// the unit's own old position (self-exclusion) or an empty neighbour set.
+    #[test]
+    fn run_move_into_empty_space_succeeds() {
+        let settings = test_settings();
+        let utype = &settings.unit_types[0];
+        let (mut world, we) = make_run_world(30, 30);
+        let b = spawn_mover(&mut world, utype, "player_0", (5.0, 5.0), &[(15.0, 5.0)]);
+        let ctx = TickContext::build_full(&world, we);
+        let mut grid = GridIndexScratch::default();
+
+        let movers = tick(&mut world, we, &settings, &ctx, &mut grid);
+
+        assert_eq!(
+            movers, 1,
+            "lone unit in empty space must move (self not blocked)"
+        );
+        let (pos, flags) = world
+            .query_one_mut::<(&UnitPosition, &UnitFlags)>(b)
+            .unwrap();
+        assert!(
+            pos.x > 5.0,
+            "unit must advance toward waypoint, got x={}",
+            pos.x
+        );
+        assert!(flags.moved, "mover must set the moved flag");
+    }
+
+    /// A unit whose step would bring another unit's center within
+    /// MIN_UNIT_DISTANCE (8) is blocked: no position write, no moved flag, and
+    /// it is not counted as a mover.
+    #[test]
+    fn run_move_blocked_within_min_distance() {
+        let settings = test_settings();
+        let utype = &settings.unit_types[0];
+        let (mut world, we) = make_run_world(30, 30);
+        // A static unit at (10,10). B at (12,10) — already within 8 of A —
+        // moving toward it. Any step toward A lands within MIN_UNIT_DISTANCE.
+        let _a = spawn_mover(&mut world, utype, "player_1", (10.0, 10.0), &[]);
+        let b = spawn_mover(&mut world, utype, "player_0", (12.0, 10.0), &[(10.0, 10.0)]);
+        let ctx = TickContext::build_full(&world, we);
+        let mut grid = GridIndexScratch::default();
+
+        let movers = tick(&mut world, we, &settings, &ctx, &mut grid);
+
+        assert_eq!(movers, 0, "B within MIN_UNIT_DISTANCE of A must be blocked");
+        let (pos, flags, path) = world
+            .query_one_mut::<(&UnitPosition, &UnitFlags, &UnitPath)>(b)
+            .unwrap();
+        assert_eq!(pos.x, 12.0, "blocked unit's x must be unchanged");
+        assert_eq!(pos.y, 10.0, "blocked unit's y must be unchanged");
+        assert!(!flags.moved, "blocked unit must not set the moved flag");
+        assert_eq!(
+            path.path.len(),
+            1,
+            "blocked unit must not pop its waypoint (it did not reach it)"
+        );
+    }
+
+    /// A blocked unit retries next tick and moves once the blocking neighbour
+    /// is gone (stable-shell / self-correcting equilibrium).
+    #[test]
+    fn run_blocked_unit_moves_after_neighbour_leaves() {
+        let settings = test_settings();
+        let utype = &settings.unit_types[0];
+        let (mut world, we) = make_run_world(30, 30);
+        let a = spawn_mover(&mut world, utype, "player_1", (10.0, 10.0), &[]);
+        let b = spawn_mover(&mut world, utype, "player_0", (12.0, 10.0), &[(10.0, 10.0)]);
+        let mut grid = GridIndexScratch::default();
+
+        // Tick 1: A present → B blocked.
+        let ctx = TickContext::build_full(&world, we);
+        assert_eq!(
+            tick(&mut world, we, &settings, &ctx, &mut grid),
+            0,
+            "B blocked while A is present"
+        );
+        let (pos,) = world.query_one_mut::<(&UnitPosition,)>(b).unwrap();
+        assert_eq!(pos.x, 12.0, "B must not move while blocked");
+
+        // A leaves (despawned) → B's retry succeeds on the next tick.
+        world.despawn(a).unwrap();
+        let ctx = TickContext::build_full(&world, we);
+        assert_eq!(
+            tick(&mut world, we, &settings, &ctx, &mut grid),
+            1,
+            "B moves once the blocker is gone"
+        );
+        let (pos,) = world.query_one_mut::<(&UnitPosition,)>(b).unwrap();
+        assert!(
+            pos.x < 12.0,
+            "B must advance after the blocker is gone, got x={}",
+            pos.x
+        );
     }
 }

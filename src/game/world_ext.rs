@@ -137,23 +137,8 @@ impl WorldExt for World {
                 return;
             }
             let timings = &mut wb.debug_stats.detailed_timings;
-            let entry = timings.entry(key.to_string()).or_insert_with(|| {
-                crate::game::components::SystemTimings {
-                    total_ms: 0.0,
-                    call_count: 0,
-                    last_ms: 0.0,
-                    avg_ms: 0.0,
-                    durations_ms: Vec::new(),
-                }
-            });
-            entry.total_ms += duration_ms;
-            entry.call_count += 1;
-            entry.last_ms = duration_ms;
-            entry.avg_ms = entry.total_ms / entry.call_count as f64;
-            if entry.durations_ms.len() > 200 {
-                entry.durations_ms.remove(0);
-            }
-            entry.durations_ms.push(duration_ms);
+            let entry = timings.entry(key.to_string()).or_default();
+            entry.record(duration_ms);
         }
     }
 }

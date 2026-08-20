@@ -7,7 +7,8 @@
 # Defaults (applied only when the matching flag is absent):
 #   --bench-initial-units 10000   total units across all cities
 #   --bench-map-size 1000         1000×1000 map (spreads units, cuts combat density)
-# Any other args (e.g. --bench-ticks, --bench-seed) are forwarded as-is.
+#   --bench-ticks 1500            tick count (pass --bench-ticks N for a short smoke run)
+# Any other args (e.g. --bench-seed) are forwarded as-is.
 
 SUFFIX="${1:?usage: run-stresstest.sh <report-suffix> [extra args]}"
 shift
@@ -26,7 +27,8 @@ has_flag() {
 
 has_flag --bench-initial-units "${EXTRA[@]}" || EXTRA+=(--bench-initial-units 10000)
 has_flag --bench-map-size "${EXTRA[@]}" || EXTRA+=(--bench-map-size 1000)
+has_flag --bench-ticks "${EXTRA[@]}" || EXTRA+=(--bench-ticks 1500)
 
 cargo run --profile release --features debug-overlay,microbenchmarks,bench-alloc -- \
-    --benchmark --bench-seed 42 --bench-ticks 1500 \
+    --benchmark --bench-seed 42 \
     --bench-html "./reports/stress_${SUFFIX}.html" "${EXTRA[@]}"

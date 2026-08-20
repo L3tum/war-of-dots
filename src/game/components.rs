@@ -56,8 +56,15 @@ pub struct UnitPath {
     pub path: SmallVec<[(f32, f32); 8]>,
 }
 
-/// Cached list of enemy entities within COMBAT_RANGE.
+/// Cached list of enemy entities within COMBAT_DISTANCE.
 /// Maintained by the nearby_enemies system. Read by combat.
+///
+/// Lists are purged of dead units by `death_cleanup` via reverse lookup
+/// through the dead units' own lists (fresh symmetric lists make the coverage
+/// exact under the current per-tick rebuild). If a rebuild ever becomes
+/// conditional, a stale one-sided entry can survive until the next rebuild;
+/// consumers tolerate it (`world.get` on a despawned `Entity` is `Err` — hecs
+/// generations prevent aliasing).
 #[derive(Debug, Clone, Default)]
 pub struct NearbyEnemies {
     /// Enemy entities found during last spatialty update.
@@ -274,6 +281,32 @@ pub struct DebugStats {
     pub system_allocs: HashMap<String, SystemAlloc>,
 }
 
+/// Run-wide log histogram for `SystemTimings` percentiles (P50/P90/P99).
+/// 3 log₁₀-spaced buckets per decade, covering 0.001 ms .. 10 s: bucket `i`
+/// covers `[0.001·10^(i/3), 0.001·10^((i+1)/3))` ms. Durations below the
+/// first edge clamp to bucket 0; durations ≥ 10 s clamp to the last bucket.
+/// The ring of raw durations this replaces was capped at 200 entries, so
+/// percentiles only covered the last 200 calls; the histogram is run-wide,
+/// bounded (96 bytes) and allocation-free for arbitrarily long sessions.
+/// Percentiles computed from it are bucket edges, so they overestimate the
+/// true percentile by at most the bucket factor 10^(1/3) ≈ 1.21.
+pub const SYSTEM_TIMINGS_HIST_BUCKETS: usize = 24;
+
+/// Bucket index for a duration in ms: 3 per decade, clamped to
+/// `0..SYSTEM_TIMINGS_HIST_BUCKETS`.
+pub fn system_timings_bucket_index(duration_ms: f64) -> usize {
+    if !duration_ms.is_finite() || duration_ms <= 0.0 {
+        return 0;
+    }
+    let idx = ((duration_ms.log10() + 3.0) * 3.0).floor() as usize;
+    idx.min(SYSTEM_TIMINGS_HIST_BUCKETS - 1)
+}
+
+/// Upper edge (ms) of histogram bucket `i`: `0.001·10^((i+1)/3)`.
+pub fn system_timings_bucket_upper_edge(bucket: usize) -> f64 {
+    0.001 * 10f64.powf((bucket + 1) as f64 / 3.0)
+}
+
 /// Timing info for a single system.
 #[derive(Debug, Default, Clone)]
 pub struct SystemTimings {
@@ -281,8 +314,21 @@ pub struct SystemTimings {
     pub call_count: u64,
     pub last_ms: f64,
     pub avg_ms: f64,
-    /// Per-tick duration buffer (bounded to 200 entries for P90/P99 computation)
-    pub durations_ms: Vec<f64>,
+    /// Run-wide log histogram of per-call durations — see
+    /// `SYSTEM_TIMINGS_HIST_BUCKETS` for the bucketing scheme.
+    pub hist: [u32; SYSTEM_TIMINGS_HIST_BUCKETS],
+}
+
+impl SystemTimings {
+    /// Record one system call: updates the scalar stats and the histogram
+    /// (the single entry point every record site goes through).
+    pub fn record(&mut self, duration_ms: f64) {
+        self.total_ms += duration_ms;
+        self.call_count += 1;
+        self.last_ms = duration_ms;
+        self.avg_ms = self.total_ms / self.call_count as f64;
+        self.hist[system_timings_bucket_index(duration_ms)] += 1;
+    }
 }
 
 /// Per-system allocation totals. Only populated when the counting allocator

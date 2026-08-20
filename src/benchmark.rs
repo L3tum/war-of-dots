@@ -99,14 +99,18 @@ struct BattleSimulator {
     rng: StdRng,
     unit_types: Vec<UnitType>,
     city_info: Vec<(String, String)>,
-    /// Convergence point for all units (map centre) — creates dense fronts so
-    /// the combat/spatialty pipeline is actually exercised by the benchmark.
+    /// Map centre. `.0` is the centre line's x — the front the armies converge
+    /// on so the combat/spatiality pipeline is actually exercised by the
+    /// benchmark. Each unit aims at `(center.0, own_y)` (its own row on the
+    /// centre line), which builds a long continuous front rather than piling the
+    /// whole map onto one spot.
     center: (f32, f32),
     tick: u64,
-    /// Reusable (id, owner) list for the movement event. Filled in place by
-    /// `Game::fill_unit_id_owner` so steady-state (post-warmup) movement runs
+    /// Reusable `(id, owner, y)` list for the movement event. Filled in place by
+    /// `Game::fill_unit_id_owner_y` so steady-state (post-warmup) movement runs
     /// allocation-free instead of rebuilding a fat `Vec<UnitQueryData>` each time.
-    unit_id_owner: Vec<(String, String)>,
+    /// The `y` coordinate lets each unit aim at its own row on the centre line.
+    unit_id_owner_y: Vec<(String, String, f32)>,
 }
 
 impl BattleSimulator {
@@ -132,7 +136,7 @@ impl BattleSimulator {
             city_info,
             center: (map_w / 2.0, map_h / 2.0),
             tick: 0,
-            unit_id_owner: Vec::new(),
+            unit_id_owner_y: Vec::new(),
         }
     }
 
@@ -150,19 +154,35 @@ impl BattleSimulator {
         self.tick += 1;
         let utype_count = self.unit_types.len();
 
-        // Movement events: every 20 ticks, move 30% of units toward the map
-        // centre. Units are sorted by id and the RNG draw order is fixed, so
-        // the whole simulation is deterministic for a given seed (ids are unique,
-        // so the id-sort is a total order). The unit list is a reusable scratch
-        // buffer filled in place by `Game::fill_unit_id_owner`, so this builds no
-        // `Vec<UnitQueryData>` and allocates nothing in steady state.
+        // Movement events: every 20 ticks, move 30% of units toward the centre
+        // line (x = map_w/2) at their own row. Units are sorted by id and the RNG
+        // draw order is fixed, so the whole simulation is deterministic for a
+        // given seed (ids are unique, so the id-sort is a total order). The unit
+        // list is a reusable scratch buffer filled in place by
+        // `Game::fill_unit_id_owner_y`, so this builds no `Vec<UnitQueryData>` and
+        // allocates nothing in steady state.
+        //
+        // Targeting `(centre_x, own_y)` — not a single point — matters: aiming
+        // every unit at one point piles the whole map onto that spot and the
+        // front collapses (measured: ~5 combats/tick). Aiming each unit at its
+        // own row on the centre line makes the left and right halves meet along
+        // a long, continuous front and sustains combat (~95 pairs/tick) while
+        // keeping the population intact (see the 9 vs 9b stress comparison).
         if self.tick.is_multiple_of(20) {
-            let n = game.fill_unit_id_owner(&mut self.unit_id_owner);
-            self.unit_id_owner[..n].sort_by(|a, b| a.0.cmp(&b.0));
+            let n = game.fill_unit_id_owner_y(&mut self.unit_id_owner_y);
+            // `sort_unstable_by`, NOT `sort_by`: the stable `sort_by` allocates a
+            // same-size temporary buffer (~48 B × unit count ≈ 240 kB at 5k
+            // units) on *every* call, which fired every 20 ticks and dominated
+            // the benchmark's "biggest allocation per tick." Unit ids are unique,
+            // so the id ordering is a total order and stability is irrelevant —
+            // the in-place unstable sort yields the identical, deterministic
+            // result with no heap allocation (and is faster on large slices).
+            self.unit_id_owner_y[..n].sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let front_x = self.center.0;
             for i in 0..n {
                 if self.rand_f32() < 0.3 {
-                    let (unit_id, owner) = &self.unit_id_owner[i];
-                    game.move_troops(unit_id, owner, vec![self.center]);
+                    let (unit_id, owner, y) = &self.unit_id_owner_y[i];
+                    game.move_troops(unit_id, owner, vec![(front_x, *y)]);
                 }
             }
         }
@@ -185,6 +205,15 @@ impl BattleSimulator {
             }
         }
     }
+}
+
+/// Max units that can be laid out non-overlapping at `MIN_UNIT_DISTANCE`
+/// spacing on a `map_size`×`map_size` map. Conservative floor-based bound
+/// (true packing fits slightly more); used for the fail-fast capacity check so
+/// an infeasible benchmark config errors out before any work.
+pub fn lattice_capacity(map_size: u32) -> u64 {
+    let cells = (map_size as f32 / crate::game::constants::MIN_UNIT_DISTANCE).floor() as u64;
+    cells * cells
 }
 
 /// Run a benchmark using a fresh game and return detailed results.
@@ -361,40 +390,77 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 .saturating_mul(cities_with_owners.len() as u32),
         );
         total_units = 0;
-        match config.initial_units {
-            // Stress mode: field exactly N units total, distributed round-robin across
-            // cities (each city's owner fields its share). Infantry/cavalry alternate by
-            // global parity, same as the default path.
-            Some(target_total) => {
-                let n_cities = cities_with_owners.len().max(1);
-                for k in 0..target_total as usize {
-                    let city = &cities_with_owners[k % n_cities];
-                    let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
-                    let utype = if total_units.is_multiple_of(2) {
-                        &infantry
-                    } else {
-                        &cavalry
-                    };
-                    if game.recruit_unit(&city.id, utype, &owner).is_some() {
-                        total_units += 1;
-                    }
+
+        // Fail-fast capacity check: the lattice below lays units out at a spacing
+        // of `map_size / ceil(sqrt(N))`, which is ≥ MIN_UNIT_DISTANCE iff
+        // N ≤ floor(map_size / MIN_UNIT_DISTANCE)². Reject an infeasible config
+        // before any work (a non-overlapping placement is impossible otherwise).
+        // (Conservative lower bound — true packing fits slightly more; see the
+        // plan's R8.)
+        let capacity = lattice_capacity(map_cfg.width);
+        if requested_total as u64 > capacity {
+            eprintln!(
+                "✖ Cannot place {} units non-overlapping on a {}×{} map: the max \
+                 capacity at min spacing {} is {}. Increase \
+                 --bench-map-size or reduce --bench-initial-units.",
+                requested_total,
+                map_cfg.width,
+                map_cfg.height,
+                crate::game::constants::MIN_UNIT_DISTANCE,
+                capacity
+            );
+            std::process::exit(1);
+        }
+
+        // Non-overlapping lattice via the gate-free bypass. An n×n grid with
+        // n = ceil(sqrt(N)); spacing = map/n (≥ MIN_UNIT_DISTANCE, guaranteed by
+        // the capacity check). Units start non-overlapping from tick 0 → no
+        // warm-up drain, and movement/combat immediately see bounded density.
+        //
+        // Owners are assigned by quadrant (P0 top-left, P1 top-right, P2
+        // bottom-left, P3 bottom-right), not round-robin per cell. Per-cell
+        // round-robin would make a checkerboard of enemies 1 spacing apart
+        // (= COMBAT_DISTANCE), so ~half the units die during the 200-tick
+        // warmup before measurement. Quadrants give two clean front lines
+        // (x = map_w/2 and y = map_h/2): interior units are surrounded by their
+        // own side, so combat + the nearby-enemies query are still exercised at
+        // the front, but the population starts intact. Infantry/cavalry still
+        // alternate by global parity.
+        let map_size_f = map_cfg.width as f32;
+        let map_h_f = map_cfg.height as f32;
+        let n = (requested_total as f32).sqrt().ceil().max(1.0) as usize;
+        let spacing = map_size_f / n as f32;
+        // The four quadrant owners: distinct city owners in first-seen order
+        // (player_0..player_{BENCH_PLAYERS-1}). Fall back to player_0 if none.
+        let mut quadrant_owners: Vec<String> = Vec::new();
+        for c in &cities_with_owners {
+            if let Some(o) = &c.owner {
+                if !quadrant_owners.iter().any(|q| q == o) {
+                    quadrant_owners.push(o.clone());
                 }
             }
-            // Default path (unchanged): units_per_city per city, in city order.
-            None => {
-                for city in &cities_with_owners {
-                    let owner = city.owner.clone().unwrap_or_else(|| "player_0".to_string());
-                    for _ in 0..config.units_per_city {
-                        let utype = if total_units.is_multiple_of(2) {
-                            &infantry
-                        } else {
-                            &cavalry
-                        };
-                        if game.recruit_unit(&city.id, utype, &owner).is_some() {
-                            total_units += 1;
-                        }
-                    }
-                }
+        }
+        if quadrant_owners.is_empty() {
+            quadrant_owners.push("player_0".to_string());
+        }
+        let cx = map_size_f / 2.0;
+        let cy = map_h_f / 2.0;
+        for k in 0..requested_total as usize {
+            let utype = if total_units.is_multiple_of(2) {
+                &infantry
+            } else {
+                &cavalry
+            };
+            let pos = (
+                ((k % n) as f32 + 0.5) * spacing,
+                ((k / n) as f32 + 0.5) * spacing,
+            );
+            // Quadrant → owner index: left/top = 0, right/top = 1,
+            // left/bottom = 2, right/bottom = 3.
+            let quad = (if pos.0 < cx { 0 } else { 1 }) + (if pos.1 < cy { 0 } else { 2 });
+            let owner = &quadrant_owners[quad % quadrant_owners.len()];
+            if game.recruit_unit_at(utype, owner, pos).is_some() {
+                total_units += 1;
             }
         }
         println!(
@@ -438,14 +504,22 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         for _ in 0..config.ticks {
             let tick_start = Instant::now();
 
+            // Harness input generation (move/recruit orders). It is *timed*
+            // (a real tick includes applying orders) but kept OUT of the
+            // allocation window: the alloc stats measure the *game's* per-tick
+            // allocations, not the benchmark's input driver. The driver is now
+            // allocation-free in steady state anyway (see `sort_unstable_by` above
+            // and `fill_unit_id_owner_y`'s reused buffer).
+            sim.tick(&mut game, &config);
+
             #[cfg(feature = "bench-alloc")]
             let alloc_base = crate::bench_alloc::snapshot();
 
-            sim.tick(&mut game, &config);
             game.tick_game();
             // World read-back + counters are part of the per-tick work, so they
             // are timed: this keeps total_ms (systems + overhead) reconciling
-            // with the wall-clock avg tick, and counts their allocations.
+            // with the wall-clock avg tick. The read-backs are allocation-free,
+            // so leaving them inside the alloc window is harmless.
             // `unit_count()` is an allocation-free count (no UnitQueryData build).
             let unit_count = game.unit_count() as u32;
             let movers = game.last_mover_count() as u32;
@@ -2595,7 +2669,12 @@ fn average_allocs(entries: &[serde_json::Value]) -> serde_json::Value {
     let avg_calls = sum_calls as f64 / n;
     out["total_allocs"] = serde_json::json!(avg_total_allocs);
     out["total_bytes"] = serde_json::json!(avg_total_bytes);
-    out["call_count"] = serde_json::json!(sum_calls);
+    // Per-run average call count (NOT the 3-run sum). total_allocs/total_bytes
+    // above are per-run averages, so call_count must be too for the table to be
+    // self-consistent: allocs_per_tick / avg_allocs == call_count / ticks ==
+    // calls-per-tick. (Previously stored the raw sum, inflating call_count 3×
+    // and deflating the derived allocs/call + bytes/call by the same factor.)
+    out["call_count"] = serde_json::json!(avg_calls.round() as u64);
     out["avg_allocs"] = serde_json::json!(if avg_calls > 0.0 {
         avg_total_allocs / avg_calls
     } else {
@@ -2808,5 +2887,31 @@ mod tests {
             "no prev → no delta arrows: {row}"
         );
         assert!(!row.contains("new"), "no prev → no 'new' flag: {row}");
+    }
+
+    #[test]
+    fn lattice_capacity_scales_with_map_size() {
+        // capacity = floor(map_size / MIN_UNIT_DISTANCE)². With MIN_UNIT_DISTANCE
+        // = 8.0: a 1000×1000 map holds floor(125)² = 15 625; a 100×100 map holds
+        // floor(12.5)² = 144. The stress config (10 000 units on 1000) fits;
+        // 20 000 on 1000 does not (would fail fast). The exact-value asserts
+        // below also pin the formula against a future constant change.
+        let cap_1000 = lattice_capacity(1000);
+        assert_eq!(cap_1000, 15_625);
+        assert!(10_000u64 <= cap_1000, "stress config must fit the 1000-map");
+        assert!(20_000u64 > cap_1000, "over-capacity must be rejected");
+
+        let cap_100 = lattice_capacity(100);
+        assert!(cap_100 < cap_1000, "capacity must grow with map size");
+        assert_eq!(cap_100, 144);
+
+        // The plan's concrete infeasible example: 10 000 on 200×200 →
+        // capacity floor(200/8)² = 25² = 625 < 10 000 → must fail fast.
+        let cap_200 = lattice_capacity(200);
+        assert_eq!(cap_200, 625);
+        assert!(
+            10_000u64 > cap_200,
+            "10 000 units cannot lay out non-overlapping on 200×200 (capacity 625)"
+        );
     }
 }

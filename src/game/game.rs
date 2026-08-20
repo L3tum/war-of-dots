@@ -1,5 +1,6 @@
 //! Game facade — holds the ECS world, settings, and dispatches systems.
 
+use super::spatial;
 use crate::config::CityUpgradeSettings;
 use crate::game::components::*;
 use crate::game::economy::{City, UnitType};
@@ -165,8 +166,9 @@ pub struct Game {
     /// Pre-allocated supply/attrition scratch, cleared and reused each tick.
     supply_scratch: systems::supply::SupplyScratch,
     /// Spatial grid buffers for nearby_enemies, resized on growth and reused
-    /// each tick (no per-tick heap allocation at steady state).
-    grid_index_scratch: systems::nearby_enemies::GridIndexScratch,
+    /// each tick (no per-tick heap allocation at steady state). Built/updated
+    /// by movement, consumed by nearby_enemies.
+    grid_index_scratch: spatial::GridIndexScratch,
     /// Reused scratch buffers for the encirclement flood-fill.
     encirclement_scratch: systems::encirclement::EncirclementScratch,
     /// Economy scratch: (player_id, funds_earned) per player, cleared and reused
@@ -520,7 +522,7 @@ impl Game {
             entity_reverse: HashMap::new(),
             combat_scratch: systems::combat::CombatScratch::new(),
             supply_scratch: systems::supply::SupplyScratch::new(),
-            grid_index_scratch: systems::nearby_enemies::GridIndexScratch::new(),
+            grid_index_scratch: spatial::GridIndexScratch::default(),
             encirclement_scratch: systems::encirclement::EncirclementScratch::new(),
             economy_earned: Vec::new(),
             movement_scratch: systems::movement::MovementScratch::default(),
@@ -574,18 +576,20 @@ impl Game {
             .count()
     }
 
-    /// Fill a caller-owned scratch buffer with `(id, owner)` for every unit,
-    /// for the benchmark AI. Same 9-component query as `query_all_units`, so it
+    /// Fill a caller-owned scratch buffer with `(id, owner, y)` for every unit,
+    /// for the benchmark AI. Same 10-component query as `query_all_units`, so it
     /// sees the identical entity set (and preserves its determinism), but emits
-    /// only the `(id, owner)` the caller needs instead of the full
-    /// String/`Vec`-heavy `UnitQueryData`. Slots are overwritten in place and the
-    /// buffer is never shrunk, so after the first growth the steady-state call
-    /// performs no allocations. Returns the live unit count.
+    /// only the `(id, owner, y)` the caller needs instead of the full
+    /// String/`Vec`-heavy `UnitQueryData`. The `y` coordinate lets the driver aim
+    /// each unit at the centre line at its own row (a long, continuous front)
+    /// rather than a single point. Slots are overwritten in place and the buffer
+    /// is never shrunk, so after the first growth the steady-state call performs
+    /// no allocations. Returns the live unit count.
     #[allow(dead_code)]
-    pub fn fill_unit_id_owner(&self, out: &mut Vec<(String, String)>) -> usize {
+    pub fn fill_unit_id_owner_y(&self, out: &mut Vec<(String, String, f32)>) -> usize {
         use std::fmt::Write as _;
         let mut n = 0usize;
-        for (entity, owner, _utype, _display, _pos, _path, _stats, _equipment, _flags, _wt) in self
+        for (entity, owner, _utype, _display, pos, _path, _stats, _equipment, _flags, _wt) in self
             .world
             .query::<(
                 Entity,
@@ -602,7 +606,7 @@ impl Game {
             .iter()
         {
             if n == out.len() {
-                out.push((String::new(), String::new()));
+                out.push((String::new(), String::new(), 0.0));
             }
             let slot = &mut out[n];
             let eid = entity.id();
@@ -611,6 +615,7 @@ impl Game {
             slot.0.clear();
             let _ = write!(slot.0, "unit_{eid}");
             slot.1.clone_from(&owner.player_id);
+            slot.2 = pos.y;
             n += 1;
         }
         n
@@ -720,7 +725,9 @@ impl Game {
             systems::water::run(&mut self.world, self.world_entity, &mut self.water_scratch)
         );
 
-        // Movement returns count of units that moved this tick.
+        // Movement returns count of units that moved this tick. It also builds
+        // the pre-move spatial grid (occupancy gate) and the post-move grid
+        // (consumed by nearby_enemies) into `self.grid_index_scratch`.
         let mover_count = tick_system!(
             "movement",
             &mut self.world,
@@ -731,6 +738,8 @@ impl Game {
                 &self.settings,
                 &mut self.movement_scratch,
                 &self.unit_types_index,
+                &self.ctx,
+                &mut self.grid_index_scratch,
             )
         );
         self.last_mover_count = mover_count;
@@ -755,16 +764,16 @@ impl Game {
             });
         }
 
-        // NearbyEnemies: brute-force rebuild of enemy adjacency lists.
-        // Runs after movement (so positions are current) and before combat.
-        // Uses shared TickContext owner lookup instead of its own &UnitOwner query.
+        // NearbyEnemies: consume the post-move spatial grid that movement just
+        // built (3×3 cell query + circle filter, O(n × c) with bounded c).
+        // Runs after movement (so the grid reflects current positions) and
+        // before combat.
         {
-            let ctx = &self.ctx;
             tick_system!(
                 "nearby_enemies",
                 &mut self.world,
                 self.world_entity,
-                systems::nearby_enemies::run(&mut self.world, ctx, &mut self.grid_index_scratch,)
+                systems::nearby_enemies::run(&mut self.world, &mut self.grid_index_scratch,)
             );
         }
 
@@ -894,7 +903,10 @@ impl Game {
 
         // Unified death cleanup: process dead entities from combat, attrition,
         // and surrender (order preserved for determinism) via slice views so no
-        // fresh `all_dead` Vec is collected each tick.
+        // fresh `all_dead` Vec is collected each tick. Purges dead units from
+        // the NearbyEnemies lists of the units that reference them, via the
+        // dead units' own lists (reverse lookup) — see death_cleanup.rs for
+        // the freshness/symmetry invariant this relies on.
         let death_count = tick_system!(
             "death_cleanup",
             &mut self.world,
@@ -927,6 +939,14 @@ impl Game {
     // Public API
     // ====================================================================
 
+    /// Recruit a unit at a city, gated by the circle occupancy rule.
+    ///
+    /// Looks up the city (validating it exists and belongs to `owner`), then
+    /// applies the **circle gate**: if any unit's center is already within
+    /// `MIN_UNIT_DISTANCE` of the city point, the recruit is rejected *before*
+    /// anything is spent (returns `None`). Otherwise delegates to
+    /// [`Game::recruit_at`]. Recruits are event-rate in real play, so the gate
+    /// is an on-demand O(n) scan — no grid lookup needed here.
     pub fn recruit_unit(
         &mut self,
         city_id: &str,
@@ -944,6 +964,36 @@ impl Game {
             city.position
         };
 
+        // Circle gate: a unit may not be placed so another unit's center is
+        // within MIN_UNIT_DISTANCE of it. Rejected before any resource check /
+        // deduction, so a blocked recruit spends nothing.
+        if self.cell_occupied(city_pos) {
+            return None;
+        }
+
+        self.recruit_at(unit_type, owner, city_pos)
+    }
+
+    /// Recruit a unit at an explicit position, **without** the circle
+    /// occupancy gate. This is the premade/benchmark bypass — identical
+    /// resource checks + bookkeeping to [`Game::recruit_unit`], but the
+    /// position is caller-chosen and stacking is allowed.
+    // Used by the lib's benchmark/fixtures, not the bin's own `mod game` copy.
+    #[allow(dead_code)]
+    pub fn recruit_unit_at(
+        &mut self,
+        unit_type: &UnitType,
+        owner: &str,
+        pos: (f32, f32),
+    ) -> Option<String> {
+        self.recruit_at(unit_type, owner, pos)
+    }
+
+    /// Shared recruitment core: validate funds + manpower, deduct, spawn at
+    /// `pos`, and do the post-spawn bookkeeping (entity registry, owner map,
+    /// dirtiness, player stats). Used by both the gated `recruit_unit` and the
+    /// `recruit_unit_at` bypass. Returns the new unit's string id.
+    fn recruit_at(&mut self, unit_type: &UnitType, owner: &str, pos: (f32, f32)) -> Option<String> {
         // Check funds
         let funds = self.world.player_funds(self.world_entity, owner);
         if funds < unit_type.recruitment_cost {
@@ -962,7 +1012,7 @@ impl Game {
             return None;
         }
 
-        // Phase 2: All checks passed — deduct resources
+        // All checks passed — deduct resources
         {
             let wb = self.world.world_data_mut(self.world_entity)?;
             if let Some(f) = wb.funds.funds.get_mut(owner) {
@@ -973,7 +1023,7 @@ impl Game {
             }
         }
 
-        let entity = self.world.spawn_unit(unit_type, owner, city_pos);
+        let entity = self.world.spawn_unit(unit_type, owner, pos);
         let unit_id = format!("unit_{}", entity.id());
         self.entity_registry.insert(unit_id.clone(), entity);
         self.entity_reverse.insert(entity, unit_id.clone());
@@ -1004,6 +1054,20 @@ impl Game {
         *self.prev_unit_counts.entry(owner.to_string()).or_insert(0) += 1;
 
         Some(unit_id)
+    }
+
+    /// True if any unit's center is within `MIN_UNIT_DISTANCE` of `pos`.
+    /// On-demand O(n) scan (recruits are event-rate; no grid lookup here).
+    fn cell_occupied(&self, pos: (f32, f32)) -> bool {
+        let limit = crate::game::constants::MIN_UNIT_DISTANCE_SQ;
+        self.world
+            .query::<(Entity, &UnitPosition)>()
+            .iter()
+            .any(|(_e, other)| {
+                let dx = pos.0 - other.x;
+                let dy = pos.1 - other.y;
+                dx * dx + dy * dy < limit
+            })
     }
 
     /// Get the owner of a unit by its string ID.
@@ -1982,5 +2046,151 @@ mod tests {
             1,
             "(9,4) flipped to player_1 after the city was stolen"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // recruit_unit — circle occupancy gate (MIN_UNIT_DISTANCE)
+    // ---------------------------------------------------------------------------
+
+    /// Read (funds, manpower) for a player from the world bundle.
+    fn funds_manpower(game: &Game, player: &str) -> (u32, u32) {
+        let wb = game.world.world_data(game.world_entity).unwrap();
+        let funds = wb.funds.funds.get(player).copied().unwrap_or(0);
+        let manpower = wb.funds.manpower.get(player).copied().unwrap_or(0);
+        (funds, manpower)
+    }
+
+    /// Count units (entities carrying a UnitPosition) in the world.
+    fn unit_count(game: &Game) -> usize {
+        game.world
+            .query::<(&crate::game::components::UnitPosition,)>()
+            .iter()
+            .count()
+    }
+
+    /// The first recruit at a city succeeds; a second recruit at the *same*
+    /// city is blocked (a unit already sits at the city point, dist 0 <
+    /// MIN_UNIT_DISTANCE) and deducts nothing.
+    #[test]
+    fn recruit_gate_blocks_second_unit_at_city() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.start();
+        let ut = basic_unit_type();
+
+        // First recruit at city_0 (3,3): succeeds, spends resources.
+        assert!(game.recruit_unit("city_0", &ut, "player_0").is_some());
+        assert_eq!(unit_count(&game), 1);
+        let (funds_after_1, mp_after_1) = funds_manpower(&game, "player_0");
+
+        // Second recruit at the same city: blocked → None, spends nothing.
+        assert!(
+            game.recruit_unit("city_0", &ut, "player_0").is_none(),
+            "a unit is already at the city point — second recruit must be blocked"
+        );
+        assert_eq!(
+            unit_count(&game),
+            1,
+            "blocked recruit must not spawn a unit"
+        );
+        let (funds_after_2, mp_after_2) = funds_manpower(&game, "player_0");
+        assert_eq!(
+            (funds_after_2, mp_after_2),
+            (funds_after_1, mp_after_1),
+            "blocked recruit must deduct nothing"
+        );
+    }
+
+    /// A unit at one city does not block recruitment at a far-away city
+    /// (city_0 (3,3) vs city_1 (16,3): dist 13 > MIN_UNIT_DISTANCE 8).
+    #[test]
+    fn recruit_gate_allows_far_city() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.assign_city_owner("city_1", "player_1");
+        game.start();
+        let ut = basic_unit_type();
+
+        assert!(game.recruit_unit("city_0", &ut, "player_0").is_some());
+        assert!(
+            game.recruit_unit("city_1", &ut, "player_1").is_some(),
+            "far city (dist 13 > 8) must not be blocked by the unit at city_0"
+        );
+        assert_eq!(unit_count(&game), 2);
+    }
+
+    /// The bypass (`recruit_unit_at`) ignores the gate: two units may be placed
+    /// at the exact same position (used by premade/benchmark fixtures that
+    /// stack units per city). It deducts resources and registers id/owner
+    /// identically to the gated path.
+    #[test]
+    fn recruit_unit_at_bypass_allows_stacking() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.start();
+        let ut = basic_unit_type();
+        let (funds_before, mp_before) = funds_manpower(&game, "player_0");
+
+        // A normal (gated) recruit at city_0 (3,3).
+        assert!(game.recruit_unit("city_0", &ut, "player_0").is_some());
+        // A bypass recruit at the *same* point — gate is skipped.
+        let id = game
+            .recruit_unit_at(&ut, "player_0", (3.0, 3.0))
+            .expect("bypass must not be subject to the occupancy gate");
+        assert_eq!(unit_count(&game), 2, "two units may now occupy (3,3)");
+
+        // Identical bookkeeping to the gated path: id registered, owner set,
+        // resources deducted.
+        assert!(
+            game.entity_registry.contains_key(&id),
+            "bypass must register the unit id"
+        );
+        assert_eq!(
+            game.get_unit_owner(&id).as_deref(),
+            Some("player_0"),
+            "bypass must set the owner identically to recruit_unit"
+        );
+        let (funds_after, mp_after) = funds_manpower(&game, "player_0");
+        assert_eq!(
+            funds_after,
+            funds_before.saturating_sub(2 * ut.recruitment_cost),
+            "both recruits must deduct the recruitment cost"
+        );
+        assert_eq!(
+            mp_after,
+            mp_before - 2 * ut.men,
+            "both recruits must deduct manpower"
+        );
+    }
+
+    /// The gate is a live scan of current positions, not sticky state: once the
+    /// unit that was blocking the city has moved away, the next recruit at the
+    /// same city succeeds again.
+    #[test]
+    fn recruit_gate_reallows_after_unit_moves_away() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.assign_city_owner("city_0", "player_0");
+        game.start();
+        let ut = basic_unit_type();
+
+        // First recruit sits on the city (3,3) and blocks a second.
+        let id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        assert!(game.recruit_unit("city_0", &ut, "player_0").is_none());
+
+        // The unit moves away (relocate its position far from the city).
+        let entity = *game.entity_registry.get(&id).unwrap();
+        let (pos,) = game
+            .world
+            .query_one_mut::<(&mut crate::game::components::UnitPosition,)>(entity)
+            .unwrap();
+        pos.x = 10.0; // (10,10) is 9.9 from (3,3) → outside MIN_UNIT_DISTANCE
+        pos.y = 10.0;
+
+        // Now the same city is free again → the next recruit succeeds.
+        assert!(
+            game.recruit_unit("city_0", &ut, "player_0").is_some(),
+            "gate must re-allow once the blocker has moved away"
+        );
+        assert_eq!(unit_count(&game), 2);
     }
 }
