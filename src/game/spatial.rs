@@ -2,8 +2,8 @@
 //!
 //! A flat-buffer 1D grid (prefix-sum offsets + sizes, no per-cell Vecs) mapping
 //! unit positions to coarse cells. **Built/updated in place by `movement`** and
-//! consumed downstream (`nearby_enemies`, `combat` via the `NearbyEnemies` lists
-//! movement's grid feeds). The dense buffers (`entries`/`cell_offsets`/
+//! consumed downstream by `combat`'s mover scan (sticky target acquisition),
+//! which runs the 3×3 neighbour circle query against the fresh post-move grid. The dense buffers (`entries`/`cell_offsets`/
 //! `cell_sizes`) are resized only on growth and overwritten in place each build
 //! — **no `::clear()` of the grid structure, no steady-state heap allocation**.
 //!
@@ -41,8 +41,8 @@ pub struct GridIndexScratch {
     /// reusable state that is deliberately *not* cleared.
     pub units: Vec<(Entity, UnitPosition, u8)>,
     /// The most recently built index metadata (bounds + dimensions). Written by
-    /// the builder (`movement`'s post-move build) and read by consumers
-    /// (`nearby_enemies`) so the grid is built once and reused, not rebuilt.
+    /// the builder (`movement`'s post-move build) and read by the consumer
+    /// (`combat`'s mover scan) so the grid is built once and reused, not rebuilt.
     pub index: GridIndex,
 }
 

@@ -44,7 +44,7 @@ pub fn run(
             .iter()
         {
             // Compact owner lookup (see TickContext); skip if the entity is
-            // somehow absent — matches nearby_enemies' defensive pattern.
+            // somehow absent — matches combat's mover-scan defensive pattern.
             let unit_owner_idx = match ctx.owner_id_by_entity.get(&entity).copied() {
                 Some(i) => i,
                 None => continue,

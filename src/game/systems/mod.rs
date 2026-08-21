@@ -7,7 +7,6 @@ pub mod economy;
 pub mod encirclement;
 pub mod influence;
 pub mod movement;
-pub mod nearby_enemies;
 pub mod supply;
 pub mod surrender;
 pub mod water;

@@ -1,25 +1,22 @@
 //! DeathCleanupSystem — unified cleanup of dead units from combat, attrition, and surrender.
 //!
 //! Runs after all death-producing systems have finished. Performs:
-//! 1. Purge dead units from the `NearbyEnemies` lists of the units that
-//!    reference them — via the dead units' own lists (reverse lookup),
-//!    O(sum of dead units' neighborhood sizes), not O(all lists)
+//! 1. Clear the explicit combat target (`UnitFlags.attacking`) of units
+//!    pointing at a unit that died post-combat this tick (target-lifecycle
+//!    site 3, plans/COMBAT_TARGETING.md §8.4)
 //! 2. Despawn dead entities and clean entity registry
 
 use std::collections::HashMap;
 
-use crate::game::components::NearbyEnemies;
+use crate::game::components::UnitFlags;
 
-/// Grow-only scratch for death cleanup: both sets are `clear()`'d each run
+/// Grow-only scratch for death cleanup: the set is `clear()`'d each run
 /// (capacity preserved), so a death-spike tick's size is retained and later
 /// spikes free the HashSet rebuild. `clear()` keeps capacity.
 #[derive(Default)]
 pub struct DeathCleanupScratch {
-    /// Entities dying this tick — built once, reused for the purge pass.
+    /// Entities dying this tick — built once, reused per run.
     pub dead_set: std::collections::HashSet<hecs::Entity>,
-    /// Units whose lists reference a dead unit (reverse lookup) — the lists
-    /// to purge. Rebuilt each run from the dead units' own lists.
-    pub seen: std::collections::HashSet<hecs::Entity>,
 }
 
 pub fn run(
@@ -45,68 +42,29 @@ pub fn run(
         }
     }
 
-    // REVERSE-LOOKUP PURGE (why this is exact under the current architecture):
-    //
-    // (a) `nearby_enemies` rebuilds every list from a single grid snapshot
-    //     each tick (runs before combat; tick order: movement →
-    //     nearby_enemies → combat → … → death_cleanup, and no system moves
-    //     units in between), using a symmetric distance predicate. So at this
-    //     point the lists are FRESH AND SYMMETRIC: for dead unit D, the set
-    //     of units whose lists contain D is exactly D's own list. Reading
-    //     each dead unit's own `NearbyEnemies` therefore covers every
-    //     reference to D — no unit can reference a dead unit without
-    //     appearing in the dead unit's list.
-    //
-    // (b) The coverage in (a) depends on list freshness/symmetry. If
-    //     `nearby_enemies` ever becomes conditional (see its TODO), a dead
-    //     unit's own list could miss a unit that still references it, and
-    //     that stale one-sided entry would survive the purge. It is safe:
-    //     combat tolerates it (`world.get::<&UnitPosition>` on a despawned
-    //     entity is `Err` → skip; see the stale-window test below) and the
-    //     next rebuild overwrites it.
-    //
-    // (c) hecs generations make stale entries unmatchable: despawn bumps the
-    //     generation, so even if the entity index is reused, `world.get`
-    //     with the old (index, generation) value returns `Err`.
-    //
-    // (d) Determinism: the purge removes exactly the (U, D) pairs the old
-    //     flat world-wide `retain` removed (U references D ⟺ D's list
-    //     contains U ⟺ U is a candidate), so the world state after this
-    //     system is bit-identical to the pre-change behavior.
-    //
-    // NOTE: lists must be read BEFORE despawn — components vanish with the
-    // entity, so the reverse lookup has to happen first.
-
-    // 2. Build the candidate set: every unit whose list references a dead
-    //    unit appears in some dead unit's own list (fresh & symmetric, (a)).
-    //    `seen` is the set of lists to purge. O(sum of dead units' list
-    //    sizes) — no world-wide list scan.
-    scratch.seen.clear();
-    for list in dead_lists {
-        for dead in *list {
-            if let Ok((nb,)) = world.query_one_mut::<(&NearbyEnemies,)>(*dead) {
-                for &u in nb.entities.iter() {
-                    scratch.seen.insert(u);
-                }
+    // Target-lifecycle site 3 (plans/COMBAT_TARGETING.md §8.4): units whose
+    // explicit combat target died to supply/surrender (post-combat deaths)
+    // get `attacking = None`. Combat's own validation (site 2) handles
+    // combat deaths; this pass covers the deaths that happen AFTER combat
+    // runs in the same tick. Done before despawn (components vanish with
+    // the entity; we only read `dead_set` + clear flags, so order vs the
+    // despawn is immaterial, but grouping the cleanup in one place keeps it
+    // reviewable). Stale entries are unmatchable once despawned (hecs
+    // generations), so any reference that slips past this tick is tolerated
+    // by combat's target-validation skip path.
+    // Collect first, then mutate: the query iterator holds an immutable
+    // world borrow across the loop.
+    let mut to_clear: Vec<hecs::Entity> = Vec::new();
+    for (entity, flags) in world.query::<(hecs::Entity, &UnitFlags)>().iter() {
+        if let Some(target) = flags.attacking {
+            if scratch.dead_set.contains(&target) {
+                to_clear.push(entity);
             }
         }
     }
-
-    // 3. Single query pass; retain only on candidate lists. Two rejected
-    //    alternatives, and why:
-    //      • world-wide flat `retain` — scans every list (O(total entries))
-    //        even when one unit dies.
-    //      • per-candidate `query_one_mut` — pays an archetype lookup per
-    //        candidate; on a death spike where candidates ≈ all units that
-    //        is a full extra pass stacked on the same retain work (this is
-    //        exactly what made the first reverse-lookup cut ~2× slower on
-    //        the stress benchmark).
-    //    One pass + a per-unit membership test gives the best of both:
-    //    light deaths touch only the affected lists; spikes cost the
-    //    flat-retain amount with no extra pass.
-    for (entity, nb) in world.query::<(hecs::Entity, &mut NearbyEnemies)>().iter() {
-        if scratch.seen.contains(&entity) {
-            nb.entities.retain(|e| !scratch.dead_set.contains(e));
+    for entity in to_clear {
+        if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
+            mf.attacking = None;
         }
     }
 
@@ -126,191 +84,58 @@ mod tests {
     use super::*;
     use crate::game::components::UnitPosition;
 
-    fn spawn_with_nearby(world: &mut hecs::World) -> hecs::Entity {
-        world.spawn((
-            NearbyEnemies {
-                entities: Default::default(),
-                initialized: true,
-            },
-            UnitPosition { x: 0.0, y: 0.0 },
-        ))
+    fn spawn_unit(world: &mut hecs::World) -> hecs::Entity {
+        world.spawn((UnitPosition { x: 0.0, y: 0.0 },))
     }
 
     #[test]
-    fn cleanup_removes_dead_via_reverse_lookup() {
+    fn cleanup_despawns_dead_and_clears_registry() {
         let mut world = hecs::World::new();
-        let alive = spawn_with_nearby(&mut world);
-        let dead1 = spawn_with_nearby(&mut world);
-        // dead2 has a position but NO NearbyEnemies — a dead unit without a
-        // list contributes nothing to the candidate set (its own reverse
-        // lookup finds no one).
-        let dead2 = world.spawn((UnitPosition { x: 0.0, y: 0.0 },));
-
-        // Setup reflects the fresh symmetric invariant: dead1's own list
-        // references the alive unit (so the reverse lookup finds `alive` as a
-        // candidate), and the alive unit references both dead units.
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(alive)
-                .unwrap()
-                .0;
-            nb.entities.push(dead1);
-            nb.entities.push(dead2);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead1)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
+        let alive = spawn_unit(&mut world);
+        let dead1 = spawn_unit(&mut world);
+        let dead2 = spawn_unit(&mut world);
 
         let mut entity_reverse = HashMap::new();
         entity_reverse.insert(dead1, "owner1".to_string());
         entity_reverse.insert(dead2, "owner2".to_string());
+        entity_reverse.insert(alive, "owner0".to_string());
 
         let mut scratch = DeathCleanupScratch::default();
         let deads = [dead1, dead2];
         let count = run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
 
-        // All dead units cleaned up (dead2 counted even without a list).
+        // All dead units counted and despawned; the alive unit is untouched.
         assert_eq!(count, 2);
-
-        // dead entities should be despawned
         assert!(
-            world.get::<&NearbyEnemies>(dead1).is_err(),
-            "dead entity should be despawned"
+            world.get::<&UnitPosition>(dead1).is_err(),
+            "dead1 despawned"
         );
         assert!(
             world.get::<&UnitPosition>(dead2).is_err(),
-            "dead entity without a list should be despawned too"
+            "dead2 despawned"
         );
+        assert!(world.get::<&UnitPosition>(alive).is_ok(), "alive untouched");
 
-        // entity_reverse cleaned
+        // entity_reverse cleaned of dead, alive entry kept.
         assert!(!entity_reverse.contains_key(&dead1));
         assert!(!entity_reverse.contains_key(&dead2));
-
-        // alive's list [dead1, dead2] is fully purged: `alive` is a candidate
-        // (dead1's own list contains it), so the single-query pass retains its
-        // WHOLE list, dropping BOTH dead entries — including dead2, which has
-        // no list of its own and so contributes nothing to the candidate set.
-        // (A one-sided reference with no dead-unit coverage is the separate
-        // stale-window case: see `stale_one_sided_reference_survives_is_safe`.)
-        let nearby = world.get::<&NearbyEnemies>(alive).unwrap();
-        assert!(
-            nearby.entities.is_empty(),
-            "candidate's whole list is retained, dropping all dead entries"
-        );
-    }
-
-    #[test]
-    fn stale_one_sided_reference_survives_is_safe() {
-        let mut world = hecs::World::new();
-        let alive = spawn_with_nearby(&mut world);
-        let dead = spawn_with_nearby(&mut world);
-
-        // One-sided reference: alive lists dead, but dead's list is EMPTY.
-        // This simulates a stale list that could exist if the rebuild ever
-        // becomes conditional — the reverse lookup cannot find `alive` via
-        // `dead`, so the reference is NOT purged (documented limitation).
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(alive)
-                .unwrap()
-                .0;
-            nb.entities.push(dead);
-        }
-
-        let mut entity_reverse = HashMap::new();
-        entity_reverse.insert(dead, "owner1".to_string());
-
-        let mut scratch = DeathCleanupScratch::default();
-        let deads = [dead];
-        let count = run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
-
-        assert_eq!(count, 1);
-        // dead is despawned and entity_reverse is cleaned.
-        assert!(world.get::<&UnitPosition>(dead).is_err());
-        assert!(!entity_reverse.contains_key(&dead));
-
-        // The stale one-sided entry SURVIVES the purge (coverage requires
-        // the dead unit's own list to be fresh)...
-        {
-            let nearby = world.get::<&NearbyEnemies>(alive).unwrap();
-            assert_eq!(
-                nearby.entities.as_slice(),
-                [dead].as_slice(),
-                "one-sided stale entry survives the reverse-lookup purge"
-            );
-        }
-
-        // ...and it is safe: exactly what combat's continue path relies on.
-        assert!(world.get::<&UnitPosition>(dead).is_err());
-
-        // Generation non-aliasing: even if the index is reused by a fresh
-        // entity, the stale Entity value never matches it.
-        let fresh = spawn_with_nearby(&mut world);
-        assert!(world.get::<&UnitPosition>(fresh).is_ok());
-        assert!(
-            world.get::<&UnitPosition>(dead).is_err(),
-            "stale Entity value must never match a successor"
-        );
-    }
-
-    #[test]
-    fn dying_candidates_are_skipped() {
-        let mut world = hecs::World::new();
-        let dead1 = spawn_with_nearby(&mut world);
-        let dead2 = spawn_with_nearby(&mut world);
-
-        // Both dead units reference each other — each is a "candidate"
-        // found via the other's list, but both are dying this tick, so the
-        // purge step must skip them (no panic, no double-processing).
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead1)
-                .unwrap()
-                .0;
-            nb.entities.push(dead2);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead2)
-                .unwrap()
-                .0;
-            nb.entities.push(dead1);
-        }
-
-        let mut entity_reverse = HashMap::new();
-        entity_reverse.insert(dead1, "o1".to_string());
-        entity_reverse.insert(dead2, "o2".to_string());
-
-        let mut scratch = DeathCleanupScratch::default();
-        let deads = [dead1, dead2];
-        let count = run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
-
-        assert_eq!(count, 2);
-        assert!(world.get::<&UnitPosition>(dead1).is_err());
-        assert!(world.get::<&UnitPosition>(dead2).is_err());
-        assert!(!entity_reverse.contains_key(&dead1));
-        assert!(!entity_reverse.contains_key(&dead2));
+        assert!(entity_reverse.contains_key(&alive));
     }
 
     #[test]
     fn cleanup_empty_input_returns_early() {
         let mut world = hecs::World::new();
-        let entity = spawn_with_nearby(&mut world);
-        assert!(world.get::<&NearbyEnemies>(entity).is_ok());
+        let entity = spawn_unit(&mut world);
 
         let mut entity_reverse = HashMap::new();
         let mut scratch = DeathCleanupScratch::default();
         let empty: Vec<hecs::Entity> = Vec::new();
-        // Empty input should not affect anything
+        // Empty input should not affect anything.
         run(&mut world, &[&empty[..]], &mut entity_reverse, &mut scratch);
 
-        // Entity should still exist
+        // Entity should still exist.
         assert!(
-            world.get::<&NearbyEnemies>(entity).is_ok(),
+            world.get::<&UnitPosition>(entity).is_ok(),
             "entity should not be affected by empty cleanup"
         );
     }
@@ -318,44 +143,18 @@ mod tests {
     #[test]
     fn cleanup_multiple_sides() {
         let mut world = hecs::World::new();
-        let dead_a = spawn_with_nearby(&mut world);
-        let dead_b = spawn_with_nearby(&mut world);
-        let alive = spawn_with_nearby(&mut world);
-
-        // Both dead units (from different sides) are referenced by alive,
-        // and each dead unit's own list contains alive.
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(alive)
-                .unwrap()
-                .0;
-            nb.entities.push(dead_a);
-            nb.entities.push(dead_b);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead_a)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead_b)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
+        let dead_a = spawn_unit(&mut world);
+        let dead_b = spawn_unit(&mut world);
+        let alive = spawn_unit(&mut world);
 
         let mut entity_reverse = HashMap::new();
         entity_reverse.insert(dead_a, "a".to_string());
         entity_reverse.insert(dead_b, "b".to_string());
 
         let mut scratch = DeathCleanupScratch::default();
-        let dead_lists = [dead_a, dead_b];
         let count = run(
             &mut world,
-            &[&[dead_lists[0]][..], &[dead_lists[1]][..]],
+            &[&[dead_a][..], &[dead_b][..]],
             &mut entity_reverse,
             &mut scratch,
         );
@@ -365,140 +164,13 @@ mod tests {
         assert!(world.get::<&UnitPosition>(dead_b).is_err());
         assert!(!entity_reverse.contains_key(&dead_a));
         assert!(!entity_reverse.contains_key(&dead_b));
-
-        // alive's list was purged via both dead units' own lists.
-        let nearby = world.get::<&NearbyEnemies>(alive).unwrap();
-        assert!(nearby.entities.is_empty());
-    }
-
-    #[test]
-    fn cleanup_preserves_order_of_entities() {
-        let mut world = hecs::World::new();
-        let alive = spawn_with_nearby(&mut world);
-        let dead1 = spawn_with_nearby(&mut world);
-        let dead2 = spawn_with_nearby(&mut world);
-        let keep1 = spawn_with_nearby(&mut world);
-        let keep2 = spawn_with_nearby(&mut world);
-
-        // alive references [dead1, keep1, dead2, keep2] — order of kept
-        // entities must be preserved by the retain pass.
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(alive)
-                .unwrap()
-                .0;
-            nb.entities.push(dead1);
-            nb.entities.push(keep1);
-            nb.entities.push(dead2);
-            nb.entities.push(keep2);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead1)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead2)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
-
-        let mut entity_reverse = HashMap::new();
-        entity_reverse.insert(dead1, "1".to_string());
-        entity_reverse.insert(dead2, "2".to_string());
-
-        let mut scratch = DeathCleanupScratch::default();
-        let deads = [dead1, dead2];
-        let count = run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
-
-        assert_eq!(count, 2);
-        let nearby = world.get::<&NearbyEnemies>(alive).unwrap();
-        assert_eq!(
-            nearby.entities.len(),
-            2,
-            "only non-dead entities should remain"
-        );
-        // retain preserves the original relative order.
-        assert_eq!(
-            nearby.entities.as_slice(),
-            [keep1, keep2].as_slice(),
-            "kept entity order must be preserved"
-        );
-    }
-
-    #[test]
-    fn scratch_is_reusable_across_calls() {
-        // Two successive calls must reuse scratch without leaking state
-        // (dead_set/candidates/seen are cleared per run).
-        let mut world = hecs::World::new();
-        let alive = spawn_with_nearby(&mut world);
-        let dead1 = spawn_with_nearby(&mut world);
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(alive)
-                .unwrap()
-                .0;
-            nb.entities.push(dead1);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead1)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
-
-        let mut entity_reverse = HashMap::new();
-        entity_reverse.insert(dead1, "1".to_string());
-
-        let mut scratch = DeathCleanupScratch::default();
-        let deads = [dead1];
-        let count = run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
-        assert_eq!(count, 1);
-
-        // Second call with a fresh death in the same world must work
-        // (no stale candidates/dead_set entries from the first call).
-        let dead2 = spawn_with_nearby(&mut world);
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(alive)
-                .unwrap()
-                .0;
-            nb.entities.push(dead2);
-        }
-        {
-            let nb = world
-                .query_one_mut::<(&mut NearbyEnemies,)>(dead2)
-                .unwrap()
-                .0;
-            nb.entities.push(alive);
-        }
-        entity_reverse.insert(dead2, "2".to_string());
-
-        let deads2 = [dead2];
-        let count2 = run(
-            &mut world,
-            &[&deads2[..]],
-            &mut entity_reverse,
-            &mut scratch,
-        );
-        assert_eq!(count2, 1);
-        assert!(world.get::<&UnitPosition>(dead2).is_err());
-        let nearby = world.get::<&NearbyEnemies>(alive).unwrap();
-        assert!(
-            nearby.entities.is_empty(),
-            "both deaths must be purged with a reused scratch"
-        );
+        assert!(world.get::<&UnitPosition>(alive).is_ok());
     }
 
     #[test]
     fn cleanup_removes_from_entity_reverse() {
         let mut world = hecs::World::new();
-        let dead = spawn_with_nearby(&mut world);
+        let dead = spawn_unit(&mut world);
 
         let mut entity_reverse: HashMap<hecs::Entity, String> = HashMap::new();
         entity_reverse.insert(dead, "unit_123".to_string());
@@ -510,6 +182,117 @@ mod tests {
         assert!(
             entity_reverse.is_empty(),
             "entity_reverse should be cleaned of dead entity"
+        );
+    }
+
+    #[test]
+    fn scratch_is_reusable_across_calls() {
+        // Two successive calls must reuse scratch without leaking state
+        // (dead_set is cleared per run).
+        let mut world = hecs::World::new();
+        let alive = spawn_unit(&mut world);
+        let dead1 = spawn_unit(&mut world);
+
+        let mut entity_reverse = HashMap::new();
+        entity_reverse.insert(dead1, "1".to_string());
+
+        let mut scratch = DeathCleanupScratch::default();
+        let deads = [dead1];
+        let count = run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
+        assert_eq!(count, 1);
+
+        // Second call with a fresh death in the same world must work (no
+        // stale dead_set entries from the first call).
+        let dead2 = spawn_unit(&mut world);
+        entity_reverse.insert(dead2, "2".to_string());
+
+        let deads2 = [dead2];
+        let count2 = run(
+            &mut world,
+            &[&deads2[..]],
+            &mut entity_reverse,
+            &mut scratch,
+        );
+        assert_eq!(count2, 1);
+        assert!(world.get::<&UnitPosition>(dead2).is_err());
+        assert!(world.get::<&UnitPosition>(alive).is_ok());
+    }
+
+    /// Safety invariant site 3 depends on: once an entity is despawned, its
+    /// `Entity` value can never match a successor (hecs bumps the generation),
+    /// so a stale `attacking` reference pointing at a dead unit is unmatchable
+    /// and combat's target-validation skip path tolerates it.
+    #[test]
+    fn stale_entity_value_never_matches_successor() {
+        let mut world = hecs::World::new();
+        let dead = spawn_unit(&mut world);
+        world.despawn(dead).unwrap();
+        assert!(world.get::<&UnitPosition>(dead).is_err());
+
+        // Index may be reused by a fresh entity, but the stale value (old
+        // generation) must never match it.
+        let fresh = spawn_unit(&mut world);
+        assert!(world.get::<&UnitPosition>(fresh).is_ok());
+        assert!(
+            world.get::<&UnitPosition>(dead).is_err(),
+            "stale Entity value must never match a successor"
+        );
+    }
+
+    /// Site 3: a unit whose explicit combat target died to supply/surrender
+    /// (post-combat, i.e. in this same cleanup's dead set) gets
+    /// `attacking = None`. A unit targeting a *living* unit keeps its target.
+    #[test]
+    fn site3_clears_target_pointing_at_post_combat_death() {
+        let mut world = hecs::World::new();
+        let attacker = spawn_unit(&mut world);
+        let dead_target = spawn_unit(&mut world);
+        let live_target = spawn_unit(&mut world);
+
+        // attacker targets the unit about to die; a second unit targets the
+        // one that lives.
+        world
+            .insert(
+                attacker,
+                (UnitFlags {
+                    attacking: Some(dead_target),
+                    ..UnitFlags::default()
+                },),
+            )
+            .unwrap();
+        let third = spawn_unit(&mut world);
+        world
+            .insert(
+                third,
+                (UnitFlags {
+                    attacking: Some(live_target),
+                    ..UnitFlags::default()
+                },),
+            )
+            .unwrap();
+
+        let mut entity_reverse = HashMap::new();
+        entity_reverse.insert(dead_target, "dead".to_string());
+
+        let mut scratch = DeathCleanupScratch::default();
+        let deads = [dead_target];
+        run(&mut world, &[&deads[..]], &mut entity_reverse, &mut scratch);
+
+        // Dead target despawned.
+        assert!(world.get::<&UnitPosition>(dead_target).is_err());
+
+        // Attacker's stale target cleared (site 3).
+        assert_eq!(
+            world.get::<&UnitFlags>(attacker).unwrap().attacking,
+            None,
+            "target died post-combat this tick → attacking must be cleared"
+        );
+
+        // The unit targeting a living unit is untouched.
+        assert_eq!(
+            world.get::<&UnitFlags>(third).unwrap().attacking,
+            Some(live_target),
+            "target still alive → attacking must be kept"
         );
     }
 }

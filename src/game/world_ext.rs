@@ -93,8 +93,6 @@ impl WorldExt for World {
             },
             UnitFlags::default(),
             UnitWaterTransition::default(),
-            // NOTE: no NearbyEnemies at spawn — its ABSENCE marks the unit as
-            // "uninitialized"; Spatialty creates it on the first pass.
         ))
     }
 

@@ -165,9 +165,9 @@ pub struct Game {
     combat_scratch: systems::combat::CombatScratch,
     /// Pre-allocated supply/attrition scratch, cleared and reused each tick.
     supply_scratch: systems::supply::SupplyScratch,
-    /// Spatial grid buffers for nearby_enemies, resized on growth and reused
-    /// each tick (no per-tick heap allocation at steady state). Built/updated
-    /// by movement, consumed by nearby_enemies.
+    /// Spatial grid buffers for the combat mover-scan (target acquisition),
+    /// resized on growth and reused each tick (no per-tick heap allocation at
+    /// steady state). Built/updated by movement, consumed by combat.
     grid_index_scratch: spatial::GridIndexScratch,
     /// Reused scratch buffers for the encirclement flood-fill.
     encirclement_scratch: systems::encirclement::EncirclementScratch,
@@ -217,38 +217,37 @@ pub struct Game {
     death_cleanup_scratch: systems::death_cleanup::DeathCleanupScratch,
 }
 
-/// Neighbour-graph snapshot: how nearby_enemies left the world this tick.
-/// `attacking`/`NearbyEnemies` are nearby_enemies-owned, so post-combat reads
-/// reflect the current tick's nearby_enemies output. Used by benchmark/status.
+/// Combat-targeting snapshot: how many units are holding an explicit combat
+/// target this tick. Read after the tick (post-combat) for benchmark/status.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CombatHealth {
-    /// Living units with UnitFlags + NearbyEnemies.
+    /// Living units with UnitFlags.
     pub units: usize,
-    /// Units with `attacking == true` (movers that found enemies nearby).
+    /// Units holding an explicit combat target (`attacking.is_some()`).
     pub units_with_attacking: usize,
-    /// Units whose NearbyEnemies list is non-empty.
-    pub units_with_enemies: usize,
-    /// Sum of NearbyEnemies list lengths across all units.
-    pub total_nearby_entries: usize,
 }
 
 /// Combat resolution-stage counters from one tick's `combat::run`.
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct CombatDiag {
-    /// Candidate units entering the combat loop (attacking || fighting).
+    /// Candidate units entering the combat loop (have an explicit target).
     pub candidates: usize,
-    /// Candidates with `attacking == true`.
+    /// Candidates carrying a target (== candidates; kept for parity).
     pub attackers: usize,
-    /// Neighbour-list iterations across all candidates.
-    pub pairs_scanned: usize,
-    /// Pairs skipped because they share an owner.
-    pub pairs_same_owner: usize,
-    /// Pairs skipped because they are out of combat range.
-    pub pairs_out_of_range: usize,
-    /// Pairs skipped because they already resolved this tick.
-    pub pairs_already_resolved: usize,
+    /// Targets that died earlier this tick (skipped, target cleared).
+    pub targets_dead: usize,
+    /// Targets that vanished from the ECS (defensive; stale despawn).
+    pub targets_gone: usize,
+    /// Targets sharing the attacker's owner (stale; target cleared).
+    pub targets_same_owner: usize,
+    /// Targets that retreated out of combat range (target cleared, D4).
+    pub targets_out_of_range: usize,
+    /// Mutual pairs skipped because the lower-id unit resolves them.
+    pub targets_skipped_mutual: usize,
+    /// Engagements resolved this tick (mutual pairs count once).
+    pub engagements: usize,
 }
 
 /// Pre-grouped data built once per tick, shared across all systems.
@@ -276,7 +275,7 @@ pub struct TickContext {
     /// Entity+position handles grouped by player ID
     pub units_by_player: HashMap<String, Vec<UnitHandle>>,
     /// Compact owner lookup: entity → player index (0..=255).
-    /// Shared across systems so nearby_enemies and combat can do
+    /// Shared across systems so movement and combat can do
     /// O(1) u8 equality instead of per-pair ECS borrows + String comparison.
     /// Updated incrementally (O(1) insert on recruit; stale entries on death
     /// are harmless since dead entities don't appear in ECS queries).
@@ -633,34 +632,21 @@ impl Game {
         self.ctx.units_by_player.values().map(|v| v.len()).sum()
     }
 
-    /// Snapshot of the neighbour graph as spatialty left it this tick.
-    /// `attacking`/`NearbyEnemies` are spatialty-owned, so post-combat reads
-    /// reflect the current tick's spatialty output. Used by benchmark/status.
+    /// Snapshot of combat targeting: how many units hold an explicit combat
+    /// target. Read after the tick (post-combat) for benchmark/status.
     #[allow(dead_code)]
     pub fn combat_health(&self) -> CombatHealth {
         let mut units = 0usize;
         let mut units_with_attacking = 0usize;
-        let mut units_with_enemies = 0usize;
-        let mut total_nearby_entries = 0usize;
-        for (_, flags, nearby) in self
-            .world
-            .query::<(Entity, &UnitFlags, &NearbyEnemies)>()
-            .iter()
-        {
+        for (_, flags) in self.world.query::<(Entity, &UnitFlags)>().iter() {
             units += 1;
-            if flags.attacking {
+            if flags.attacking.is_some() {
                 units_with_attacking += 1;
             }
-            if !nearby.entities.is_empty() {
-                units_with_enemies += 1;
-            }
-            total_nearby_entries += nearby.entities.len();
         }
         CombatHealth {
             units,
             units_with_attacking,
-            units_with_enemies,
-            total_nearby_entries,
         }
     }
 
@@ -670,10 +656,12 @@ impl Game {
         CombatDiag {
             candidates: self.combat_scratch.candidates,
             attackers: self.combat_scratch.attackers,
-            pairs_scanned: self.combat_scratch.pairs_scanned,
-            pairs_same_owner: self.combat_scratch.pairs_same_owner,
-            pairs_out_of_range: self.combat_scratch.pairs_out_of_range,
-            pairs_already_resolved: self.combat_scratch.pairs_already_resolved,
+            targets_dead: self.combat_scratch.targets_dead,
+            targets_gone: self.combat_scratch.targets_gone,
+            targets_same_owner: self.combat_scratch.targets_same_owner,
+            targets_out_of_range: self.combat_scratch.targets_out_of_range,
+            targets_skipped_mutual: self.combat_scratch.targets_skipped_mutual,
+            engagements: self.combat_scratch.engagements,
         }
     }
 
@@ -727,7 +715,7 @@ impl Game {
 
         // Movement returns count of units that moved this tick. It also builds
         // the pre-move spatial grid (occupancy gate) and the post-move grid
-        // (consumed by nearby_enemies) into `self.grid_index_scratch`.
+        // (consumed by combat's mover-scan / target acquisition) into `self.grid_index_scratch`.
         let mover_count = tick_system!(
             "movement",
             &mut self.world,
@@ -764,20 +752,11 @@ impl Game {
             });
         }
 
-        // NearbyEnemies: consume the post-move spatial grid that movement just
-        // built (3×3 cell query + circle filter, O(n × c) with bounded c).
-        // Runs after movement (so the grid reflects current positions) and
-        // before combat.
-        {
-            tick_system!(
-                "nearby_enemies",
-                &mut self.world,
-                self.world_entity,
-                systems::nearby_enemies::run(&mut self.world, &mut self.grid_index_scratch,)
-            );
-        }
-
-        // Combat (reads NearbyEnemies, uses shared TickContext for owner lookups)
+        // Combat: resolves explicit combat targets. The mover-scan (target
+        // acquisition, site 1) consumes the post-move spatial grid that
+        // movement just built (3×3 cell query + circle filter, O(n × c) with
+        // bounded c) — folded in from the deleted `nearby_enemies` system
+        // (Phase 2, plans/COMBAT_TARGETING.md §8.8).
         let combat_dead: Vec<hecs::Entity> = {
             let ctx = &self.ctx;
             tick_system!(
@@ -790,7 +769,8 @@ impl Game {
                     &mut self.combat_scratch,
                     &self.settings,
                     ctx,
-                    &self.unit_types_index
+                    &self.unit_types_index,
+                    &self.grid_index_scratch,
                 )
             )
         };
@@ -903,10 +883,9 @@ impl Game {
 
         // Unified death cleanup: process dead entities from combat, attrition,
         // and surrender (order preserved for determinism) via slice views so no
-        // fresh `all_dead` Vec is collected each tick. Purges dead units from
-        // the NearbyEnemies lists of the units that reference them, via the
-        // dead units' own lists (reverse lookup) — see death_cleanup.rs for
-        // the freshness/symmetry invariant this relies on.
+        // fresh `all_dead` Vec is collected each tick. Clears stale explicit
+        // targets pointing at post-combat deaths (lifecycle site 3), then
+        // despawns and cleans the entity registry.
         let death_count = tick_system!(
             "death_cleanup",
             &mut self.world,
@@ -1799,7 +1778,7 @@ mod tests {
                 cost_per_item: 2.5,
             }],
             soft_attack: 5.0,
-            soft_defense: 4.0,
+            soft_defense: 5.5,
             hard_attack: 3.0,
             hard_defense: 2.0,
             recruitment_cost: 200,

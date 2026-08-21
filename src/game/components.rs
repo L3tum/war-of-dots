@@ -56,25 +56,6 @@ pub struct UnitPath {
     pub path: SmallVec<[(f32, f32); 8]>,
 }
 
-/// Cached list of enemy entities within COMBAT_DISTANCE.
-/// Maintained by the nearby_enemies system. Read by combat.
-///
-/// Lists are purged of dead units by `death_cleanup` via reverse lookup
-/// through the dead units' own lists (fresh symmetric lists make the coverage
-/// exact under the current per-tick rebuild). If a rebuild ever becomes
-/// conditional, a stale one-sided entry can survive until the next rebuild;
-/// consumers tolerate it (`world.get` on a despawned `Entity` is `Err` — hecs
-/// generations prevent aliasing).
-#[derive(Debug, Clone, Default)]
-pub struct NearbyEnemies {
-    /// Enemy entities found during last spatialty update.
-    /// SmallVec keeps the common case (≤ 8 enemies) stack-allocated.
-    pub entities: SmallVec<[hecs::Entity; 8]>,
-    /// Whether this list was ever populated by the spatialty system.
-    /// false at spawn, set to true after first Tier 1 initialization.
-    pub initialized: bool,
-}
-
 /// Dynamic stats modified by combat, attrition, healing.
 #[derive(Debug, Clone, Copy)]
 pub struct UnitStats {
@@ -100,13 +81,24 @@ pub struct UnitEquipment {
     pub max_supply: f32,
 }
 
-/// Boolean flags that control unit behavior.
-#[derive(Debug, Clone, Default, Copy)]
+/// Unit engagement flags. `attacking` is the explicit combat target
+/// (see plans/COMBAT_TARGETING.md §8.4 for the lifecycle).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct UnitFlags {
     pub healing: bool,
-    pub fighting: bool,  // repurposed from `attacking` — true when in combat range
-    pub attacking: bool, // true when unit moved into/through enemy territory (set by spatialty)
-    pub moved: bool,     // set by movement system when position changes
+    /// True when the unit participated in a resolved engagement this tick
+    /// (as attacker *or* defender); set by combat, cleared by the retreat
+    /// check. Feeds the client `attacking` wire field and the supply
+    /// org-recovery gate.
+    pub fighting: bool,
+    /// Explicit combat target. `Some(e)` = engaged with unit `e`; `None` =
+    /// no target. Written by three sites only: (1) the combat mover scan
+    /// (sticky target acquisition, site 1), (2) combat validation
+    /// (target died this tick / gone / out of range → `None`), (3)
+    /// `death_cleanup` (target died to supply/surrender → `None`).
+    pub attacking: Option<hecs::Entity>,
+    /// Set by movement system when position changes
+    pub moved: bool,
     pub encircled: bool,
     pub resupply_enabled: bool,
     pub on_water: bool,

@@ -339,14 +339,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     // Combat diagnostics accumulators (per-tick, averaged across all runs).
     let mut diag_candidates = 0usize;
     let mut diag_attackers = 0usize;
-    let mut diag_scanned = 0usize;
-    let mut diag_same_owner = 0usize;
-    let mut diag_out_of_range = 0usize;
-    let mut diag_already_resolved = 0usize;
+    let mut diag_targets_dead = 0usize;
+    let mut diag_targets_same_owner = 0usize;
+    let mut diag_targets_out_of_range = 0usize;
+    let mut diag_targets_skipped_mutual = 0usize;
+    let mut diag_engagements = 0usize;
     let mut health_units = 0usize;
     let mut health_attacking = 0usize;
-    let mut health_enemies = 0usize;
-    let mut health_entries = 0usize;
 
     if !config.detailed_systems.is_empty() {
         println!("  Detailed timing: {}", config.detailed_systems.join(", "));
@@ -538,15 +537,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             let diag = game.combat_diag();
             diag_candidates += diag.candidates;
             diag_attackers += diag.attackers;
-            diag_scanned += diag.pairs_scanned;
-            diag_same_owner += diag.pairs_same_owner;
-            diag_out_of_range += diag.pairs_out_of_range;
-            diag_already_resolved += diag.pairs_already_resolved;
+            diag_targets_dead += diag.targets_dead;
+            diag_targets_same_owner += diag.targets_same_owner;
+            diag_targets_out_of_range += diag.targets_out_of_range;
+            diag_targets_skipped_mutual += diag.targets_skipped_mutual;
+            diag_engagements += diag.engagements;
             let health = game.combat_health();
             health_units += health.units;
             health_attacking += health.units_with_attacking;
-            health_enemies += health.units_with_enemies;
-            health_entries += health.total_nearby_entries;
 
             #[cfg(any(debug_assertions, feature = "debug-overlay"))]
             let td = if let Some(ds) = game.get_debug_stats() {
@@ -883,23 +881,22 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     );
     let ticks_f = tick_data.len() as f64;
     println!(
-        "  Combat diagnostics (avg/tick): candidates {:.1}, attackers {:.1}, pairs scanned {:.1}",
+        "  Combat diagnostics (avg/tick): candidates {:.1}, attackers {:.1}, engagements {:.1}",
         diag_candidates as f64 / ticks_f,
         diag_attackers as f64 / ticks_f,
-        diag_scanned as f64 / ticks_f,
+        diag_engagements as f64 / ticks_f,
     );
     println!(
-        "    skipped: same-owner {:.1}, out-of-range {:.1}, already-resolved {:.1}",
-        diag_same_owner as f64 / ticks_f,
-        diag_out_of_range as f64 / ticks_f,
-        diag_already_resolved as f64 / ticks_f,
+        "    target clears: dead {:.1}, same-owner {:.1}, out-of-range {:.1}, skipped-mutual {:.1}",
+        diag_targets_dead as f64 / ticks_f,
+        diag_targets_same_owner as f64 / ticks_f,
+        diag_targets_out_of_range as f64 / ticks_f,
+        diag_targets_skipped_mutual as f64 / ticks_f,
     );
     println!(
-        "    health: units {:.1}, with-attacking {:.1}, with-enemies {:.1}, total-nearby-entries {:.1}",
+        "    health: units {:.1}, with-attacking {:.1}",
         health_units as f64 / ticks_f,
         health_attacking as f64 / ticks_f,
-        health_enemies as f64 / ticks_f,
-        health_entries as f64 / ticks_f,
     );
     println!();
 
@@ -1128,14 +1125,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "combat_diag": {
             "avg_candidates_per_tick": diag_candidates as f64 / tick_data.len() as f64,
             "avg_attackers_per_tick": diag_attackers as f64 / tick_data.len() as f64,
-            "avg_pairs_scanned_per_tick": diag_scanned as f64 / tick_data.len() as f64,
-            "avg_pairs_same_owner_per_tick": diag_same_owner as f64 / tick_data.len() as f64,
-            "avg_pairs_out_of_range_per_tick": diag_out_of_range as f64 / tick_data.len() as f64,
-            "avg_pairs_already_resolved_per_tick": diag_already_resolved as f64 / tick_data.len() as f64,
+            "avg_engagements_per_tick": diag_engagements as f64 / tick_data.len() as f64,
+            "avg_targets_dead_per_tick": diag_targets_dead as f64 / tick_data.len() as f64,
+            "avg_targets_same_owner_per_tick": diag_targets_same_owner as f64 / tick_data.len() as f64,
+            "avg_targets_out_of_range_per_tick": diag_targets_out_of_range as f64 / tick_data.len() as f64,
+            "avg_targets_skipped_mutual_per_tick": diag_targets_skipped_mutual as f64 / tick_data.len() as f64,
             "health_avg_units": health_units as f64 / tick_data.len() as f64,
             "health_avg_units_with_attacking": health_attacking as f64 / tick_data.len() as f64,
-            "health_avg_units_with_enemies": health_enemies as f64 / tick_data.len() as f64,
-            "health_avg_total_nearby_entries": health_entries as f64 / tick_data.len() as f64,
         },
         "microbenchmarks": microbench_json,
     });

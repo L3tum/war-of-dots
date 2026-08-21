@@ -295,8 +295,9 @@ pub fn run(
         }
 
         // Organisation recovery (merged from reinforce.rs)
-        // Units in combat (fighting or attacking) do NOT recover org.
-        if !flags.fighting && !flags.attacking {
+        // Units in combat (fighting this tick OR holding an explicit target)
+        // do NOT recover org (plans/COMBAT_TARGETING.md §8.4).
+        if !flags.fighting && flags.attacking.is_none() {
             let supply_pct = ratio * 100.0;
             let malus = if supply_pct > 50.0 {
                 1.0
@@ -663,12 +664,15 @@ mod tests {
         );
     }
 
-    /// Organisation recovery: attacking units do NOT recover org.
+    /// Organisation recovery: units holding an explicit combat target do NOT
+    /// recover org.
     #[test]
     fn org_no_recovery_when_attacking() {
         let (mut world, world_entity, settings) = make_world(100_000);
+        let other =
+            spawn_unit_with_equipment_and_org(&mut world, UnitFlags::default(), 12, 10, 100.0);
         let flags = UnitFlags {
-            attacking: true,
+            attacking: Some(other),
             ..Default::default()
         };
         let unit = spawn_unit_with_equipment_and_org(&mut world, flags, 10, 10, 50.0);
@@ -678,7 +682,7 @@ mod tests {
         let stats = world.get::<&UnitStats>(unit).unwrap();
         assert!(
             (stats.organisation - 50.0).abs() < 0.01,
-            "attacking unit does not recover org"
+            "unit with an explicit target does not recover org"
         );
     }
 

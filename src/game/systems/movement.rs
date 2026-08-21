@@ -134,8 +134,8 @@ pub fn run(
     };
 
     // Build the PRE-move spatial grid (reused buffers, in place, no alloc at
-    // steady state). The gate queries it; nearby_enemies later consumes the
-    // post-move grid built at the end of this function.
+    // steady state). The occupancy gate queries it; combat's mover scan later
+    // consumes the post-move grid built at the end of this function.
     populate_grid_units(world, ctx, grid_scratch);
     let pre_grid = spatial::GridIndex::build(
         &grid_scratch.units,
@@ -217,7 +217,7 @@ pub fn run(
     let t4 = Instant::now();
 
     // Build the POST-move spatial grid (reflecting applied positions) — this is
-    // the grid `nearby_enemies`/`combat` consume this tick (fresh, post-move).
+    // the grid `combat`'s mover scan (target acquisition) consumes this tick.
     populate_grid_units(world, ctx, grid_scratch);
     grid_scratch.index = spatial::GridIndex::build(
         &grid_scratch.units,
@@ -242,7 +242,7 @@ pub fn run(
 /// `(entity, position, owner_idx)`. `owner_idx` comes from the shared
 /// `TickContext` compact-owner lookup. Units missing an owner entry are skipped
 /// (all living units have one — `recruit_unit` inserts synchronously), matching
-/// the prior `nearby_enemies` behaviour.
+/// the prior behaviour.
 /// Public so the microbenchmark fixtures (which run systems without the full
 /// `Game` tick loop) can build the same grid movement would build.
 #[doc(hidden)]

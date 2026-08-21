@@ -20,7 +20,7 @@ fn basic_unit_type() -> UnitType {
             cost_per_item: 2.5,
         }],
         soft_attack: 5.0,
-        soft_defense: 4.0,
+        soft_defense: 5.5,
         hard_attack: 3.0,
         hard_defense: 2.0,
         recruitment_cost: 200,
@@ -514,4 +514,91 @@ fn unified_cleanup_handles_combat_and_surrender() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 e2e — explicit combat targets through the full tick pipeline
+// (plans/COMBAT_TARGETING.md §9)
+// ---------------------------------------------------------------------------
+
+/// Phase 1 e2e through the real `tick_game` pipeline (movement → combat
+/// (mover-scan acquisition + resolution) → supply → death_cleanup), public
+/// API only:
+///   1. Adjacent-but-parked enemy units do NOT fight (behavior change C1 —
+///      parked units are defense-only; only movers acquire targets).
+///   2. When one unit moves (staying within the 8–10 combat band), it acquires
+///      its target and both sides exchange role-based damage — with the
+///      defense-favorable ratio (§9.3: def 5.5 > atk 5.0), the parked
+///      defender loses fewer men per tick than the advancing attacker.
+#[test]
+fn e2e_mover_engages_parked_defender() {
+    let map = test_map();
+    let settings = test_settings();
+    let mut game = Game::new(map, settings, 4);
+    game.start();
+
+    let ut = basic_unit_type();
+    // B parked at (19,3); A at (10,3) — dist 9, inside the
+    // (MIN_UNIT_DISTANCE=8, COMBAT_DISTANCE=10) band, so the spawn is
+    // separation-stable (no nudges → no accidental movers).
+    let a = game
+        .recruit_unit_at(&ut, "player_0", (10.0, 3.0))
+        .expect("recruit A");
+    let b = game
+        .recruit_unit_at(&ut, "player_1", (19.0, 3.0))
+        .expect("recruit B");
+
+    let state_of = |game: &Game, id: &str| {
+        game.query_all_units()
+            .into_iter()
+            .find(|u| u.id == id)
+            .unwrap()
+    };
+
+    // Phase 1: both parked — no engagement (C1). Only attrition-scale drift
+    // (1/600 men/tick), no combat-scale damage (~5 men/tick per side).
+    for _ in 0..5 {
+        game.tick_game();
+    }
+    let (a0, b0) = (state_of(&game, &a).men, state_of(&game, &b).men);
+    assert!(
+        a0 > 995.0 && b0 > 995.0,
+        "parked units must not fight each other (C1): A men={}, B men={}",
+        a0,
+        b0
+    );
+
+    // Phase 2: A steps perpendicular to (10,4) — one tile, dist 9.06 from B:
+    // still in combat range, still separation-stable. A becomes a mover,
+    // acquires B (T1), and the engagement resolves every tick after (A parks
+    // at the path end and keeps its target — D4).
+    game.move_troops(&a, "player_0", vec![(10.0, 4.0)]);
+    for _ in 0..10 {
+        game.tick_game();
+    }
+
+    let (ua, ub) = (state_of(&game, &a), state_of(&game, &b));
+    assert!(
+        ua.men < 990.0 && ub.men < 990.0,
+        "both units must have exchanged combat-scale damage through the full tick pipeline (A men={}, B men={})",
+        ua.men,
+        ub.men
+    );
+    assert!(
+        ua.fighting && ub.fighting,
+        "both units should be flagged engaged after combat (A fighting={}, B fighting={})",
+        ua.fighting,
+        ub.fighting
+    );
+    // Defense-favorable ratio (§9.3): the parked defender (def 5.5 vs atk 5.0)
+    // takes the attacker's attack but counters at the defensive stat — it
+    // loses fewer men per tick than the advancing attacker.
+    let a_lost = a0 - ua.men;
+    let b_lost = b0 - ub.men;
+    assert!(
+        b_lost < a_lost,
+        "parked defender should lose fewer men than the advancing attacker (A lost {:.1}, B lost {:.1})",
+        a_lost,
+        b_lost
+    );
 }

@@ -282,7 +282,7 @@ mod tests {
                 cost_per_item: 2.5,
             }],
             soft_attack: 5.0,
-            soft_defense: 4.0,
+            soft_defense: 5.5,
             hard_attack: 3.0,
             hard_defense: 2.0,
             recruitment_cost: 200,
