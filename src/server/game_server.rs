@@ -906,16 +906,36 @@ pub(crate) async fn watch_handler() -> Html<String> {
 
 pub(crate) async fn serve_static(
     req: axum::http::Request<axum::body::Body>,
-) -> axum::response::Result<axum::response::Html<String>> {
+) -> Result<axum::response::Response, axum::http::StatusCode> {
     let path_str = req.uri().path().trim_start_matches('/').to_string();
     if path_str.is_empty() {
-        return Err(axum::http::StatusCode::NOT_FOUND.into());
+        return Err(axum::http::StatusCode::NOT_FOUND);
     }
-    if let Some(file) = FRONTEND.get_file(&path_str) {
-        let content = file.contents_utf8().unwrap_or("");
-        return Ok(axum::response::Html(content.to_string()));
-    }
-    Err(axum::http::StatusCode::NOT_FOUND.into())
+    let file = match FRONTEND.get_file(&path_str) {
+        Some(file) => file,
+        None => return Err(axum::http::StatusCode::NOT_FOUND),
+    };
+    let content_type = match file.path().extension().and_then(|e| e.to_str()) {
+        Some("js") => "application/javascript",
+        Some("mjs") => "application/javascript",
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("map") => "application/json",
+        Some("wasm") => "application/wasm",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        _ => "application/octet-stream",
+    };
+    let content = file.contents().to_vec();
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .body(axum::body::Body::from(content))
+        .unwrap())
 }
 
 /// List all available maps

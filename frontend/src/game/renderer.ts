@@ -280,9 +280,9 @@ export class Renderer {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    // Fog overlay buffers — fullscreen quad with NDC positions + UVs
+    // Fog overlay buffers — fullscreen quad with NDC positions
     this.fogPositionsBuffer = device.createBuffer({
-      size: 32, // 4 vertices * 8 bytes (pos + uv)
+      size: 32, // 4 vertices * 8 bytes (pos only; frag shader recomputes UVs)
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this.fogColorsBuffer = device.createBuffer({
@@ -303,11 +303,11 @@ export class Renderer {
     });
   }
 
-  /** Generate fullscreen NDC fog quad. UVs are dummy — fragment shader recomputes from world position */
-  updateFogQuad(_terrainWidth: number = 0, _terrainHeight: number = 0): void {
-    // Fullscreen quad in NDC space: 4 vertices, pos(x,y) + uv(dummy) = 4 floats per vertex, stride 8
-    const fogPositionsUV = new Float32Array([-1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1]);
-    this.device.queue.writeBuffer(this.fogPositionsBuffer, 0, fogPositionsUV);
+  /** Generate fullscreen NDC fog quad. UVs are recomputed in the fragment shader from world position */
+  updateFogQuad(): void {
+    // Fullscreen quad in NDC space: 4 vertices, pos(x,y) only = 2 floats per vertex, stride 8
+    const fogPositions = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+    this.device.queue.writeBuffer(this.fogPositionsBuffer, 0, fogPositions);
   }
 
   private createMainPipeline(uniformLayout: GPUBindGroupLayout): GPURenderPipeline {
@@ -667,14 +667,12 @@ export class Renderer {
 
         struct VertexOutput {
           @builtin(position) position: vec4<f32>,
-          @location(0) uv: vec2<f32>,
         };
 
         @vertex
-        fn vert(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOutput {
+        fn vert(@location(0) pos: vec2<f32>) -> VertexOutput {
           var output: VertexOutput;
           output.position = vec4<f32>(pos, 0.0, 1.0);
-          output.uv = uv; // pass UV from vertex (will be overwritten in frag)
           return output;
         }
 
@@ -688,16 +686,15 @@ export class Renderer {
 
           // Fog texture UVs: world (0..texSize*CELL_SIZE) maps to texture (0..1)
           // Each fog texel covers one CELL_SIZE unit, so UV = world / (texelCount * CELL_SIZE)
-          let texSize = f32(textureDimensions(fogTex, 0));
+          let texSize = vec2<f32>(textureDimensions(fogTex, 0));
           let uv = vec2<f32>(worldX / (texSize.x * fogUniforms.cellSize), worldY / (texSize.y * fogUniforms.cellSize));
 
-          // Outside terrain area = no fog (transparent)
-          if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-            return vec4<f32>(0.0, 0.0, 0.05, 0.0);
-          }
-
           let fog = textureSample(fogTex, fogSampler, uv);
-          return vec4<f32>(0.0, 0.0, 0.05, fog.a);
+          // Outside terrain area = no fog. The sampler clamps out-of-range UVs,
+          // so build a 0/1 in-range mask with step() — textureSample must stay
+          // in uniform control flow (no per-pixel branch around it).
+          let inRange = step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0);
+          return vec4<f32>(0.0, 0.0, 0.05, fog.a * inRange);
         }
       `,
     });
@@ -714,10 +711,7 @@ export class Renderer {
         buffers: [
           {
             arrayStride: 8,
-            attributes: [
-              { format: 'float32x2', offset: 0, shaderLocation: 0 },
-              { format: 'float32x2', offset: 4, shaderLocation: 1 },
-            ],
+            attributes: [{ format: 'float32x2', offset: 0, shaderLocation: 0 }],
           },
         ],
       },
