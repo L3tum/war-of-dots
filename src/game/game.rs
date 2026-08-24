@@ -177,6 +177,12 @@ pub struct Game {
     /// Unit-type name -> index into `settings.unit_types`, built once at
     /// `Game::new` so the supply system does not rebuild the map every tick.
     unit_types_index: HashMap<String, usize>,
+    /// Sum of `max_count` across each unit type's equipment template — one
+    /// entry per index into `settings.unit_types`. The per-unit equipment
+    /// `needed` denominator is invariant (built from this template at spawn,
+    /// never mutated), so supply reads this instead of re-summing per unit per
+    /// tick (S-1). Same order as `settings.unit_types`.
+    unit_type_total_max_equipment: Vec<f32>,
     /// Pre-allocated movement scratch, cleared and reused each tick. Holds the
     /// mover records that movement system uses.
     movement_scratch: systems::movement::MovementScratch,
@@ -285,6 +291,9 @@ pub struct SupplyDiag {
 /// combat) do their own bulk query instead of per-entity world lookups.
 #[derive(Debug, Clone, Copy)]
 pub struct UnitHandle {
+    /// Entity handle — used by tests and by the future incremental rebuild
+    /// (T-1). Not read by the steady-state tick loop.
+    #[allow(dead_code)]
     pub entity: hecs::Entity,
     pub pos: (f32, f32),
 }
@@ -300,16 +309,63 @@ pub struct TickContext {
     pub height: u32,
     /// Entity+position handles grouped by player ID
     pub units_by_player: HashMap<String, Vec<UnitHandle>>,
-    /// Compact owner lookup: entity → player index (0..=255).
+    /// Compact owner lookup: entity id → player index (0..=254), or OWNER_NONE.
     /// Shared across systems so movement and combat can do
     /// O(1) u8 equality instead of per-pair ECS borrows + String comparison.
-    /// Updated incrementally (O(1) insert on recruit; stale entries on death
-    /// are harmless since dead entities don't appear in ECS queries).
-    pub owner_id_by_entity: HashMap<Entity, u8>,
+    /// Dense Vec indexed by entity id (low 32 bits of `Entity::to_bits()`);
+    /// the hecs entity generation guards id reuse (a reused id has a bumped
+    /// generation, so a stale slot never matches — mirroring how the old
+    /// `HashMap<Entity, u8>` key inherently included generation).
+    pub owner_at: Vec<u8>,
+    /// Entity generation stamped when `owner_at[id]` was written.
+    pub owner_gen: Vec<u32>,
     /// Persistent player→index mapping for incremental owner map updates.
     pub player_id_to_index: HashMap<String, u8>,
     /// Next available player index (monotonically increasing, never reused).
     pub next_player_idx: u8,
+}
+
+/// Sentinel for "no owner" in `TickContext.owner_at` (owner indices are < 255).
+pub const OWNER_NONE: u8 = 255;
+
+/// Cap on the owner table's entity-id span. Live hecs ids are bounded by total
+/// spawns (tens of thousands); the cap keeps a pathological id (e.g.
+/// `Entity::DANGLING` = u32::MAX) from triggering a multi-GB resize. Entities
+/// beyond the cap simply read as OWNER_NONE (correctness unaffected).
+const OWNER_MAX_ID: usize = 1 << 20;
+
+impl TickContext {
+    /// Look up a unit's player index via the dense owner table.
+    /// Returns `OWNER_NONE` for unset/out-of-cap entities or when the stored
+    /// hecs generation does not match (id reuse after death+respawn).
+    #[inline]
+    pub fn owner_index(&self, e: hecs::Entity) -> u8 {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        if id >= OWNER_MAX_ID {
+            return OWNER_NONE;
+        }
+        if self.owner_gen.get(id).copied().unwrap_or(0) != (bits >> 32) as u32 {
+            return OWNER_NONE;
+        }
+        self.owner_at.get(id).copied().unwrap_or(OWNER_NONE)
+    }
+
+    /// Record a unit's owner index (called on recruit). No-op for ids beyond
+    /// the cap; safe against id reuse because the generation is stamped.
+    pub fn owner_set(&mut self, e: hecs::Entity, owner_idx: u8) {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        if id >= OWNER_MAX_ID {
+            return;
+        }
+        if self.owner_at.len() <= id {
+            self.owner_at.resize(id + 1, OWNER_NONE);
+            self.owner_gen.resize(id + 1, 0);
+        }
+        self.owner_at[id] = owner_idx;
+        self.owner_gen[id] = (bits >> 32) as u32;
+    }
 }
 
 /// Tracks which TickContext fields need updating this tick.
@@ -341,34 +397,34 @@ impl TickContext {
         };
         // wb dropped — borrow released
 
-        // Populate player_id_to_index and owner_id_by_entity in a single ECS query
-        let mut player_id_to_index: HashMap<String, u8> = HashMap::with_capacity(16);
-        let mut owner_id_by_entity: HashMap<Entity, u8> = HashMap::new();
-        let mut next_player_idx: u8 = 0;
-        for (entity, owner) in world.query::<(Entity, &UnitOwner)>().iter() {
-            let idx = match player_id_to_index.entry(owner.player_id.clone()) {
-                Entry::Occupied(e) => *e.get(),
-                Entry::Vacant(e) => {
-                    let id = next_player_idx;
-                    next_player_idx += 1;
-                    e.insert(id);
-                    id
-                }
-            };
-            owner_id_by_entity.insert(entity, idx);
-        }
-        debug_assert!(next_player_idx < 255, "too many players");
-
-        Self {
+        // Populate player_id_to_index and owner_at/owner_gen in a single ECS query
+        let player_id_to_index: HashMap<String, u8> = HashMap::with_capacity(16);
+        let mut ctx = Self {
             world_entity,
             cities,
             width,
             height,
             units_by_player: HashMap::new(),
-            owner_id_by_entity,
+            owner_at: Vec::new(),
+            owner_gen: Vec::new(),
             player_id_to_index,
-            next_player_idx,
+            next_player_idx: 0,
+        };
+        for (entity, owner) in world.query::<(Entity, &UnitOwner)>().iter() {
+            let idx = match ctx.player_id_to_index.entry(owner.player_id.clone()) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let id = ctx.next_player_idx;
+                    ctx.next_player_idx += 1;
+                    e.insert(id);
+                    id
+                }
+            };
+            ctx.owner_set(entity, idx);
         }
+        debug_assert!(ctx.next_player_idx < 255, "too many players");
+
+        ctx
     }
 
     /// Rebuild units_by_player from ECS (positions, entity set).
@@ -401,16 +457,18 @@ impl TickContext {
         self.units_by_player.retain(|_, v| !v.is_empty());
     }
 
-    /// Combined rebuild of player_id_to_index, owner_id_by_entity, AND units_by_player
+    /// Combined rebuild of player_id_to_index, owner_at/owner_gen, AND units_by_player
     /// in a single ECS pass. Used by build_full() for benchmarks — not called in the
     /// tick loop (owner map is updated incrementally; units_by_player is rebuilt lazily).
     #[cfg(any(test, feature = "microbenchmarks"))]
     #[allow(dead_code)]
     pub fn rebuild_both(&mut self, world: &World) {
         let mut player_id_to_index: HashMap<String, u8> = HashMap::with_capacity(16);
-        let mut owner_id_by_entity: HashMap<Entity, u8> = HashMap::new();
         let mut new_units: HashMap<String, Vec<UnitHandle>> = HashMap::new();
         let mut next_player_idx: u8 = 0;
+
+        self.owner_at.clear();
+        self.owner_gen.clear();
 
         for (entity, owner, pos) in world.query::<(Entity, &UnitOwner, &UnitPosition)>().iter() {
             let pid = owner.player_id.clone();
@@ -423,7 +481,7 @@ impl TickContext {
                     id
                 }
             };
-            owner_id_by_entity.insert(entity, idx);
+            self.owner_set(entity, idx);
             new_units.entry(pid).or_default().push(UnitHandle {
                 entity,
                 pos: (*pos).as_tuple(),
@@ -433,7 +491,6 @@ impl TickContext {
 
         self.player_id_to_index = player_id_to_index;
         self.next_player_idx = next_player_idx;
-        self.owner_id_by_entity = owner_id_by_entity;
         self.units_by_player = new_units;
     }
 
@@ -531,12 +588,21 @@ impl Game {
             .enumerate()
             .map(|(i, ut)| (ut.name.clone(), i))
             .collect();
+        // S-1: precompute the invariant equipment `needed` denominator per unit
+        // type (sum of the template's max_count). Supply reads this instead of
+        // re-summing max_equipment for every unit every tick.
+        let unit_type_total_max_equipment: Vec<f32> = settings
+            .unit_types
+            .iter()
+            .map(|ut| ut.equipment.iter().map(|e| e.max_count as f32).sum())
+            .collect();
 
         Self {
             world,
             world_entity,
             settings,
             unit_types_index,
+            unit_type_total_max_equipment,
             players,
             tick: 0,
             running: false,
@@ -838,6 +904,7 @@ impl Game {
                 &mut self.supply_scratch,
                 &self.ctx,
                 &self.unit_types_index,
+                &self.unit_type_total_max_equipment,
             )
         );
 
@@ -1068,7 +1135,7 @@ impl Game {
             self.ctx.player_id_to_index.insert(owner.to_string(), idx);
             idx
         };
-        self.ctx.owner_id_by_entity.insert(entity, player_idx);
+        self.ctx.owner_set(entity, player_idx);
 
         // New unit isn't in ctx.units_by_player yet — force a rebuild on the
         // next consumer tick and mark influence stale (staleness fix).
@@ -2286,5 +2353,73 @@ mod tests {
             "gate must re-allow once the blocker has moved away"
         );
         assert_eq!(unit_count(&game), 2);
+    }
+
+    /// T-3: the dense owner table must survive hecs id-reuse after death.
+    /// Unit A (id, gen) is despawned; unit B reuses the same id at gen+1 with
+    /// a different owner. `owner_index` for B must return B's owner, and a
+    /// stale handle to A's (id, gen) must resolve to OWNER_NONE — the
+    /// generation guard is what makes the dense Vec safe.
+    #[test]
+    fn owner_index_generation_guard_survives_id_reuse() {
+        let mut world = hecs::World::new();
+        let wb = WorldBundle::new(
+            vec![vec![Terrain::Plains; 4]; 4],
+            4,
+            4,
+            CityUpgradeSettings::default(),
+            HashMap::new(),
+        );
+        let world_entity = world.spawn((wb,));
+
+        // Unit A: owner "P1" (UnitPosition required by rebuild_both's query).
+        let a = world.spawn((
+            UnitOwner {
+                player_id: "P1".to_string(),
+            },
+            UnitPosition { x: 1.0, y: 1.0 },
+        ));
+        let mut ctx = TickContext::build_initial(&world, world_entity);
+        let p1 = ctx.player_id_to_index["P1"];
+        ctx.owner_set(a, p1);
+        assert_eq!(ctx.owner_index(a), p1);
+
+        // A dies → its id is freed (generation will bump on reuse).
+        world.despawn(a).unwrap();
+
+        // Unit B reuses the same id at the next generation, owner "P2".
+        let b = world.spawn((
+            UnitOwner {
+                player_id: "P2".to_string(),
+            },
+            UnitPosition { x: 1.0, y: 1.0 },
+        ));
+        assert_eq!(b.id(), a.id(), "hecs must reuse the freed id");
+        // Generation is the upper 32 bits of the entity bits.
+        let gen = |e: hecs::Entity| (e.to_bits().get() >> 32) as u32;
+        assert_ne!(gen(b), gen(a), "generation must bump");
+
+        // Rebuild from the world: B must now own the id, A's stale (id,gen)
+        // must no longer resolve.
+        ctx.rebuild_both(&world);
+        let p2 = ctx.player_id_to_index["P2"];
+        assert_eq!(ctx.owner_index(b), p2);
+        assert_eq!(ctx.owner_index(a), OWNER_NONE);
+    }
+
+    /// S-1: the per-type equipment `needed` cache must equal the sum of each
+    /// unit type template's max_count. This is the invariant the supply system
+    /// relies on (per-unit max_equipment is a clone of the template at spawn).
+    #[test]
+    fn unit_type_total_max_equipment_matches_templates() {
+        let game = Game::new(test_map(), test_settings(), 1);
+        assert_eq!(
+            game.unit_type_total_max_equipment.len(),
+            game.settings.unit_types.len()
+        );
+        for (i, ut) in game.settings.unit_types.iter().enumerate() {
+            let sum: f32 = ut.equipment.iter().map(|e| e.max_count as f32).sum();
+            assert_eq!(game.unit_type_total_max_equipment[i], sum);
+        }
     }
 }

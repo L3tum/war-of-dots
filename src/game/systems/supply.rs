@@ -15,8 +15,7 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::game::components::*;
-use crate::game::game::GameSettings;
-use crate::game::game::TickContext;
+use crate::game::game::{GameSettings, OWNER_NONE, TickContext};
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 
@@ -114,12 +113,9 @@ fn plan_delivery_into(equipment: &UnitEquipment, out: &mut SmallVec<[(usize, u32
 }
 
 /// Equipment ratio: carried / required (>= 1.0 when buffered/fully supplied).
-fn equipment_ratio(equipment: &UnitEquipment) -> f32 {
-    let needed: f32 = equipment
-        .max_equipment
-        .iter()
-        .map(|e| e.max_count as f32)
-        .sum();
+/// `needed` is the precomputed per-unit-type max-equipment total (invariant),
+/// passed in to avoid re-summing `max_equipment` per unit per tick (S-1).
+fn equipment_ratio(equipment: &UnitEquipment, needed: f32) -> f32 {
     if needed <= 0.0 {
         return 1.0;
     }
@@ -145,6 +141,7 @@ pub fn run(
     scratch: &mut SupplyScratch,
     ctx: &TickContext,
     unit_types_index: &HashMap<String, usize>,
+    unit_type_total_max_equipment: &[f32],
 ) -> SmallVec<[hecs::Entity; 8]> {
     // Clear scratch for reuse (capacity preserved).
     scratch.clear();
@@ -221,26 +218,31 @@ pub fn run(
         // Dense owner index from TickContext (replaces per-unit String hashing
         // and pid.clone()). None if this entity is absent from the owner map or
         // out of range — in which case it simply draws no supply (pools empty).
-        let owner_idx = ctx
-            .owner_id_by_entity
-            .get(&entity)
-            .copied()
-            .map(|i| i as usize)
-            .filter(|&i| i < remaining_funds.len());
+        let owner_idx = {
+            let oi = ctx.owner_index(entity);
+            (oi != OWNER_NONE).then_some(oi as usize).filter(|&i| i < remaining_funds.len())
+        };
         // Dead-waiting-for-surrender units are not mutated here.
         if stats.men <= 0.0 {
             continue;
         }
-        let ut = unit_types_index
-            .get(&utype.name)
-            .map(|&i| &settings.unit_types[i]);
+        let type_idx = unit_types_index.get(&utype.name).copied();
+        let ut = type_idx.map(|i| &settings.unit_types[i]);
         let base_attrition = ut.map(|u| u.base_attrition).unwrap_or(1.0);
+
+        // S-1: the `needed` denominator is invariant per unit type (built from
+        // the unit-type equipment template at spawn, never mutated), so read it
+        // from the precomputed table. Fall back to the per-unit sum if the type
+        // index is missing (should not happen in steady state).
+        let needed = type_idx
+            .and_then(|i| unit_type_total_max_equipment.get(i).copied())
+            .unwrap_or_else(|| equipment.max_equipment.iter().map(|e| e.max_count as f32).sum());
 
         // IMPORTANT: `ratio` is computed from the PRE-wear, untouched equipment,
         // matching the original (which read the immutable &UnitEquipment). It
         // drives both the men-drain multiplier and the organisation malus, so it
         // must be captured before wear/delivery mutate the counts below.
-        let ratio = equipment_ratio(equipment);
+        let ratio = equipment_ratio(equipment, needed);
 
         // Attrition — water: org drain + boat supply consumption.
         if flags.on_water && !wt.embarking && !wt.disembarking {
@@ -432,7 +434,17 @@ mod tests {
                 name: "infantry".to_string(),
                 symbol: "I".to_string(),
                 men: 1000,
-                equipment: vec![],
+                // Must stay in lockstep with the fixtures' per-unit max_equipment
+                // (spawn_unit_with_equipment_* hardcodes rifle max_count 10):
+                // in production every unit's max_equipment is a clone of its type
+                // template, and the supply system's per-type `needed` cache
+                // (S-1) reads this template.
+                equipment: vec![crate::game::unit::Equipment {
+                    name: "rifle".to_string(),
+                    count: 10,
+                    max_count: 10,
+                    cost_per_item: 0.5,
+                }],
                 soft_attack: 5.0,
                 soft_defense: 4.0,
                 hard_attack: 3.0,
@@ -514,8 +526,13 @@ mod tests {
             .enumerate()
             .map(|(i, ut)| (ut.name.clone(), i))
             .collect();
+        let ut_total: Vec<f32> = settings
+            .unit_types
+            .iter()
+            .map(|ut| ut.equipment.iter().map(|e| e.max_count as f32).sum())
+            .collect();
         let mut s = SupplyScratch::new();
-        let _ = run(world, world_entity, settings, &mut s, &ctx, &ut_index);
+        let _ = run(world, world_entity, settings, &mut s, &ctx, &ut_index, &ut_total);
     }
 
     #[test]
@@ -787,6 +804,11 @@ mod tests {
             .enumerate()
             .map(|(i, ut)| (ut.name.clone(), i))
             .collect();
+        let ut_total: Vec<f32> = settings
+            .unit_types
+            .iter()
+            .map(|ut| ut.equipment.iter().map(|e| e.max_count as f32).sum())
+            .collect();
 
         // Two ticks on the SAME scratch (mirrors Game's persistent scratch).
         let ctx = TickContext::build_full(&world, world_entity);
@@ -797,6 +819,7 @@ mod tests {
             &mut scratch,
             &ctx,
             &ut_index,
+            &ut_total,
         );
         let ctx2 = TickContext::build_full(&world, world_entity);
         let _ = run(
@@ -806,6 +829,7 @@ mod tests {
             &mut scratch,
             &ctx2,
             &ut_index,
+            &ut_total,
         );
 
         let end = manpower(&world, world_entity);

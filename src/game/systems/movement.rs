@@ -4,7 +4,7 @@
 
 use crate::game::components::*;
 use crate::game::constants::MIN_UNIT_DISTANCE_SQ;
-use crate::game::game::{GameSettings, TickContext};
+use crate::game::game::{GameSettings, OWNER_NONE, TickContext};
 use crate::game::spatial::{self, GridIndexScratch};
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
@@ -17,12 +17,11 @@ use std::time::Instant;
 struct MovementChange {
     old_pos: UnitPosition,
     new_pos: UnitPosition,
-    new_path: Option<UnitPath>,
     new_org: Option<f32>,
     moved: bool,
     /// When the unit reached its first waypoint, the apply phase pops the head
     /// of the path in place (avoids the per-waypoint SmallVec clone + O(path)
-    /// remove(0) memmove in phase 1). Never set together with a Some(new_path).
+    /// remove(0) memmove in phase 1).
     pop_head: bool,
 }
 
@@ -247,7 +246,7 @@ pub fn run(
     // writes, the movers vec, and the blocked-skip are all bit-identical.
     let changes = &scratch.changes;
     let is_noop =
-        |c: &MovementChange| !c.moved && c.new_path.is_none() && !c.pop_head && c.new_org.is_none();
+        |c: &MovementChange| !c.moved && !c.pop_head && c.new_org.is_none();
 
     let t3a = Instant::now();
     // Pass A: occupancy gate — decides which movers proceed. Blocked units get
@@ -341,9 +340,7 @@ pub fn run(
             // Clamp position to map bounds to prevent out-of-bounds access
             mpos.x = change.new_pos.x.clamp(0.0, map_w - 1.0);
             mpos.y = change.new_pos.y.clamp(0.0, map_h - 1.0);
-            if let Some(new_path) = &change.new_path {
-                *mpath = (*new_path).clone();
-            } else if change.pop_head {
+            if change.pop_head {
                 // Reached first waypoint: pop the head of the path in place.
                 // Guarded + asserted because compute only sets pop_head after
                 // `path.first()?` succeeded and no other system writes
@@ -396,13 +393,13 @@ pub fn populate_grid_units(world: &World, ctx: &TickContext, grid_scratch: &mut 
                 .query::<(Entity, &UnitPosition)>()
                 .iter()
                 .filter_map(|(e, pos)| {
+                    let owner_id = ctx.owner_index(e);
                     debug_assert!(
-                        ctx.owner_id_by_entity.contains_key(&e),
-                        "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                        owner_id != OWNER_NONE,
+                        "entity {:?} missing from owner table — TickContext stale?",
                         e
                     );
-                    let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
-                    Some((e, *pos, owner_id))
+                    (owner_id != OWNER_NONE).then_some((e, *pos, owner_id))
                 }),
         );
 }
@@ -451,10 +448,10 @@ fn compute_movement(
         }
     }
 
-    let (new_pos, new_path, pop_head) = if dist < speed {
+    let (new_pos, pop_head) = if dist < speed {
         // Reached waypoint: pop the head of the path in the apply phase (no
         // SmallVec copy here, no O(path) remove(0) memmove in phase 1).
-        (UnitPosition { x: *nx, y: *ny }, None, true)
+        (UnitPosition { x: *nx, y: *ny }, true)
     } else {
         // Moving towards waypoint
         let ratio = speed / dist;
@@ -463,7 +460,6 @@ fn compute_movement(
                 x: pos.x + dx * ratio,
                 y: pos.y + dy * ratio,
             },
-            None,
             false,
         )
     };
@@ -484,21 +480,27 @@ fn compute_movement(
     Some(MovementChange {
         old_pos: pos,
         new_pos,
-        new_path,
         new_org,
         moved: actually_moved,
         pop_head,
     })
 }
 
+/// Constant terrain speed multipliers, indexed by the `Terrain` discriminant
+/// (Plains=0, Hills=1, Forest=2, Water=3, Mountain=4). The Water slot is a
+/// placeholder: water speed is a division that depends on the unit type's
+/// speed, so it stays a special case in `unit_speed_with_terrain` (M-2).
+const TERRAIN_SPEED_MOD: [f32; 5] = [1.0, 0.7, 0.8, 1.0, 1.0];
+
+#[inline]
 fn unit_speed_with_terrain(terrain: &Terrain, water_speed: f32, unit_type_speed: f32) -> f32 {
-    let terrain_mod = match terrain {
-        Terrain::Hills => 0.7,
-        Terrain::Forest => 0.8,
-        Terrain::Water => water_speed / unit_type_speed.max(0.01),
-        _ => 1.0,
-    };
-    unit_type_speed * terrain_mod
+    match terrain {
+        // Water is `unit_type_speed * (water_speed / unit_type_speed.max(0.01))` —
+        // a division, not a constant multiplier — so it does not fit a table
+        // entry. Kept exactly as the original expression (bit-identical).
+        Terrain::Water => unit_type_speed * (water_speed / unit_type_speed.max(0.01)),
+        _ => unit_type_speed * TERRAIN_SPEED_MOD[*terrain as usize],
+    }
 }
 
 #[cfg(test)]
@@ -830,7 +832,6 @@ mod tests {
         assert_eq!(change.new_pos.y, 5.0);
         // Reaching a waypoint now pops the path head in the apply phase rather
         // than materializing a cloned path here.
-        assert!(change.new_path.is_none());
         assert!(change.pop_head);
         assert!(change.moved);
     }
@@ -870,8 +871,6 @@ mod tests {
         assert!(change.new_pos.x > 0.0);
         assert!(change.new_pos.x < 10.0);
         assert_eq!(change.new_pos.y, 0.0);
-        // Path not consumed
-        assert!(change.new_path.is_none());
     }
 
     #[test]

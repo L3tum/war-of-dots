@@ -981,6 +981,12 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         .enumerate()
         .map(|(i, ut)| (ut.name.clone(), i))
         .collect();
+    // S-1: per-type max-equipment sums, mirroring the cache `Game` builds.
+    let ut_total_max_eq: Vec<f32> = settings
+        .unit_types
+        .iter()
+        .map(|ut| ut.equipment.iter().map(|e| e.max_count as f32).sum())
+        .collect();
 
     // --- Movement ---
 
@@ -1106,6 +1112,76 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         ..result
     });
 
+    // --- Spatial (for_each_within, dense) ---
+    // P4 gate measurement: the _500 fixture above spreads 500 units so the
+    // 3×3-cell scan touches a modest candidate set. This one packs 1 000
+    // units into a 50×38 region of a 100×100 map at ~1.8-unit spacing, so a
+    // 3×3 scan (30×30 world units) touches ~280 candidates — realistic
+    // engagement density for the SoA distance-filter work-share question
+    // (P4, plans/deep-plan-20260824-190231.md).
+    let result = run_bench_with_setup(
+        cfg,
+        || {
+            let mut f = MovementFixture::with_units(100, 100, 2, &ut, 1000, false);
+            // Repack the evenly-spawned units into a dense 50×20 block.
+            for (i, e) in f
+                .ctx
+                .units_by_player
+                .values()
+                .flatten()
+                .map(|h| h.entity)
+                .enumerate()
+            {
+                let x = 5.0 + (i % 50) as f32 * 1.8;
+                let y = 5.0 + (i / 50) as f32 * 1.8;
+                if let Ok((pos,)) = f
+                    .world
+                    .query_one_mut::<(&mut UnitPosition,)>(e)
+                {
+                    pos.x = x;
+                    pos.y = y;
+                }
+            }
+            crate::game::systems::movement::populate_grid_units(
+                &f.world,
+                &f.ctx,
+                &mut f.grid_scratch,
+            );
+            let idx = crate::game::spatial::GridIndex::build(
+                &f.grid_scratch.units,
+                &mut f.grid_scratch.entries,
+                &mut f.grid_scratch.cell_offsets,
+                &mut f.grid_scratch.cell_sizes,
+            );
+            f.grid_scratch.index = idx;
+            f
+        },
+        |f: &mut MovementFixture| {
+            // Fixed probe at the center of the dense block (deterministic —
+            // the fixture's unit order is HashMap-derived).
+            let probe = UnitPosition {
+                x: 25.0,
+                y: 18.0,
+            };
+            let mut hits = 0usize;
+            crate::game::spatial::for_each_within(
+                &f.grid_scratch.index,
+                &f.grid_scratch,
+                probe,
+                crate::game::constants::COMBAT_DISTANCE_SQ,
+                |_, _, _| {
+                    hits += 1;
+                },
+            );
+            black_box(hits);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "spatial/for_each_within_dense".to_string(),
+        group: "spatial".to_string(),
+        ..result
+    });
+
     // --- Combat ---
 
     // Combat with ~50 engaged pairs
@@ -1173,6 +1249,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &mut scratch,
                 &f.ctx,
                 &ut_index,
+                &ut_total_max_eq,
             );
             black_box(200);
         },
@@ -1196,6 +1273,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 &mut scratch,
                 &f.ctx,
                 &ut_index,
+                &ut_total_max_eq,
             );
             black_box(500);
         },

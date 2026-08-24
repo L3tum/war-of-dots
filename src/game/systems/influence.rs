@@ -476,7 +476,8 @@ mod tests {
             width: W as u32,
             height: H as u32,
             units_by_player,
-            owner_id_by_entity: HashMap::new(),
+            owner_at: Vec::new(),
+            owner_gen: Vec::new(),
             player_id_to_index: HashMap::new(),
             next_player_idx: 0,
         }

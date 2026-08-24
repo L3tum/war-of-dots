@@ -24,7 +24,7 @@
 use crate::game::components::*;
 use crate::game::constants::COMBAT_DISTANCE_SQ;
 use crate::game::game::GameSettings;
-use crate::game::game::TickContext;
+use crate::game::game::{OWNER_NONE, TickContext};
 use crate::game::spatial::{self, GridIndexScratch};
 use crate::game::world_ext::WorldExt;
 use hecs::Entity;
@@ -296,13 +296,13 @@ pub fn run(
             .iter()
             .filter(|(_, _, flags, stats)| stats.men > 0.0 && flags.attacking.is_some())
             .filter_map(|(e, pos, flags, stats)| {
+                let owner_id = ctx.owner_index(e);
                 debug_assert!(
-                    ctx.owner_id_by_entity.contains_key(&e),
-                    "entity {:?} missing from owner_id_by_entity — TickContext stale?",
+                    owner_id != OWNER_NONE,
+                    "entity {:?} missing from owner table — TickContext stale?",
                     e
                 );
-                let owner_id = ctx.owner_id_by_entity.get(&e).copied()?;
-                Some((e, *pos, owner_id, *stats, *flags))
+                (owner_id != OWNER_NONE).then_some((e, *pos, owner_id, *stats, *flags))
             }),
     );
     scratch.candidates = scratch.candidate_units.len();
@@ -340,16 +340,16 @@ pub fn run(
         }
         // Same-owner check via shared TickContext lookup (O(1) u8 equality,
         // no per-pair ECS borrow + String comparison).
-        let same_owner = match ctx.owner_id_by_entity.get(&target) {
-            Some(other_id) => *owner1 == *other_id,
-            None => {
-                debug_assert!(
-                    false,
-                    "entity {:?} missing from owner_id_by_entity during same-owner check",
-                    target
-                );
-                true
-            }
+        let other_id = ctx.owner_index(target);
+        let same_owner = if other_id == OWNER_NONE {
+            debug_assert!(
+                false,
+                "entity {:?} missing from owner table during same-owner check",
+                target
+            );
+            true
+        } else {
+            *owner1 == other_id
         };
         if same_owner {
             scratch.targets_same_owner += 1;

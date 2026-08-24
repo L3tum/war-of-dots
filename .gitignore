@@ -32,3 +32,4 @@ reports/
 
 # Benchmark dbs
 war_of_dots.db*
+.baseline_ab

@@ -12,6 +12,7 @@ use crate::game::game::TickContext;
 use crate::game::systems::influence::NONE;
 use crate::game::world_ext::WorldExt;
 use hecs::World;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Per-tick wall-clock budget for the flood-fill (see the module docs). Each
@@ -232,7 +233,6 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64, scratch: &mut Encir
     // input change — that bounded staleness is the accepted tradeoff (see the
     // plan). The flag pass below always pairs `safe` with this same snapshot.
     let fill_terr = &scratch.fill_territory[..];
-    let fill_players = scratch.fill_players.clone();
     let t1 = std::time::Instant::now();
     // Advance the BFS by at most FLOOD_TICK_BUDGET this tick (skipped entirely
     // when the fill is already complete and unchanged — the SKIP fast path).
@@ -262,22 +262,45 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64, scratch: &mut Encir
     // Per-unit encirclement flags: dominated but not safe. Updated only when
     // the fill is complete — a partial `safe` would over-report encirclement,
     // so on mid-flight ticks the flag simply keeps its previous value.
+    //
+    // E-3: one query sweep instead of a per-unit `query_one_mut` ECS lookup.
+    // The player index must come from the fill's sorted `fill_players` — the
+    // same index space the territory/safe grids use. `ctx.owner_index` is NOT
+    // usable here: its index space is first-seen order from `build_initial`,
+    // not sorted order, so it would mis-assign players.
+    //
+    // Membership decision (full sweep, not units_by_player): the sweep covers
+    // every entity with (UnitPosition, UnitFlags, UnitOwner) — a superset of
+    // `units_by_player` (identical component set; that map is rebuilt on
+    // consumer ticks before this system runs anyway). It also reads *live*
+    // positions instead of the cached UnitHandle snapshot, which is strictly
+    // more correct if a unit moved after the rebuild. Per-unit flag results
+    // are independent, so the final world state is bit-identical to the old
+    // per-player loop for identical inputs.
     if scratch.fill_complete {
-        for (player_idx, player_id) in fill_players.iter().enumerate() {
-            let player_idx = player_idx as u8;
-            let entities = match ctx.units_by_player.get(player_id) {
-                Some(e) => e,
-                None => continue,
+        let player_idx: HashMap<&str, u8> = scratch
+            .fill_players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.as_str(), i as u8))
+            .collect();
+        for (pos, flags, owner) in world
+            .query::<(&UnitPosition, &mut UnitFlags, &UnitOwner)>()
+            .iter()
+        {
+            // Player index via owner id → sorted position (see E-3 note above).
+            let Some(&pidx) = player_idx.get(owner.player_id.as_str()) else {
+                continue;
             };
-            for handle in entities {
-                let xi = handle.pos.0 as i32;
-                let yi = handle.pos.1 as i32;
-                let idx = (yi as usize) * wusize + (xi as usize);
-                let encircled =
-                    idx < grid_size && fill_terr[idx] == player_idx && safe[idx] != player_idx;
-                if let Ok((flags,)) = world.query_one_mut::<(&mut UnitFlags,)>(handle.entity) {
-                    flags.encircled = encircled;
-                }
+            let xi = pos.x as i32;
+            let yi = pos.y as i32;
+            let idx = (yi as usize) * wusize + (xi as usize);
+            let encircled =
+                idx < grid_size && fill_terr[idx] == pidx && safe[idx] != pidx;
+            // Skip the write when the flag already matches — steady state
+            // then does zero ECS mutations in this pass.
+            if flags.encircled != encircled {
+                flags.encircled = encircled;
             }
         }
     }
@@ -512,6 +535,101 @@ pub fn seed_queue(safe: &[u8], dominant: &[u8], w: i32, h: i32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::unit::Terrain;
+    use std::collections::HashMap;
+
+    /// E-3: the single-sweep flag pass, end to end on a real world.
+    /// Player 0 dominates a 10×10 map except a ring of player-1 cells around
+    /// (5,5), which walls off a one-cell pocket:
+    ///   • unit A (player_0) inside the pocket → encircled (flood can't reach it);
+    ///   • unit B (player_0) near the edge → safe → not encircled;
+    ///   • unit C (player_1) on the ring → no safe cells for player 1 → encircled.
+    /// A second run must leave the flags bit-identical (idempotent sweep).
+    #[test]
+    fn flag_sweep_sets_encircled_correctly() {
+        let (w, h) = (10, 10);
+        let wu = w as usize;
+        let n = wu * h as usize;
+        let mut dominant = vec![0u8; n];
+        let deltas: [(i32, i32); 8] = [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (-1, 1),
+            (1, -1),
+            (1, 1),
+        ];
+        for (dx, dy) in deltas {
+            let cx = 5 + dx;
+            let cy = 5 + dy;
+            dominant[(cy as usize) * wu + (cx as usize)] = 1;
+        }
+
+        let mut world = World::new();
+        let terrain = vec![vec![Terrain::Plains; wu]; h as usize];
+        let mut wb = WorldBundle::new(
+            terrain,
+            w as u32,
+            h as u32,
+            crate::config::CityUpgradeSettings::default(),
+            HashMap::new(),
+        );
+        wb.territory.grid = Arc::new(dominant);
+        let world_entity = world.spawn((wb,));
+
+        let a = world.spawn((
+            UnitOwner {
+                player_id: "player_0".to_string(),
+            },
+            UnitPosition {
+                x: 5.0,
+                y: 5.0,
+            },
+            UnitFlags::default(),
+        ));
+        let b = world.spawn((
+            UnitOwner {
+                player_id: "player_0".to_string(),
+            },
+            UnitPosition {
+                x: 2.0,
+                y: 2.0,
+            },
+            UnitFlags::default(),
+        ));
+        let c = world.spawn((
+            UnitOwner {
+                player_id: "player_1".to_string(),
+            },
+            UnitPosition {
+                x: 6.0,
+                y: 5.0,
+            },
+            UnitFlags::default(),
+        ));
+
+        let mut ctx = TickContext::build_initial(&world, world_entity);
+        ctx.rebuild_units_by_player(&world);
+        let mut scratch = EncirclementScratch::new();
+        run(&mut world, &ctx, 0, &mut scratch);
+        assert!(
+            scratch.fill_complete,
+            "a 10×10 flood must complete in one tick"
+        );
+
+        // Second run: inputs unchanged → SKIP fast path, flags bit-identical.
+        run(&mut world, &ctx, 30, &mut scratch);
+
+        let flag = |e: hecs::Entity| *world.get::<&UnitFlags>(e).unwrap();
+        assert!(flag(a).encircled, "unit inside the pocket must be encircled");
+        assert!(!flag(b).encircled, "unit near the edge must be safe");
+        assert!(
+            flag(c).encircled,
+            "player-1 unit with no safe cells must be encircled"
+        );
+    }
 
     /// Timing probe: 1000×1000 contested quadrants (same fixture as the
     /// `encirclement/flood_serial_1000` microbenchmark), min/median over

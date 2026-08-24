@@ -62,6 +62,16 @@ impl WorldExt for World {
         owner: &str,
         position: (f32, f32),
     ) -> hecs::Entity {
+        // W-1: initialize on_water from the spawn terrain so a static unit
+        // (flags.moved == false) is correct from its first water tick without
+        // waiting for a movement tick to re-check terrain. The WorldBundle is a
+        // single-entity component; the one-time query is negligible at recruit.
+        let on_water = self
+            .query::<(&WorldBundle,)>()
+            .iter()
+            .next()
+            .map(|(wb,)| wb.terrain.get(position.0, position.1) == crate::game::unit::Terrain::Water)
+            .unwrap_or(false);
         self.spawn((
             UnitOwner {
                 player_id: owner.to_string(),
@@ -91,7 +101,10 @@ impl WorldExt for World {
                 supply: unit_type.max_supply as f32,
                 max_supply: unit_type.max_supply as f32,
             },
-            UnitFlags::default(),
+            UnitFlags {
+                on_water,
+                ..Default::default()
+            },
             UnitWaterTransition::default(),
         ))
     }
