@@ -660,6 +660,7 @@ struct CityCaptureFixture {
     world: World,
     world_entity: hecs::Entity,
     ctx: TickContext,
+    grid_scratch: crate::game::spatial::GridIndexScratch,
 }
 
 impl CityCaptureFixture {
@@ -667,10 +668,21 @@ impl CityCaptureFixture {
         let (mut world, world_entity) = make_world(20, 20, num_players);
         spawn_n_units(&mut world, world_entity, unit_type, count);
         let ctx = TickContext::build_full(&world, world_entity);
+        // Build the post-move spatial grid the real tick loop hands to
+        // city_capture (movement builds it; combat/city_capture reuse it).
+        let mut grid_scratch = crate::game::spatial::GridIndexScratch::default();
+        crate::game::systems::movement::populate_grid_units(&world, &ctx, &mut grid_scratch);
+        grid_scratch.index = crate::game::spatial::GridIndex::build(
+            &grid_scratch.units,
+            &mut grid_scratch.entries,
+            &mut grid_scratch.cell_offsets,
+            &mut grid_scratch.cell_sizes,
+        );
         Self {
             world,
             world_entity,
             ctx,
+            grid_scratch,
         }
     }
 }
@@ -984,7 +996,6 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &settings,
                 &mut scratch,
-                &ut_index,
                 &f.ctx,
                 &mut f.grid_scratch,
             );
@@ -1008,7 +1019,6 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &settings,
                 &mut scratch,
-                &ut_index,
                 &f.ctx,
                 &mut f.grid_scratch,
             );
@@ -1032,7 +1042,6 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &settings,
                 &mut scratch,
-                &ut_index,
                 &f.ctx,
                 &mut f.grid_scratch,
             );
@@ -1042,6 +1051,58 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
     results.push(MicrobenchmarkResult {
         id: "systems/movement_2000".to_string(),
         group: "systems".to_string(),
+        ..result
+    });
+
+    // --- Spatial (for_each_within) ---
+    // Direct measurement of the circle-intersection distance filter
+    // (`spatial::for_each_within`) — the loop combat's target acquisition and the
+    // movement occupancy gate both call. The grid is built once per iteration in
+    // setup (outside the timer) so only the scan is measured. This is the R4
+    // measure-first target (plans/deep-plan-20260821-231145.md).
+    let result = run_bench_with_setup(
+        cfg,
+        || {
+            let mut f = MovementFixture::with_units(50, 50, 2, &ut, 500, false);
+            crate::game::systems::movement::populate_grid_units(
+                &f.world,
+                &f.ctx,
+                &mut f.grid_scratch,
+            );
+            let idx = crate::game::spatial::GridIndex::build(
+                &f.grid_scratch.units,
+                &mut f.grid_scratch.entries,
+                &mut f.grid_scratch.cell_offsets,
+                &mut f.grid_scratch.cell_sizes,
+            );
+            f.grid_scratch.index = idx;
+            f
+        },
+        |f: &mut MovementFixture| {
+            // One scan at the first unit's position — the same unit of work
+            // combat's mover scan performs per unit.
+            let probe = f
+                .grid_scratch
+                .units
+                .first()
+                .map(|u| u.1)
+                .unwrap_or_default();
+            let mut hits = 0usize;
+            crate::game::spatial::for_each_within(
+                &f.grid_scratch.index,
+                &f.grid_scratch,
+                probe,
+                crate::game::constants::COMBAT_DISTANCE_SQ,
+                |_, _, _| {
+                    hits += 1;
+                },
+            );
+            black_box(hits);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "spatial/for_each_within_500".to_string(),
+        group: "spatial".to_string(),
         ..result
     });
 
@@ -1301,6 +1362,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
                 f.world_entity,
                 &mut stats,
                 &f.ctx,
+                &f.grid_scratch,
             );
             black_box(stats.len());
         },
@@ -1328,6 +1390,61 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         group: "systems".to_string(),
         ..result
     });
+
+    // --- Encirclement flood: serial multi-player BFS on a realistic 1000² grid ---
+    // Measures the shipped `flood_serial` path (combined multi-player BFS over a
+    // 1000×1000 contested grid: 4 solid quadrants + a central NONE square). A stable
+    // microbenchmark of the encirclement flood, independent of the full game.
+    {
+        const FW: i32 = 1000;
+        const FH: i32 = 1000;
+        let n = (FW * FH) as usize;
+        let ab_cfg = BenchConfig {
+            warmup: 3,
+            timed: 20,
+        };
+        // Precompute the deterministic dominant grid once (un-timed).
+        let mut dominant0 = vec![0u8; n];
+        crate::game::systems::encirclement::build_bench_dominant(FW, FH, &mut dominant0);
+
+        struct FloodSerial<'a> {
+            dominant: &'a [u8],
+            safe: Vec<u8>,
+            queue: Vec<u32>,
+        }
+        let make_fixture = || {
+            let mut safe = vec![crate::game::systems::influence::NONE; n];
+            crate::game::systems::encirclement::mark_safe_edges_multi(
+                &mut safe,
+                FW as usize,
+                FH as usize,
+                &dominant0,
+            );
+            let queue = crate::game::systems::encirclement::seed_queue(&safe, &dominant0, FW, FH);
+            FloodSerial {
+                dominant: &dominant0,
+                safe,
+                queue,
+            }
+        };
+
+        // The shipped serial path (combined multi-player BFS).
+        let result = run_bench_with_setup(ab_cfg, &make_fixture, |f: &mut FloodSerial| {
+            crate::game::systems::encirclement::flood_serial(
+                &mut f.safe,
+                f.dominant,
+                FW,
+                FH,
+                &mut f.queue,
+            );
+            black_box(f.safe.len());
+        });
+        results.push(MicrobenchmarkResult {
+            id: "encirclement/flood_serial_1000".to_string(),
+            group: "systems".to_string(),
+            ..result
+        });
+    }
 
     // --- Economy ---
 

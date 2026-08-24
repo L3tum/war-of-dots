@@ -1,5 +1,14 @@
 # SIMD Auto-Vectorization Analysis
 
+> **⚠️ SUPERSEDED — do not use as the source of truth.**
+> This analysis predates the COMBAT_TARGETING redesign landing. It has been
+> re-analyzed against the current tree in
+> **`plans/deep-plan-20260821-231145.md`** (reviewed spec, evidence-labeled to
+> HEAD), which: updates every `file:line` reference, supersedes §1/§4.4 (the
+> deleted `nearby_enemies` / `NearbyEnemies` surface), re-ranks the
+> recommendations (R1–R7), and rewrites `scripts/check_vectorization.sh`. Keep
+> this file for the original `[CARRY]` asm evidence only.
+
 Analysis of whether the SIMD-capable code paths are actually auto-vectorized by the
 compiler, plus a survey of additional spots where SIMD could be applied easily.
 

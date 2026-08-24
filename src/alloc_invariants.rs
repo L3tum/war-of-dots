@@ -119,13 +119,29 @@ fn warm_tick_net_heap_growth_is_bounded() {
     let _profiler = dhat::Profiler::builder().testing().build();
     let mut game = warm_game();
 
-    // Single-tick net heap growth
-    let before = dhat::HeapStats::get();
-    game.tick_game();
-    let after = dhat::HeapStats::get();
-
-    let net_blocks = after.curr_blocks as i64 - before.curr_blocks as i64;
-    let net_bytes = after.curr_bytes as i64 - before.curr_bytes as i64;
+    // Single-tick net heap growth. dhat is a process-global allocator, so a
+    // single (before, tick, after) sample under parallel `cargo test` can be
+    // spiked by heap that *other* test threads happen to retain in the window
+    // (observed up to ~90 KB of transient noise, far above this game's ~10 KB
+    // steady-state scratch). A genuine per-tick net growth is a *consistent*
+    // offset present in every sample, whereas a concurrent spike is an outlier —
+    // so take the median of K samples: it filters the spikes while still
+    // catching a real per-tick leak (which shows up in the median too).
+    // Baseline (isolated, single sample): 6 blocks, 5441 bytes.
+    const SAMPLES: usize = 7;
+    let mut sample_blocks = Vec::with_capacity(SAMPLES);
+    let mut sample_bytes = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let b = dhat::HeapStats::get();
+        game.tick_game();
+        let a = dhat::HeapStats::get();
+        sample_blocks.push(a.curr_blocks as i64 - b.curr_blocks as i64);
+        sample_bytes.push(a.curr_bytes as i64 - b.curr_bytes as i64);
+    }
+    sample_blocks.sort_unstable();
+    sample_bytes.sort_unstable();
+    let net_blocks = sample_blocks[SAMPLES / 2];
+    let net_bytes = sample_bytes[SAMPLES / 2];
 
     // Net heap growth should be small (scratch buffers reused, no leak).
     // Baseline (isolated): 6 blocks, 5441 bytes. Full-suite (parallel thread noise):

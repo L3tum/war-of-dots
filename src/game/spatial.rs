@@ -1,9 +1,13 @@
 //! Shared spatial grid — a reusable, allocation-free neighbour index.
 //!
 //! A flat-buffer 1D grid (prefix-sum offsets + sizes, no per-cell Vecs) mapping
-//! unit positions to coarse cells. **Built/updated in place by `movement`** and
-//! consumed downstream by `combat`'s mover scan (sticky target acquisition),
-//! which runs the 3×3 neighbour circle query against the fresh post-move grid. The dense buffers (`entries`/`cell_offsets`/
+//! unit positions to coarse cells. **Built once per tick, in place, by
+//! `movement`** from pre-move positions and consumed by: the movement
+//! occupancy gate (pre-move snapshot, same tick), and — run after movement —
+//! `combat`'s mover scan (sticky target acquisition) and city capture, which
+//! see pre-move positions (a unit that moved this tick counts from its old
+//! position; combat rescans every mover every tick, so acquisition is at most
+//! one tick late). The dense buffers (`entries`/`cell_offsets`/
 //! `cell_sizes`) are resized only on growth and overwritten in place each build
 //! — **no `::clear()` of the grid structure, no steady-state heap allocation**.
 //!
@@ -40,9 +44,10 @@ pub struct GridIndexScratch {
     /// Cleared and repopulated by the builder; the dense buffers above are the
     /// reusable state that is deliberately *not* cleared.
     pub units: Vec<(Entity, UnitPosition, u8)>,
-    /// The most recently built index metadata (bounds + dimensions). Written by
-    /// the builder (`movement`'s post-move build) and read by the consumer
-    /// (`combat`'s mover scan) so the grid is built once and reused, not rebuilt.
+    /// The most recently built index metadata (bounds + dimensions). Written
+    /// once per tick by `movement` (pre-move build) and read by the consumers
+    /// (`combat`'s mover scan, city capture) so the grid is built once and
+    /// reused, not rebuilt.
     pub index: GridIndex,
 }
 
@@ -192,9 +197,12 @@ fn cell_for(pos: UnitPosition) -> (i32, i32) {
 }
 
 /// For each unit within `radius_sq` of `pos` in a built grid, call
-/// `f(entity, pos, owner_idx)`. A 3×3 cell scan plus a squared-distance filter
-/// (FMA/SIMD-friendly, branch-free inner test). Completeness holds for
-/// `radius_sq` up to `SPATIAL_CELL_SIZE²` (see `constants` tests).
+/// `f(entity, pos, owner_idx)`. A 3×3 cell scan plus a squared-distance filter.
+/// The inner test is branch-free but **scalar** today: the per-element
+/// `f(...)` callback inside the filter blocks LLVM's mask-and-gather idiom, so
+/// it does not auto-vectorize (0 `vfmadd` in the release binary). See
+/// `plans/deep-plan-20260821-231145.md` (R4) for the SoA + measure-first path.
+/// Completeness holds for `radius_sq` up to `SPATIAL_CELL_SIZE²` (see `constants` tests).
 pub fn for_each_within(
     grid: &GridIndex,
     scratch: &GridIndexScratch,

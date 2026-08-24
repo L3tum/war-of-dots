@@ -9,7 +9,10 @@ Companion to `plans/SIMD_ANAL.md` (cross-linked). This redesign changes what com
 iterates over and reshapes the combat distance loop, so any SIMD work on those paths
 (`SIMD_ANAL.md` §1 / §4.4) must be **re-measured after this lands**.
 
-- **Companion plan:** `plans/SIMD_ANAL.md`
+- **Companion plan:** `plans/SIMD_ANAL.md` — **now superseded** by the post-redesign
+  re-analysis **`plans/deep-plan-20260821-231145.md`** (the "re-measure after it
+  lands" is complete there; it re-anchors the audit to HEAD and re-ranks the
+  SIMD recommendations as R1–R7).
 - **Status:** decisions D1–D5 **RESOLVED** — final design is **§8**, revised by **§9**
   (sticky acquisition = approved; defensive-counter damage model = **APPROVED**,
   incl. §9.3 infantry def bump). **Phase 1 IMPLEMENTED & GREEN** (see §10).

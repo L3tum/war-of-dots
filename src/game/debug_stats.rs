@@ -94,7 +94,11 @@ impl DebugSystemGuard {
                     return;
                 }
                 let timings = &mut ds.detailed_timings;
-                let entry = timings.entry(key.to_string()).or_default();
+                // get-first: no throwaway `to_string()` per call (see record_system_timing).
+                let entry = match timings.get_mut(key) {
+                    Some(e) => e,
+                    None => timings.entry(key.to_string()).or_default(),
+                };
                 entry.record(duration_ms);
             }
         }
@@ -158,7 +162,14 @@ pub fn record_system_timing(
     if let Some(wb) = world.world_data_mut(world_entity) {
         let ds = &mut wb.debug_stats;
         let timings = &mut ds.system_timings;
-        let entry = timings.entry(system_name.to_string()).or_default();
+        // `get_mut` borrows via `String: Borrow<str>` — no throwaway `to_string()`
+        // per call (this runs once per system per tick and its allocs land in the
+        // unattributed “other/overhead” bucket). `entry`/`to_string` only fires when
+        // a system name is recorded for the first time.
+        let entry = match timings.get_mut(system_name) {
+            Some(e) => e,
+            None => timings.entry(system_name.to_string()).or_default(),
+        };
         entry.record(duration_ms);
     }
 }
@@ -182,7 +193,12 @@ pub fn record_system_alloc(
 ) {
     if let Some(wb) = world.world_data_mut(world_entity) {
         let ds = &mut wb.debug_stats;
-        let entry = ds.system_allocs.entry(system_name.to_string()).or_default();
+        // get-first: `get_mut` borrows via `Borrow<str>` (no throwaway `to_string()`
+        // per call — ~9×/tick in the unattributed bucket); `entry` only on first record.
+        let entry = match ds.system_allocs.get_mut(system_name) {
+            Some(e) => e,
+            None => ds.system_allocs.entry(system_name.to_string()).or_default(),
+        };
         entry.total_allocs += allocs;
         entry.total_bytes += bytes;
         entry.call_count += 1;

@@ -11,7 +11,9 @@
 //!
 //! ## Future Optimization (see TODO_PHASE2_NOTES.md)
 //! - Use `Arc` for grid data to enable cheap CoW cloning
-//! - Parallelize per-player delta computation with rayon
+//! - Parallelize per-player delta computation (NOTE: rayon was trialed and
+//!   removed — its dispatch overhead regressed the encirclement flood A/B, so
+//!   any parallelization here needs its own A/B before being assumed to win)
 //! - Consider incremental hashing for grid diff detection
 
 use std::collections::HashMap;

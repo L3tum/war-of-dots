@@ -76,6 +76,22 @@ struct Cli {
     /// Map size (width × height in tiles). City positions scale to fill it.
     #[arg(long, default_value_t = 200)]
     bench_map_size: u32,
+
+    /// Number of cities. Default (12) uses the authored 12-city layout; any other
+    /// count generates an even sqrt lattice. Raise for unit-heavy stress tests so
+    /// per-player city income can keep up with the army's supply drain (the
+    /// default 12:10000 city:unit ratio leaves funds pools chronically exhausted,
+    /// which is not representative of a real game).
+    #[arg(long, default_value_t = 12)]
+    bench_cities: u32,
+
+    /// Max units recruited per recruit event (every 100 ticks). Each city
+    /// recruits `bench_units / 2` (min 1) per event, capped at this total and
+    /// spread evenly across cities. Default 2000 — raise for heavier
+    /// recruitment pressure (ECS spawn/churn load), lower to keep the
+    /// population roughly stable.
+    #[arg(long, default_value_t = 2000)]
+    bench_recruiting: u32,
 }
 
 #[tokio::main]
@@ -97,7 +113,9 @@ async fn main() -> anyhow::Result<()> {
             || cli.bench_html.is_some()
             || cli.bench_prev.is_some()
             || cli.bench_initial_units.is_some()
-            || cli.bench_map_size != 200;
+            || cli.bench_map_size != 200
+            || cli.bench_cities != 12
+            || cli.bench_recruiting != 2000;
 
         if has_bench_args {
             eprintln!("error: bench arguments provided without --benchmark flag");
@@ -128,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
             bench_prev: cli.bench_prev.clone(),
             initial_units: cli.bench_initial_units,
             map_size: cli.bench_map_size,
+            cities: cli.bench_cities,
+            max_recruits_per_event: cli.bench_recruiting,
         };
         let results = benchmark::run_benchmark(bench_cfg);
 

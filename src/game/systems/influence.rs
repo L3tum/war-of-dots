@@ -122,7 +122,9 @@ impl Default for InfluenceScratch {
 
 /// Saturating influence write — adds `delta` (the configured per-source
 /// weight). `u16` caps absurd stacks at 65,535; only strict-`>` ordering is
-/// consumed in-game.
+/// consumed in-game. Kept for the saturation unit test; `stamp_circle` writes
+/// its rows directly for better vectorization.
+#[cfg(test)]
 #[inline]
 fn add_influence(grid: &mut [u16], idx: usize, delta: u16) {
     grid[idx] = grid[idx].saturating_add(delta);
@@ -161,10 +163,17 @@ fn stamp_circle(
         if lo > hi {
             continue;
         }
-        for x in lo..=hi {
-            let idx = y_off + (x as usize);
-            vision[idx] = true;
-            add_influence(influence, idx, weight);
+        // Two contiguous passes, not one interleaved per-cell loop: vision is a
+        // constant memset of a byte run, and the influence row is a contiguous
+        // `u16` saturating-add of a constant — a shape LLVM auto-vectorizes
+        // (saturating 16-bit add, 8 lanes/vec on AVX2, 4 on NEON). The old
+        // interleaved `vision[idx]=true; influence[idx]+=w` mixed a 1-byte store
+        // with a 2-byte RMW in one loop body, which blocked the vectorizer.
+        let start = y_off + (lo as usize);
+        let end = y_off + (hi as usize) + 1;
+        vision[start..end].fill(true);
+        for v in &mut influence[start..end] {
+            *v = v.saturating_add(weight);
         }
     }
 }
@@ -174,9 +183,10 @@ fn stamp_circle(
 /// Vision and influence share one circle per source (unit or city); `settings`
 /// supplies the per-source weight and the circle radii.
 ///
-/// Both vision and influence are written into the caller's reused buffers
-/// (reset here); the caller clones vision into the published Arc. Influence is
-/// folded into the territory by the caller.
+/// Both vision and influence are written into the caller's reused buffers; the
+/// caller resets them first (`run` measures the reset separately from this
+/// stamping pass — see `influence/p2a_fill`). The caller clones vision into the
+/// published Arc. Influence is folded into the territory by the caller.
 #[allow(clippy::too_many_arguments)] // Pure per-player projection: sources/settings/dims + 2 output buffers
 fn compute_player(
     city_positions: &mut Vec<(f32, f32)>,
@@ -192,9 +202,10 @@ fn compute_player(
 ) {
     let w_usize = w as usize;
 
-    // Vision and influence both reuse caller buffers, reset here (no alloc).
-    vision.fill(false);
-    influence.fill(0);
+    // NOTE: the `vision.fill(false)` / `influence.fill(0)` resets live in the
+    // caller (`run`) so they are measured separately from the circle stamping
+    // (W3, `influence/p2a_fill` vs `p2_compute`). Callers with fresh buffers
+    // (unit tests) pass already-zeroed grids.
 
     // Unit loop — a single circle pass writes both vision and influence.
     for handle in units {
@@ -260,11 +271,17 @@ pub(crate) const NONE: u8 = 255;
 /// fold logic.
 #[inline]
 fn fold_influence_into(dominant: &mut [u8], max_inf: &mut [u16], grid: &[u16], idx: u8) {
+    let idx_u32 = idx as u32;
     for i in 0..dominant.len() {
-        if grid[i] > max_inf[i] {
-            max_inf[i] = grid[i];
-            dominant[i] = idx;
-        }
+        // Branchless select — lets LLVM auto-vectorize the running-max fold.
+        // `0u32.wrapping_sub(cond)` is a clean 0 / !0 mask; `x & !sel | y & sel`
+        // selects y only when the cell was updated. Preserves the strict-`>`
+        // tie-break (lowest-sorted player wins) and the NONE (255) sentinel.
+        // Bit-identical to the old `if grid[i] > max_inf[i] { max_inf[i] =
+        // grid[i]; dominant[i] = idx; }`.
+        let sel = 0u32.wrapping_sub(u32::from(grid[i] > max_inf[i]));
+        max_inf[i] = ((max_inf[i] as u32) & !sel | (grid[i] as u32) & sel) as u16;
+        dominant[i] = ((dominant[i] as u32) & !sel | idx_u32 & sel) as u8;
     }
 }
 
@@ -312,6 +329,10 @@ pub fn run(
         return;
     }
 
+    // Per-phase timing (no-op unless `--bench-detailed influence`): p1_seed =
+    // setup + buffer resets, p2_compute = per-player circle stamping,
+    // p3_fold = territory running-max fold (accumulated across players).
+    let t0 = std::time::Instant::now();
     // Scoped Arc extraction for terrain grid (24 bytes pointer bump, not a clone)
     let terrain_grid: Arc<Vec<Terrain>> = match world.world_data(ctx.world_entity) {
         Some(wb) => Arc::clone(&wb.terrain.grid),
@@ -344,6 +365,9 @@ pub fn run(
     let mut updated_vision: HashMap<String, Arc<Vec<bool>>> =
         HashMap::with_capacity(sorted_players.len());
     let vision_gen = scratch.vision_gen as usize;
+    let t1 = std::time::Instant::now();
+    let mut fold_ms = 0.0f64;
+    let mut fill_ms = 0.0f64;
 
     for (idx, &player_id) in sorted_players.iter().enumerate() {
         let units = ctx.units_by_player.get(player_id).unwrap();
@@ -366,6 +390,13 @@ pub fn run(
             if slot.len() != grid_size {
                 slot.resize(grid_size, false);
             }
+            // W3-①: measure the per-player full-grid clear (1 MB vision +
+            // 2 MB influence per player — 12 MB/call at 4 players) separately
+            // from the circle stamping to settle the p2_compute split.
+            let tf = std::time::Instant::now();
+            slot.fill(false);
+            scratch.player_influence.fill(0);
+            fill_ms += tf.elapsed().as_secs_f64() * 1000.0;
             compute_player(
                 &mut scratch.city_positions,
                 &terrain_grid,
@@ -381,16 +412,19 @@ pub fn run(
         }
         // A1: fold this player's influence straight into the running territory
         // (index = sorted position), then discard the influence buffer.
+        let tf = std::time::Instant::now();
         fold_influence_into(
             terr,
             &mut scratch.territory_max,
             &scratch.player_influence,
             idx as u8,
         );
+        fold_ms += tf.elapsed().as_secs_f64() * 1000.0;
         // Publish a clone of the slot's Arc (steady state: in-place fill, so a
         // cheap refcount bump, not a ~1 MB grid clone).
         updated_vision.insert(player_id.clone(), Arc::clone(&pair[slot_gen]));
     }
+    let t2 = std::time::Instant::now();
 
     // Publish. `borders.grids` is production-dead (only `#[cfg(test)]` reads it)
     // and is no longer written; the per-player influence grids are folded above
@@ -406,6 +440,19 @@ pub fn run(
     // other (now-unpublished) slot — the double-buffer invariant.
     scratch.vision_gen ^= 1;
     scratch.territory_gen ^= 1;
+
+    world.record_detailed(
+        ctx.world_entity,
+        "influence/p1_seed",
+        (t1 - t0).as_secs_f64() * 1000.0,
+    );
+    world.record_detailed(
+        ctx.world_entity,
+        "influence/p2_compute",
+        (t2 - t1).as_secs_f64() * 1000.0,
+    );
+    world.record_detailed(ctx.world_entity, "influence/p2a_fill", fill_ms);
+    world.record_detailed(ctx.world_entity, "influence/p3_fold", fold_ms);
 }
 
 #[cfg(test)]
@@ -794,5 +841,81 @@ mod tests {
         fold_influence_into(&mut dominant, &mut max_inf, &inf, 7);
         assert_eq!(dominant[idx(20, 20)], 7);
         assert_eq!(dominant[idx(26, 20)], NONE);
+    }
+
+    /// Stamping cost probe: one player, ~2 500 units on a 1000×1000 map at the
+    /// stress-test density (~1 unit / 400 cells). Measures the `compute_player`
+    /// circle-stamping pass (the W3 target) so the stamp-loop micro-opts have a
+    /// local A/B signal without a full stress run. min/median over iters.
+    #[test]
+    fn stamp_cost_probe() {
+        let settings = crate::game::game::InfluenceSettings::default();
+        let (w, h) = (1000i32, 1000);
+        let n = (w * h) as usize;
+        let terrain = Arc::new(vec![Terrain::Plains; n]);
+
+        // Deterministic scatter of ~2 500 units across the map.
+        let mut rng = 0x2F6E2B1u32;
+        let mut next = move || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rng
+        };
+        let count = (n / 400).max(1);
+        let units: Vec<UnitHandle> = (0..count)
+            .map(|_| {
+                let x = (next() % w as u32) as f32;
+                let y = ((next() >> 11) % h as u32) as f32;
+                unit((x, y))
+            })
+            .collect();
+
+        let mut city_positions = Vec::new();
+
+        // Warmup (allocation + page faults).
+        for _ in 0..2 {
+            let mut inf = vec![0u16; n];
+            let mut vis = vec![false; n];
+            compute_player(
+                &mut city_positions,
+                &terrain,
+                "player_0",
+                &units,
+                &[],
+                &settings,
+                w,
+                h,
+                &mut inf,
+                &mut vis[..],
+            );
+            std::hint::black_box(&inf);
+        }
+
+        let iters = 5u32;
+        let mut samples = Vec::new();
+        for _ in 0..iters {
+            let mut inf = vec![0u16; n];
+            let mut vis = vec![false; n];
+            let t0 = std::time::Instant::now();
+            compute_player(
+                &mut city_positions,
+                &terrain,
+                "player_0",
+                &units,
+                &[],
+                &settings,
+                w,
+                h,
+                &mut inf,
+                &mut vis[..],
+            );
+            std::hint::black_box(&inf);
+            samples.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = samples[samples.len() / 2];
+        eprintln!(
+            "stamp_cost_probe: units={} iters={} min={:.4}ms med={:.4}ms",
+            count, iters, samples[0], med
+        );
     }
 }

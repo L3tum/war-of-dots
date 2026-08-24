@@ -42,6 +42,11 @@ pub struct SupplyScratch {
     pub remaining_mp: Vec<u32>,
     /// Snapshot of each player's remaining funds pool, reloaded each tick.
     pub remaining_funds: Vec<u32>,
+    /// Diagnostics counters (W4; read via `Game::supply_diag`). NOT times —
+    /// these are per-tick counts, which is why they are reported through the
+    /// benchmark diagnostics lines rather than `record_detailed` (ms table).
+    pub diag_blocked_funds: u64,
+    pub diag_blocked_mp: u64,
 }
 
 impl SupplyScratch {
@@ -54,6 +59,8 @@ impl SupplyScratch {
             id_by_index: Vec::new(),
             remaining_mp: Vec::new(),
             remaining_funds: Vec::new(),
+            diag_blocked_funds: 0,
+            diag_blocked_mp: 0,
         }
     }
 
@@ -187,6 +194,18 @@ pub fn run(
     // No read-then-write staging: hecs permits one &mut per distinct component
     // type in a query, so all three writes are applied immediately (no
     // Vec<Change> buffer, no per-entity query_one_mut, no full clones).
+    //
+    // Detailed-mode counters (cheap, always accumulated): measure how often
+    // the FCFS pool gates actually block a draw. Counters only — no timing
+    // inside the hot loop. (W4: 11w1 measured ~2 476 blocked funds/tick and
+    // the pools end on a small residue rather than draining to exactly 0, so
+    // the `remaining_funds > 0` skip below catches almost nothing — the gate
+    // fires on `0 < avail < cost`. See SIMD_ROADMAP §W4.)
+    let t1 = std::time::Instant::now();
+    scratch.diag_blocked_funds = 0;
+    scratch.diag_blocked_mp = 0;
+    let supply_blocked_funds = &mut scratch.diag_blocked_funds;
+    let supply_blocked_mp = &mut scratch.diag_blocked_mp;
     for (entity, utype, _owner, flags, stats, equipment, wt) in world
         .query::<(
             hecs::Entity,
@@ -252,8 +271,22 @@ pub fn run(
 
         // Supply — refill toward the supply buffer (capped by supply_rate,
         // gated on funds, non-encircled only). Plan reuses the scratch buffer.
-        let cost = plan_delivery_into(equipment, &mut scratch.delivery);
-        if cost > 0 && !flags.encircled {
+        //
+        // W4 short-circuit: the plan feeds *only* the delivery below, which can
+        // never fire for encircled units or when the owner's funds pool is
+        // already exhausted — so skip the plan work in those cases. Measured
+        // (run 11detailed, `supply/obs_blocked_funds` ≈ 4.7 k/tick): the funds
+        // pool is chronically exhausted at 10 k units, so this is a common
+        // case, and it is exactly equivalent (an empty pool can never satisfy
+        // `avail >= cost` for `cost > 0`).
+        let can_deliver =
+            !flags.encircled && owner_idx.map(|oi| remaining_funds[oi]).unwrap_or(0) > 0;
+        let cost = if can_deliver {
+            plan_delivery_into(equipment, &mut scratch.delivery)
+        } else {
+            0
+        };
+        if cost > 0 {
             if let Some(oi) = owner_idx {
                 let avail = remaining_funds[oi];
                 if avail >= cost {
@@ -264,6 +297,8 @@ pub fn run(
                         }
                     }
                     scratch.fund_cost[oi] += cost;
+                } else {
+                    *supply_blocked_funds += 1;
                 }
             }
         }
@@ -282,6 +317,8 @@ pub fn run(
                         remaining_mp[oi] -= gain as u32;
                         men_gain = gain;
                         scratch.mp_cost[oi] += gain as u32;
+                    } else {
+                        *supply_blocked_mp += 1;
                     }
                 }
             }
@@ -293,7 +330,6 @@ pub fn run(
         if stats.men <= 0.0 {
             scratch.dead.push(entity);
         }
-
         // Organisation recovery (merged from reinforce.rs)
         // Units in combat (fighting this tick OR holding an explicit target)
         // do NOT recover org (plans/COMBAT_TARGETING.md §8.4).
@@ -314,6 +350,7 @@ pub fn run(
     }
 
     // Deduct from global pools (one write per player).
+    let t2 = std::time::Instant::now();
     {
         let wb = match world.world_data_mut(world_entity) {
             Some(wb) => wb,
@@ -334,6 +371,21 @@ pub fn run(
             }
         }
     }
+    let t3 = std::time::Instant::now();
+
+    world.record_detailed(
+        world_entity,
+        "supply/p2_loop",
+        (t2 - t1).as_secs_f64() * 1000.0,
+    );
+    world.record_detailed(
+        world_entity,
+        "supply/p3_deduct",
+        (t3 - t2).as_secs_f64() * 1000.0,
+    );
+    // Note: the FCFS gate block counters (scratch.diag_blocked_*) are COUNTS,
+    // not milliseconds — they are reported through the benchmark's
+    // "Supply diagnostics" line (Game::supply_diag), not this ms table.
 
     std::mem::take(&mut scratch.dead)
 }

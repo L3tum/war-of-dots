@@ -204,8 +204,8 @@ pub fn run(
 
     // ── Site 1: sticky target acquisition for movers (T1–T4) ─────────────
     // Plans: COMBAT_TARGETING.md §9.1 (folded in from the deleted
-    // `nearby_enemies` system, Phase 2 §8.8). Scans the post-move grid
-    // movement just built; no grid rebuild here. Runs BEFORE candidate
+    // `nearby_enemies` system, Phase 2 §8.8). Scans the grid movement built
+    // this tick from pre-move positions; no grid rebuild here. Runs BEFORE candidate
     // collection so a freshly-acquired target can resolve this same tick.
     // A rescan picks the closest in-range enemy (`dist²`, `Entity::id`
     // tiebreak) or `None` if none — which also fixes the old sticky-
@@ -248,9 +248,9 @@ pub fn run(
                 continue;
             }
             // Closest in-range enemy: 3×3 cell scan + dist² filter. The grid
-            // entry position IS the unit's current position (grid was built
-            // post-move; no system moves units between movement and combat),
-            // so no per-enemy `world.get` is needed.
+            // entry position is the unit's PRE-move position (movement builds
+            // the grid before applying moves; no system moves units between
+            // movement and combat), so no per-enemy `world.get` is needed.
             let mut best: Option<Entity> = None;
             let mut best_dist_sq: f32 = f32::INFINITY;
             spatial::for_each_within(
@@ -785,7 +785,7 @@ mod tests {
         );
     }
 
-    /// Run combat against the world's current post-move grid (test stand-in
+    /// Run combat against the world's current grid (test stand-in
     /// for the game loop: movement builds the grid, then combat consumes it).
     fn run_with_grid(
         world: &mut World,
@@ -1329,7 +1329,7 @@ mod tests {
     // Site 1 — sticky target acquisition tests (ported from the deleted
     // `nearby_enemies` system, Phase 2). These spawn minimal units (no
     // stats/equipment) so the resolution loop cannot touch them; only the
-    // acquisition pass (mover scan over the post-move grid) is exercised.
+    // acquisition pass (mover scan over the spatial grid) is exercised.
     // ---------------------------------------------------------------------
 
     /// T1: a mover with no target acquires the closest in-range enemy.

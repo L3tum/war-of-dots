@@ -7,6 +7,8 @@
 # Defaults (applied only when the matching flag is absent):
 #   --bench-initial-units 10000   total units across all cities
 #   --bench-map-size 1000         1000×1000 map (spreads units, cuts combat density)
+#   --bench-cities 100            10×10 city lattice (realistic city:unit ratio; the
+#                                 authored 12-city layout is a poor fit for a 10k army)
 #   --bench-ticks 1500            tick count (pass --bench-ticks N for a short smoke run)
 # Any other args (e.g. --bench-seed) are forwarded as-is.
 
@@ -27,6 +29,7 @@ has_flag() {
 
 has_flag --bench-initial-units "${EXTRA[@]}" || EXTRA+=(--bench-initial-units 10000)
 has_flag --bench-map-size "${EXTRA[@]}" || EXTRA+=(--bench-map-size 1000)
+has_flag --bench-cities "${EXTRA[@]}" || EXTRA+=(--bench-cities 100)
 has_flag --bench-ticks "${EXTRA[@]}" || EXTRA+=(--bench-ticks 1500)
 
 cargo run --profile release --features debug-overlay,microbenchmarks,bench-alloc -- \

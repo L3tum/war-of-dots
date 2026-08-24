@@ -135,7 +135,12 @@ impl WorldExt for World {
                 return;
             }
             let timings = &mut wb.debug_stats.detailed_timings;
-            let entry = timings.entry(key.to_string()).or_default();
+            // get-first: `get_mut` borrows via `Borrow<str>` (no throwaway
+            // `to_string()` per call); `entry` only on the first record for a key.
+            let entry = match timings.get_mut(key) {
+                Some(e) => e,
+                None => timings.entry(key.to_string()).or_default(),
+            };
             entry.record(duration_ms);
         }
     }

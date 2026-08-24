@@ -250,6 +250,32 @@ pub struct CombatDiag {
     pub engagements: usize,
 }
 
+/// Movement diagnostics counters from the most recent tick's run (W1).
+#[allow(dead_code)]
+pub struct MovementDiag {
+    /// Units with a non-empty path entering the change list this tick.
+    pub changes: usize,
+    /// Occupancy-gate `for_each_within` scans performed.
+    pub scans: usize,
+    /// Movers blocked by the gate (retry next tick).
+    pub blocked: usize,
+    /// No-op changes skipped by the W1-① filter (writes nothing).
+    pub noop_skipped: usize,
+    /// Gate re-scans skipped via the W1-④ blocked-unit backoff window.
+    pub cooldown_skipped: usize,
+    /// Movers that passed the gate and were applied.
+    pub movers: usize,
+}
+
+/// Supply diagnostics counters from the most recent tick's run (W4).
+#[allow(dead_code)]
+pub struct SupplyDiag {
+    /// Units whose supply draw was blocked by an exhausted funds pool.
+    pub blocked_funds: u64,
+    /// Units whose men gain was blocked by an exhausted manpower pool.
+    pub blocked_mp: u64,
+}
+
 /// Pre-grouped data built once per tick, shared across all systems.
 /// Eliminates redundant player enumeration and unit filtering.
 /// Only holds small data (cities ~20 entries, funds ~12 entries).
@@ -665,6 +691,28 @@ impl Game {
         }
     }
 
+    /// Movement counters from the most recent tick's run (W1 sub-profiling).
+    #[allow(dead_code)]
+    pub fn movement_diag(&self) -> MovementDiag {
+        MovementDiag {
+            changes: self.movement_scratch.changes_len(),
+            scans: self.movement_scratch.diag_scans,
+            blocked: self.movement_scratch.diag_blocked,
+            noop_skipped: self.movement_scratch.diag_noop_skipped,
+            cooldown_skipped: self.movement_scratch.diag_cooldown,
+            movers: self.last_mover_count,
+        }
+    }
+
+    /// Supply FCFS-gate counters from the most recent tick's run (W4).
+    #[allow(dead_code)]
+    pub fn supply_diag(&self) -> SupplyDiag {
+        SupplyDiag {
+            blocked_funds: self.supply_scratch.diag_blocked_funds,
+            blocked_mp: self.supply_scratch.diag_blocked_mp,
+        }
+    }
+
     /// Main game tick.
     pub fn tick_game(&mut self) {
         if !self.running {
@@ -714,8 +762,9 @@ impl Game {
         );
 
         // Movement returns count of units that moved this tick. It also builds
-        // the pre-move spatial grid (occupancy gate) and the post-move grid
-        // (consumed by combat's mover-scan / target acquisition) into `self.grid_index_scratch`.
+        // the tick's one spatial grid (pre-move positions) into
+        // `self.grid_index_scratch` — consumed by the occupancy gate, combat's
+        // mover-scan / target acquisition, and city capture.
         let mover_count = tick_system!(
             "movement",
             &mut self.world,
@@ -725,7 +774,6 @@ impl Game {
                 self.world_entity,
                 &self.settings,
                 &mut self.movement_scratch,
-                &self.unit_types_index,
                 &self.ctx,
                 &mut self.grid_index_scratch,
             )
@@ -753,10 +801,10 @@ impl Game {
         }
 
         // Combat: resolves explicit combat targets. The mover-scan (target
-        // acquisition, site 1) consumes the post-move spatial grid that
-        // movement just built (3×3 cell query + circle filter, O(n × c) with
-        // bounded c) — folded in from the deleted `nearby_enemies` system
-        // (Phase 2, plans/COMBAT_TARGETING.md §8.8).
+        // acquisition, site 1) consumes the spatial grid movement built this
+        // tick from PRE-move positions (3×3 cell query + circle filter,
+        // O(n × c) with bounded c) — folded in from the deleted
+        // `nearby_enemies` system (Phase 2, plans/COMBAT_TARGETING.md §8.8).
         let combat_dead: Vec<hecs::Entity> = {
             let ctx = &self.ctx;
             tick_system!(
@@ -793,7 +841,10 @@ impl Game {
             )
         );
 
-        // City capture — returns list of city IDs whose ownership changed
+        // City capture — returns list of city IDs whose ownership changed.
+        // Reuses the spatial grid movement built this tick (shared borrow —
+        // combat read it too) so the candidate scan is O(cities × units_in_range)
+        // instead of O(units × cities).
         let cities_changed = tick_system!(
             "city_capture",
             &mut self.world,
@@ -803,6 +854,7 @@ impl Game {
                 self.world_entity,
                 &mut self.player_stats,
                 &self.ctx,
+                &self.grid_index_scratch,
             )
         );
         if !cities_changed.is_empty() {
@@ -1527,6 +1579,14 @@ impl Game {
         for pid in player_ids {
             if let Some(grid) = wb.vision.grids.get(pid) {
                 for i in 0..grid_size {
+                    // Sparse-friendly branch. NOTE: this does NOT auto-vectorize
+                    // (measured — scripts/check_vectorization.sh shows 0 wide ops
+                    // here): `bool` is 1-bit in MIR, and the earlier branchless
+                    // `result_flat[i] |= grid[i]` also failed to vectorize while
+                    // storing every cell, a micro-regression on sparse grids. The
+                    // branch form skips empty cells and is bit-identical output.
+                    // Real SIMD fix (only if this ever measures hot): `[u8]`
+                    // vision storage — see plans/SIMD_ROADMAP.md §W5.
                     if grid[i] {
                         result_flat[i] = true;
                     }
@@ -1594,25 +1654,34 @@ impl Game {
     }
 
     fn track_unit_losses(&mut self) {
-        let current_counts: HashMap<String, usize> = self
-            .world
-            .query::<(Entity, &UnitOwner)>()
-            .iter()
-            .fold(HashMap::new(), |mut acc, (_, owner)| {
-                *acc.entry(owner.player_id.clone()).or_insert(0) += 1;
-                acc
-            });
-
-        for (player_id, prev_count) in &self.prev_unit_counts {
-            let current_count = *current_counts.get(player_id).unwrap_or(&0);
-            let lost = prev_count.saturating_sub(current_count);
-            if lost > 0 {
-                if let Some(stats) = self.player_stats.get_mut(player_id) {
-                    stats.units_lost += lost as u32;
+        // Count units per player WITHOUT a per-unit String clone. The prior
+        // `entry(owner.player_id.clone())` heap-allocated + freed one String per
+        // unit per tick (~9 600 allocs/tick at ~10 k units) just to probe a map
+        // that has only a handful of keys. The player set is tiny and only grows
+        // on recruit (which pre-inserts the owner into `prev_unit_counts` before
+        // any unit can hold it), so match each unit's borrowed owner id against
+        // the few known keys by str equality — no per-unit allocation.
+        let ids: Vec<String> = self.prev_unit_counts.keys().cloned().collect();
+        let mut counts = vec![0usize; ids.len()];
+        for (_, owner) in self.world.query::<(Entity, &UnitOwner)>().iter() {
+            for i in 0..ids.len() {
+                if ids[i] == owner.player_id {
+                    counts[i] += 1;
+                    break;
                 }
             }
         }
-        self.prev_unit_counts = current_counts;
+        for i in 0..ids.len() {
+            let current = counts[i];
+            let entry = self.prev_unit_counts.get_mut(&ids[i]).unwrap();
+            let lost = (*entry).saturating_sub(current);
+            if lost > 0 {
+                if let Some(stats) = self.player_stats.get_mut(&ids[i]) {
+                    stats.units_lost += lost as u32;
+                }
+            }
+            *entry = current;
+        }
     }
 
     // ====================================================================
@@ -1822,6 +1891,52 @@ mod tests {
         game.border_grid_2d(player)
             .map(|g| g[y as usize][x as usize])
             .unwrap_or(0)
+    }
+
+    /// Proves `track_unit_losses` no longer clones a String per unit per tick.
+    /// The count must stay ~constant (a handful, the player-id key table) as
+    /// the unit count grows — the old `entry(owner.player_id.clone())` scaled
+    /// 1:1 with units (~9 600 allocs/tick at ~10 k units, the flat "other /
+    /// overhead" alloc spike in the stress report). Run single-threaded so the
+    /// global counting allocator's delta around the call is clean:
+    /// `cargo test --release --features bench-alloc track_unit_losses -- --test-threads=1 --nocapture`
+    #[cfg(feature = "bench-alloc")]
+    #[test]
+    fn track_unit_losses_alloc_does_not_scale_with_units() {
+        use crate::bench_alloc;
+        fn measure(n_units: usize) -> (u64, u64) {
+            let mut game = Game::new(test_map(), test_settings(), 2);
+            game.start();
+            let ut = basic_unit_type();
+            let owners = ["player_0", "player_1"];
+            for i in 0..n_units {
+                game.world
+                    .spawn_unit(&ut, owners[i % owners.len()], (1.0, 1.0));
+            }
+            // Recruit normally pre-inserts owners here; do the same.
+            for o in owners {
+                game.prev_unit_counts.insert(o.to_string(), 0);
+            }
+            bench_alloc::snapshot(); // settle max-window
+            let a = bench_alloc::peek();
+            game.track_unit_losses();
+            let b = bench_alloc::peek();
+            let d = b.diff(a);
+            (d.allocs, d.bytes)
+        }
+        let (a1000, b1000) = measure(1_000);
+        let (a10000, b10000) = measure(10_000);
+        eprintln!(
+            "track_unit_losses allocs @1000 = {a1000} ({b1000} B)  @10000 = {a10000} ({b10000} B)"
+        );
+        assert!(
+            a10000 < 50,
+            "allocs must be ~constant (player-id table), not ~n_units (got {a10000})"
+        );
+        assert!(
+            a10000 <= a1000 + 5,
+            "allocs must not grow with n_units (1000→{a1000}, 10000→{a10000})"
+        );
     }
 
     #[test]

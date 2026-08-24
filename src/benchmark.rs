@@ -71,6 +71,20 @@ pub struct BenchmarkConfig {
     /// scale proportionally to fill the map, so a stress test can spread units
     /// over a larger area (e.g. 1000×1000) to cut local combat density.
     pub map_size: u32,
+    /// Number of cities. Default 12 uses the authored 12-city layout (scaled
+    /// to the map); any other count generates an even sqrt lattice instead.
+    /// Stress tests with many units should raise this so per-player city income
+    /// (funds_per_city × cities/tick) can actually keep up with the army's
+    /// supply drain — at the default 12 cities the funds pools are chronically
+    /// exhausted and `supply`'s FCFS gate blocks ~25% of units every tick
+    /// (run 11w2m), which does not match a real game's city:unit ratio.
+    pub cities: u32,
+    /// Max units recruited per recruit event (every 100 ticks). Each city
+    /// recruits `units_per_city / 2` (min 1) per event, capped at this total
+    /// per event and spread evenly across cities (first `total % cities`
+    /// cities get one extra). Default 2000. Raise for heavier recruitment
+    /// pressure; lower to keep the population roughly stable.
+    pub max_recruits_per_event: u32,
 }
 
 impl Default for BenchmarkConfig {
@@ -83,6 +97,8 @@ impl Default for BenchmarkConfig {
             bench_prev: None,
             initial_units: None,
             map_size: 200,
+            cities: 12,
+            max_recruits_per_event: 2000,
         }
     }
 }
@@ -187,14 +203,17 @@ impl BattleSimulator {
             }
         }
 
-        // Recruit events: every 100 ticks, recruit new units
+        // Recruit events: every 100 ticks, recruit new units. Per-city count
+        // is `units_per_city / 2`, capped at `max_recruits_per_event` per
+        // event and spread evenly across cities (see `recruit_event_plan`).
         if self.tick.is_multiple_of(100) && self.tick > 0 {
-            let units_to_recruit = (config.units_per_city / 2).max(1) as usize;
-            let mut recruits: Vec<(String, UnitType, String)> = Vec::new();
+            let (base, extra) = recruit_event_plan(config, self.city_info.len());
+            let mut recruits: Vec<(String, UnitType, String)> =
+                Vec::with_capacity(base * self.city_info.len() + extra);
             for ci in 0..self.city_info.len() {
                 let city_id = self.city_info[ci].0.clone();
                 let owner = self.city_info[ci].1.clone();
-                for _ in 0..units_to_recruit {
+                for _ in 0..base + usize::from(ci < extra) {
                     let utype_idx = self.rand_idx(utype_count);
                     let utype = self.unit_types[utype_idx].clone();
                     recruits.push((city_id.clone(), utype, owner.clone()));
@@ -214,6 +233,19 @@ impl BattleSimulator {
 pub fn lattice_capacity(map_size: u32) -> u64 {
     let cells = (map_size as f32 / crate::game::constants::MIN_UNIT_DISTANCE).floor() as u64;
     cells * cells
+}
+
+/// Per-city recruit plan for one recruit event (every 100 ticks): each city
+/// recruits `units_per_city / 2` (min 1), capped at `max_recruits_per_event`
+/// total per event and spread evenly — returns `(base, extra)` so city `i`
+/// recruits `base + (i < extra)`. Deterministic for a given config.
+pub fn recruit_event_plan(config: &BenchmarkConfig, n_cities: usize) -> (usize, usize) {
+    if n_cities == 0 {
+        return (0, 0);
+    }
+    let per_city = (config.units_per_city / 2).max(1) as usize;
+    let total = (per_city * n_cities).min(config.max_recruits_per_event as usize);
+    (total / n_cities, total % n_cities)
 }
 
 /// Run a benchmark using a fresh game and return detailed results.
@@ -262,10 +294,30 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         (150.0, 50.0),
         (100.0, 150.0),
     ];
-    let cities: Vec<(f32, f32)> = base_cities
-        .iter()
-        .map(|&(x, y)| (x * city_scale, y * city_scale))
-        .collect();
+    let cities: Vec<(f32, f32)> = if config.cities == 12 {
+        // Authored layout (identical to pre-`--bench-cities` behavior).
+        base_cities
+            .iter()
+            .map(|&(x, y)| (x * city_scale, y * city_scale))
+            .collect()
+    } else {
+        // Even sqrt lattice filling the map with `config.cities` cities
+        // (margin = one cell of the lattice pitch, so no city sits on the edge).
+        let n = config.cities.max(1);
+        let cols = (n as f32).sqrt().ceil() as u32;
+        let rows = n.div_ceil(cols);
+        let m = map_size as f32;
+        (0..n)
+            .map(|i| {
+                let cx = (i % cols) as f32;
+                let cy = (i / cols) as f32;
+                (
+                    m * (cx + 1.0) / (cols as f32 + 1.0),
+                    m * (cy + 1.0) / (rows as f32 + 1.0),
+                )
+            })
+            .collect()
+    };
     let map_cfg = MapConfig {
         width: map_size,
         height: map_size,
@@ -346,6 +398,17 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let mut diag_engagements = 0usize;
     let mut health_units = 0usize;
     let mut health_attacking = 0usize;
+
+    // Movement / supply diagnostics accumulators (per-tick, averaged across
+    // all runs). Movement: W1 sub-profiling counters. Supply: FCFS gate block
+    // counts (they are counts, not ms — hence not in the detailed-timings table).
+    let mut mdiag_changes = 0usize;
+    let mut mdiag_scans = 0usize;
+    let mut mdiag_blocked = 0usize;
+    let mut mdiag_noop = 0usize;
+    let mut mdiag_cooldown = 0usize;
+    let mut sdiag_blocked_funds = 0u64;
+    let mut sdiag_blocked_mp = 0u64;
 
     if !config.detailed_systems.is_empty() {
         println!("  Detailed timing: {}", config.detailed_systems.join(", "));
@@ -545,6 +608,15 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             let health = game.combat_health();
             health_units += health.units;
             health_attacking += health.units_with_attacking;
+            let mdiag = game.movement_diag();
+            mdiag_changes += mdiag.changes;
+            mdiag_scans += mdiag.scans;
+            mdiag_blocked += mdiag.blocked;
+            mdiag_noop += mdiag.noop_skipped;
+            mdiag_cooldown += mdiag.cooldown_skipped;
+            let sdiag = game.supply_diag();
+            sdiag_blocked_funds += sdiag.blocked_funds;
+            sdiag_blocked_mp += sdiag.blocked_mp;
 
             #[cfg(any(debug_assertions, feature = "debug-overlay"))]
             let td = if let Some(ds) = game.get_debug_stats() {
@@ -755,8 +827,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         Vec::new()
     };
     let recruit_events = ((config.ticks / 100).max(1) - 1) as u32;
-    let total_recruited =
-        total_units + recruit_events * (config.units_per_city / 2).max(1) * total_cities as u32;
+    // Per-event count under the `max_recruits_per_event` cap (same logic the
+    // simulator uses), so the "Units recruited" total matches what actually spawned.
+    let per_recruit_event = {
+        let (base, extra) = recruit_event_plan(&config, total_cities);
+        (base * total_cities + extra) as u32
+    };
+    let total_recruited = total_units + recruit_events * per_recruit_event;
 
     // Compute overhead gap: tick_ms - sum(system_ms) = archetype/query/spawn overhead
     let overhead_durations: Vec<f64> = tick_data
@@ -814,6 +891,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "  Avg movers/tick (movement mover_count): {:.1}",
         avg_movers
     );
+    println!(
+        "    movement (avg/tick): changes {:.1}, gate scans {:.1}, gate-blocked {:.1}, cooldown-skipped {:.1}, noop-skipped {:.1}",
+        mdiag_changes as f64 / tick_data.len() as f64,
+        mdiag_scans as f64 / tick_data.len() as f64,
+        mdiag_blocked as f64 / tick_data.len() as f64,
+        mdiag_cooldown as f64 / tick_data.len() as f64,
+        mdiag_noop as f64 / tick_data.len() as f64
+    );
     println!("  Total mover-tick count: {}", total_movers);
     let avg_combats = if tick_data.is_empty() {
         0.0
@@ -824,6 +909,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     println!(
         "  Avg combats/tick (combat engaged pairs): {:.1}",
         avg_combats
+    );
+    println!(
+        "    supply (avg/tick): funds-blocked {:.1}, mp-blocked {:.1}",
+        sdiag_blocked_funds as f64 / tick_data.len() as f64,
+        sdiag_blocked_mp as f64 / tick_data.len() as f64
     );
     println!("  Total combat-tick count: {}", total_combats);
 
@@ -1049,6 +1139,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
+            "max_recruits_per_event": config.max_recruits_per_event,
             "initial_units": config.initial_units,
             "map_size": config.map_size,
             "total_units_initial": total_units, "total_units_recruited": total_recruited,
@@ -1065,6 +1156,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "move_events": config.ticks / 20 * MEASURED_RUNS as u64, "recruit_events": recruit_events * MEASURED_RUNS,
             "avg_movers_per_tick": avg_movers_per_tick,
             "total_mover_ticks": total_mover_ticks,
+            "avg_gate_scans_per_tick": mdiag_scans as f64 / tick_data.len() as f64,
+            "avg_gate_blocked_per_tick": mdiag_blocked as f64 / tick_data.len() as f64,
+            "avg_cooldown_skipped_per_tick": mdiag_cooldown as f64 / tick_data.len() as f64,
+            "avg_supply_funds_blocked_per_tick": sdiag_blocked_funds as f64 / tick_data.len() as f64,
+            "avg_supply_mp_blocked_per_tick": sdiag_blocked_mp as f64 / tick_data.len() as f64,
             "avg_combats_per_tick": avg_combats_per_tick,
             "total_combat_ticks": total_combat_ticks,
             "allocs_per_tick": avg_allocs_per_tick,
@@ -1132,6 +1228,17 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "avg_targets_skipped_mutual_per_tick": diag_targets_skipped_mutual as f64 / tick_data.len() as f64,
             "health_avg_units": health_units as f64 / tick_data.len() as f64,
             "health_avg_units_with_attacking": health_attacking as f64 / tick_data.len() as f64,
+        },
+        "movement_diag": {
+            "avg_changes_per_tick": mdiag_changes as f64 / tick_data.len() as f64,
+            "avg_gate_scans_per_tick": mdiag_scans as f64 / tick_data.len() as f64,
+            "avg_gate_blocked_per_tick": mdiag_blocked as f64 / tick_data.len() as f64,
+            "avg_cooldown_skipped_per_tick": mdiag_cooldown as f64 / tick_data.len() as f64,
+            "avg_noop_skipped_per_tick": mdiag_noop as f64 / tick_data.len() as f64,
+        },
+        "supply_diag": {
+            "avg_funds_blocked_per_tick": sdiag_blocked_funds as f64 / tick_data.len() as f64,
+            "avg_mp_blocked_per_tick": sdiag_blocked_mp as f64 / tick_data.len() as f64,
         },
         "microbenchmarks": microbench_json,
     });
@@ -1216,6 +1323,9 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let units_per_city = results.summary["config"]["units_per_city"]
         .as_u64()
         .unwrap_or(0);
+    let max_recruits_per_event = results.summary["config"]["max_recruits_per_event"]
+        .as_u64()
+        .unwrap_or(2000);
     let avg_system = results.summary["results"]["avg_system_ms"]
         .as_f64()
         .unwrap_or(0.0);
@@ -1233,6 +1343,23 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         .as_f64()
         .unwrap_or(0.0);
     let avg_combats = results.summary["results"]["avg_combats_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    // Movement / supply per-tick counters (Battle Activity cards). 0.0 when the
+    // report predates them (field-presence degrades to "no delta" via the cards').
+    let avg_gate_scans = results.summary["results"]["avg_gate_scans_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let avg_gate_blocked = results.summary["results"]["avg_gate_blocked_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let avg_cooldown_skipped = results.summary["results"]["avg_cooldown_skipped_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let avg_supply_funds_blocked = results.summary["results"]["avg_supply_funds_blocked_per_tick"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let avg_supply_mp_blocked = results.summary["results"]["avg_supply_mp_blocked_per_tick"]
         .as_f64()
         .unwrap_or(0.0);
     let overhead_p50 = results.summary["overhead"]["p50_ms"]
@@ -1341,6 +1468,26 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let prev_avg_combats = prev_json
         .get("results")
         .and_then(|r| r.get("avg_combats_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_gate_scans = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_gate_scans_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_gate_blocked = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_gate_blocked_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_cooldown_skipped = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_cooldown_skipped_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_supply_funds_blocked = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_supply_funds_blocked_per_tick"))
+        .and_then(|v| v.as_f64());
+    let prev_avg_supply_mp_blocked = prev_json
+        .get("results")
+        .and_then(|r| r.get("avg_supply_mp_blocked_per_tick"))
         .and_then(|v| v.as_f64());
     // Deaths/tick derived from the previous report (initial + recruited - remaining)/ticks.
     let prev_deaths_per_tick: Option<f64> = (|| {
@@ -1537,6 +1684,18 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     let units_recruited_delta = delta_html(units_recruited as f64, prev_units_recruited, "", COUNT);
     let avg_movers_delta = delta_html(avg_movers, prev_avg_movers, "", COUNT);
     let avg_combats_delta = delta_html(avg_combats, prev_avg_combats, "", COUNT);
+    let avg_gate_scans_delta = delta_html(avg_gate_scans, prev_avg_gate_scans, "", COUNT);
+    let avg_gate_blocked_delta = delta_html(avg_gate_blocked, prev_avg_gate_blocked, "", COUNT);
+    let avg_cooldown_skipped_delta =
+        delta_html(avg_cooldown_skipped, prev_avg_cooldown_skipped, "", COUNT);
+    let avg_supply_funds_blocked_delta = delta_html(
+        avg_supply_funds_blocked,
+        prev_avg_supply_funds_blocked,
+        "",
+        COUNT,
+    );
+    let avg_supply_mp_blocked_delta =
+        delta_html(avg_supply_mp_blocked, prev_avg_supply_mp_blocked, "", COUNT);
     let deaths_per_tick_delta = delta_html(deaths_per_tick, prev_deaths_per_tick, "", RATE);
 
     let tick_durations: Vec<f64> = results.tick_data.iter().map(|td| td.total_ms).collect();
@@ -1662,6 +1821,23 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         40
     };
 
+    // Previous detailed sub-part objects, keyed by sub-part name (mirrors
+    // `prev_timings`). A report that predates the sub-part (or that was run
+    // without `--bench-detailed`) simply yields no deltas for it.
+    let prev_detailed: std::collections::HashMap<String, &serde_json::Value> = prev_json
+        .get("detailed_timings")
+        .and_then(|dt| dt.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    s.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| (n.to_string(), s))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Detailed timing table rows
     let detailed_rows = {
         let dt = &results.summary["detailed_timings"];
@@ -1677,15 +1853,48 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
                         .partial_cmp(&a["total_ms"].as_f64().unwrap_or(0.0))
                         .unwrap()
                 });
-                sorted.iter().map(|s| {
-                    let name = s["name"].as_str().unwrap_or("?");
-                    let total = s["total_ms"].as_f64().unwrap_or(0.0);
-                    let calls = s["call_count"].as_u64().unwrap_or(0);
-                    let avg = s["avg_ms"].as_f64().unwrap_or(0.0);
-                    let p99 = s["p99_ms"].as_f64().unwrap_or(0.0);
-                    format!("<tr><td>{}</td><td>{:.1}</td><td>{:.3}</td><td>{}</td><td>{:.3}</td></tr>",
-                        name, total, avg, calls, p99)
-                }).collect::<Vec<_>>().join("\n      ")
+                sorted
+                    .iter()
+                    .map(|s| {
+                        let name = s["name"].as_str().unwrap_or("?");
+                        let total = s["total_ms"].as_f64().unwrap_or(0.0);
+                        let calls = s["call_count"].as_u64().unwrap_or(0);
+                        let avg = s["avg_ms"].as_f64().unwrap_or(0.0);
+                        let p99 = s["p99_ms"].as_f64().unwrap_or(0.0);
+                        let prev = prev_detailed.get(name);
+                        let prev_total: Option<f64> = prev
+                            .and_then(|p| p.get("total_ms"))
+                            .and_then(|v| v.as_f64());
+                        let prev_avg: Option<f64> =
+                            prev.and_then(|p| p.get("avg_ms")).and_then(|v| v.as_f64());
+                        let prev_calls: Option<f64> = prev
+                            .and_then(|p| p.get("call_count"))
+                            .and_then(|v| v.as_f64());
+                        let prev_p99: Option<f64> =
+                            prev.and_then(|p| p.get("p99_ms")).and_then(|v| v.as_f64());
+                        // Total cell: flag the sub-part "new" when absent from the previous report.
+                        let total_cell = match prev_total {
+                            Some(_) => {
+                                cell_delta(&format!("{:.1}", total), total, prev_total, "ms", 0.01)
+                            }
+                            None => format!(
+                                "<td><span style='color:#888'>{:.1} <i>new</i></span></td>",
+                                total
+                            ),
+                        };
+                        let avg_cell =
+                            cell_delta(&format!("{:.3}", avg), avg, prev_avg, "ms", 0.001);
+                        let calls_cell =
+                            cell_delta(&format!("{}", calls), calls as f64, prev_calls, "", 0.5);
+                        let p99_cell =
+                            cell_delta(&format!("{:.3}", p99), p99, prev_p99, "ms", 0.001);
+                        format!(
+                            "<tr><td>{}</td>{total_cell}{avg_cell}{calls_cell}{p99_cell}</tr>",
+                            name
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n      ")
             }
         } else {
             "<tr><td colspan='5'>No detailed timing data. Use --bench-detailed=system1,system2 to enable.</td></tr>".to_string()
@@ -2159,6 +2368,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             <tr><td>Cities</td><td>{cities}</td></tr>
             <tr><td>Players</td><td>{bench_players} (cities round-robin)</td></tr>
             <tr><td>Units per city</td><td>{units_per_city}</td></tr>
+            <tr><td>Max recruits/event</td><td>{max_recruits_per_event} (every 100 ticks, spread evenly across cities)</td></tr>
             <tr><td>Initial units</td><td>{units_initial}</td></tr>
             <tr><td>Ticks</td><td>{ticks}</td></tr>
             <tr><td>Seed</td><td>{seed}</td></tr>
@@ -2206,8 +2416,13 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             <div class="metric"><div class="value">{deaths_per_tick:.2}{deaths_per_tick_delta}</div><div class="label">Deaths/Tick*</div></div>
             <div class="metric"><div class="value">{avg_movers:.0}{avg_movers_delta}</div><div class="label">Avg Movers/Tick</div></div>
             <div class="metric"><div class="value">{avg_combats:.0}{avg_combats_delta}</div><div class="label">Avg Combats/Tick</div></div>
+            <div class="metric"><div class="value">{avg_gate_scans:.0}{avg_gate_scans_delta}</div><div class="label">Gate Scans/Tick</div></div>
+            <div class="metric"><div class="value">{avg_gate_blocked:.0}{avg_gate_blocked_delta}</div><div class="label">Gate-Blocked/Tick</div></div>
+            <div class="metric"><div class="value">{avg_cooldown_skipped:.0}{avg_cooldown_skipped_delta}</div><div class="label">Cooldown-Skipped/Tick</div></div>
+            <div class="metric"><div class="value">{avg_supply_funds_blocked:.0}{avg_supply_funds_blocked_delta}</div><div class="label">Supply-Blocked (Funds)</div></div>
+            <div class="metric"><div class="value">{avg_supply_mp_blocked:.0}{avg_supply_mp_blocked_delta}</div><div class="label">Supply-Blocked (MP)</div></div>
         </div>
-        <p class="note">*Deaths/Tick derived: (initial + recruited − remaining) / ticks — assumes units only leave via combat death.</p>
+        <p class="note">*Deaths/Tick derived: (initial + recruited − remaining) / ticks — assumes units only leave via combat death. Gate counters: occupancy-gate scans per tick in movement; gate-blocked = movers whose target was occupied; cooldown-skipped = blocked movers in their 3-tick backoff (W1-④). Supply-Blocked = units whose supply delivery was denied by the player's funds / manpower pool (FCFS gate; see city:unit ratio caveat).</p>
 
         <h2>Per-Tick Timing</h2>
         <div class="chart-container"><canvas id="tickChart" height="120"></canvas></div>
@@ -2575,6 +2790,16 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         avg_movers_delta = avg_movers_delta,
         avg_combats = avg_combats,
         avg_combats_delta = avg_combats_delta,
+        avg_gate_scans = avg_gate_scans,
+        avg_gate_scans_delta = avg_gate_scans_delta,
+        avg_gate_blocked = avg_gate_blocked,
+        avg_gate_blocked_delta = avg_gate_blocked_delta,
+        avg_cooldown_skipped = avg_cooldown_skipped,
+        avg_cooldown_skipped_delta = avg_cooldown_skipped_delta,
+        avg_supply_funds_blocked = avg_supply_funds_blocked,
+        avg_supply_funds_blocked_delta = avg_supply_funds_blocked_delta,
+        avg_supply_mp_blocked = avg_supply_mp_blocked,
+        avg_supply_mp_blocked_delta = avg_supply_mp_blocked_delta,
         deaths_per_tick = deaths_per_tick,
         deaths_per_tick_delta = deaths_per_tick_delta,
         avg_overhead = avg_overhead,
@@ -2747,6 +2972,7 @@ mod tests {
         serde_json::json!({
             "config": {
                 "cities": 12, "units_per_city": 5, "initial_units": 10000,
+                "max_recruits_per_event": 2000,
                 "map_size": 1000, "total_units_initial": 10000, "total_units_recruited": 11680,
                 "ticks": 500, "seed": 42, "measured_runs": 3, "warmup_ticks": 200,
                 "bench_prev": null, "detailed_systems": []
@@ -2770,6 +2996,24 @@ mod tests {
     /// The `<tr>…</tr>` segment (up to the next `<tr>`) that contains `needle`.
     fn row_containing<'a>(html: &'a str, needle: &str) -> Option<&'a str> {
         html.split("<tr>").find(|seg| seg.contains(needle))
+    }
+
+    #[test]
+    fn recruit_event_plan_caps_and_spreads_evenly() {
+        let mut cfg = BenchmarkConfig::default(); // units_per_city 5 → 2/city, cap 2000
+                                                  // Uncapped: 2/city × 12 cities = 24 < 2000.
+        assert_eq!(recruit_event_plan(&cfg, 12), (2, 0));
+        // Cap binds: 2/city × 1500 cities = 3000 > 2000 → 2000/1500 = 1 + 500 extra.
+        assert_eq!(recruit_event_plan(&cfg, 1500), (1, 500));
+        // Cap below city count: only the first `cap` cities recruit one each.
+        cfg.max_recruits_per_event = 3;
+        assert_eq!(recruit_event_plan(&cfg, 12), (0, 3));
+        // units_per_city 1 → (1/2).max(1) = 1/city.
+        cfg = BenchmarkConfig::default();
+        cfg.units_per_city = 1;
+        assert_eq!(recruit_event_plan(&cfg, 12), (1, 0));
+        // No cities → nothing.
+        assert_eq!(recruit_event_plan(&cfg, 0), (0, 0));
     }
 
     #[test]

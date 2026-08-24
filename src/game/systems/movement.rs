@@ -10,7 +10,6 @@ use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
 use hecs::Entity;
 use hecs::World;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,6 +40,91 @@ pub struct MovementScratch {
     /// preserved so steady-state ticks do not grow/allocate the Vec). Private
     /// because `MovementChange` is module-private. (Compile rule R1.)
     changes: Vec<(hecs::Entity, MovementChange)>,
+    /// Pass-A gate decisions, parallel to `changes` (true = move allowed).
+    /// Reused each tick; index i is only meaningful when `changes[i].moved`.
+    gate_passed: Vec<bool>,
+    /// W1-④ blocked-gate backoff slots, indexed by entity id (low 32 bits of
+    /// `Entity::to_bits`): high 56 bits = entity generation, low 8 bits = ticks
+    /// remaining. Grows as entity ids increase; steady-state ticks do not
+    /// allocate. A reused id (post-despawn) has a bumped generation ⇒ clear.
+    blocked_cd: Vec<u64>,
+    /// Diagnostics counters (W1 sub-profiling; read via `Game::movement_diag`).
+    pub diag_scans: usize,
+    pub diag_blocked: usize,
+    pub diag_noop_skipped: usize,
+    /// Gate re-scans skipped because the unit was still in its backoff window.
+    pub diag_cooldown: usize,
+}
+
+impl MovementScratch {
+    /// Number of units with a non-empty path in the current change list.
+    pub fn changes_len(&self) -> usize {
+        self.changes.len()
+    }
+}
+
+/// Ticks a gate-blocked unit skips re-scanning before retrying (W1-④).
+/// Run 11w2m: 7 117 of 9 747 gate scans/tick were blocked units re-scanning the
+/// same jam — a 3-tick backoff saves ~73 % of the gate work (≈ 0.23 ms/tick)
+/// at a gameplay cost of at most 3 ticks of delay behind an impassable
+/// front (the old behavior retried every tick and was blocked every tick).
+const GATE_BACKOFF: u8 = 3;
+
+/// Cap on the backoff vec's entity-id span. Live hecs ids are bounded by total
+/// spawns (tens of thousands); the cap keeps a pathological id (e.g.
+/// `Entity::DANGLING` = u32::MAX) from triggering a multi-GB resize. Entities
+/// beyond the cap simply never get a backoff (correctness unaffected).
+const GATE_BACKOFF_MAX_ID: usize = 1 << 20;
+
+/// Returns `true` — and decrements — when `entity` is still in its blocked-gate
+/// backoff window; `false` when the slot is clear to scan. Grows the vec as
+/// entity ids increase (no shrink). Slot layout (u64): generation in the high
+/// 56 bits, ticks remaining in the low 8 — full generation range, no packing
+/// truncation. `Entity::to_bits()` is the public (id, generation) projection.
+fn gate_cooldown_active(cd: &mut Vec<u64>, entity: hecs::Entity) -> bool {
+    let bits = entity.to_bits().get();
+    let idx = (bits & 0xFFFF_FFFF) as usize;
+    if idx >= GATE_BACKOFF_MAX_ID {
+        return false;
+    }
+    let gen = bits >> 32;
+    if idx >= cd.len() {
+        cd.resize(idx + 1, 0);
+    }
+    let slot = cd[idx];
+    if slot >> 8 == gen && slot & 0xFF > 0 {
+        cd[idx] = (slot & !0xFF) | ((slot & 0xFF) - 1);
+        true
+    } else {
+        false
+    }
+}
+
+/// Puts `entity` on its blocked-gate backoff window.
+fn gate_cooldown_set(cd: &mut Vec<u64>, entity: hecs::Entity, ticks: u8) {
+    let bits = entity.to_bits().get();
+    let idx = (bits & 0xFFFF_FFFF) as usize;
+    if idx >= GATE_BACKOFF_MAX_ID {
+        return;
+    }
+    let gen = bits >> 32;
+    if idx >= cd.len() {
+        cd.resize(idx + 1, 0);
+    }
+    cd[idx] = (gen << 8) | u64::from(ticks);
+}
+
+/// Clears `entity`'s backoff slot once a scan passes (unit is unblocked).
+fn gate_cooldown_clear(cd: &mut [u64], entity: hecs::Entity) {
+    let bits = entity.to_bits().get();
+    let idx = (bits & 0xFFFF_FFFF) as usize;
+    if idx >= GATE_BACKOFF_MAX_ID {
+        return;
+    }
+    let gen = bits >> 32;
+    if idx < cd.len() {
+        cd[idx] = gen << 8;
+    }
 }
 
 /// Returns the number of units that moved this tick.
@@ -49,13 +133,16 @@ pub fn run(
     world_entity: hecs::Entity,
     settings: &GameSettings,
     scratch: &mut MovementScratch,
-    unit_types_index: &HashMap<String, usize>,
     ctx: &TickContext,
     grid_scratch: &mut GridIndexScratch,
 ) -> usize {
     // Scratch is filled by the apply loop below; clear the previous tick's
     // records up front so a fresh population happens every tick.
     scratch.movers.clear();
+    scratch.diag_scans = 0;
+    scratch.diag_blocked = 0;
+    scratch.diag_noop_skipped = 0;
+    scratch.diag_cooldown = 0;
 
     // Per-phase timing (recorded into WorldBundle debug stats; no-op without
     // the debug-overlay feature). Surface with `--bench-detailed movement`.
@@ -73,8 +160,6 @@ pub fn run(
         None => return 0,
     };
 
-    // Unit-type speed is resolved via the cached `unit_types_index` (name -> index
-    // into `settings.unit_types`) built once per `Game` — no per-tick HashMap build.
     let t1 = Instant::now();
 
     // Phase 1: query all components, compute movement changes into the reused
@@ -104,7 +189,6 @@ pub fn run(
                     equipment,
                     &terrain,
                     terrain_width,
-                    unit_types_index,
                     settings,
                 )
                 .map(|change| (entity, change))
@@ -119,8 +203,10 @@ pub fn run(
     // positions. A blocked unit is skipped entirely — no position write, no
     // waypoint pop (it did not reach its waypoint), no mover record, no `moved`
     // flag, no org drain — and retries next tick. Because centers can't approach
-    // closer than `MIN_UNIT_DISTANCE`, unit density is bounded, which is what
-    // keeps every `NearbyEnemies` list O(constant).
+    // closer than `MIN_UNIT_DISTANCE`, unit density is bounded, which keeps each
+    // `for_each_within` spatial scan O(constant) (a 3×3 cell touch, at most a few
+    // units per cell) — the same bound that keeps combat's target-acquisition
+    // scan cheap.
     //
     // Soft equilibrium (documented): two units converging on the *same* point in
     // the *same* tick both pass the pre-move check (neither is there yet) and may
@@ -133,26 +219,67 @@ pub fn run(
         None => return 0,
     };
 
-    // Build the PRE-move spatial grid (reused buffers, in place, no alloc at
-    // steady state). The occupancy gate queries it; combat's mover scan later
-    // consumes the post-move grid built at the end of this function.
+    // Build the tick's ONE spatial grid (reused buffers, in place, no alloc at
+    // steady state) from PRE-move positions. Three consumers:
+    //  1. the occupancy gate below — needs the pre-move snapshot: blocking is
+    //     decided against a frozen position set, so it never depends on apply
+    //     order (the documented "soft equilibrium" for converging units).
+    //  2. combat's mover scan (target acquisition) and 3. city capture, which
+    //     read `grid_scratch.index` AFTER the writes below, so they see
+    //     pre-move positions: a unit that moved this tick is still at its old
+    //     position for them. Combat rescans every mover every tick, so a unit
+    //     that just walked into range acquires/releases its target one tick
+    //     later — accepted in exchange for dropping the former second
+    //     (post-move) build, which cost ~0.21 ms/tick for that freshness.
     populate_grid_units(world, ctx, grid_scratch);
-    let pre_grid = spatial::GridIndex::build(
+    grid_scratch.index = spatial::GridIndex::build(
         &grid_scratch.units,
         &mut grid_scratch.entries,
         &mut grid_scratch.cell_offsets,
         &mut grid_scratch.cell_sizes,
     );
+    let pre_grid = grid_scratch.index;
 
-    // Only units that actually moved count as movers (drives spatialty).
+    // W1 two-pass apply so the occupancy gate (read-only grid scans) is
+    // measured separately from the ECS writes. Run 11w1 left p3_apply flat
+    // after ①+②, so this split decides ③ (single-pass apply) vs ④ (gate work).
+    // Pass order and per-entity order are identical to the old single loop, so
+    // writes, the movers vec, and the blocked-skip are all bit-identical.
+    let changes = &scratch.changes;
+    let is_noop =
+        |c: &MovementChange| !c.moved && c.new_path.is_none() && !c.pop_head && c.new_org.is_none();
+
+    let t3a = Instant::now();
+    // Pass A: occupancy gate — decides which movers proceed. Blocked units get
+    // no writes at all and retry next tick.
+    scratch.gate_passed.clear();
+    scratch.gate_passed.resize(changes.len(), true);
     let mut applied_movers = 0usize;
-    for (entity, change) in &scratch.changes {
-        let entity = *entity;
+    for (i, (entity, change)) in changes.iter().enumerate() {
+        if is_noop(change) {
+            // W1-①: a no-op change writes nothing — `moved == false` implies
+            // `new_pos == old_pos` exactly (compute flagging rule), so with no
+            // path change and no org drain there is nothing to apply.
+            scratch.diag_noop_skipped += 1;
+            continue;
+        }
         if change.moved {
-            // Gate against the pre-move grid: block if any *other* unit is within
-            // MIN_UNIT_DISTANCE of the (clamped) target. Self-exclusion is
-            // required — the grid holds this unit at its OLD position, a small
-            // step away, which must not block the unit itself.
+            let entity = *entity;
+            // W1-④: a unit blocked at the gate is jammed behind another unit;
+            // re-scanning the same target every tick while still stuck (the
+            // 11w2m case: 7 117 blocked / 9 747 scans) is pure waste. Count
+            // down its backoff once per tick and skip both the scan and the
+            // apply; it retries after GATE_BACKOFF ticks.
+            if gate_cooldown_active(&mut scratch.blocked_cd, entity) {
+                scratch.gate_passed[i] = false;
+                scratch.diag_cooldown += 1;
+                continue;
+            }
+            // Gate against the pre-move grid: block if any *other* unit is
+            // within MIN_UNIT_DISTANCE of the (clamped) target. Self-exclusion
+            // is required — the grid holds this unit at its OLD position, a
+            // small step away, which must not block the unit itself.
+            scratch.diag_scans += 1;
             let target = UnitPosition {
                 x: change.new_pos.x.clamp(0.0, map_w - 1.0),
                 y: change.new_pos.y.clamp(0.0, map_h - 1.0),
@@ -170,12 +297,28 @@ pub fn run(
                 },
             );
             if blocked {
-                // Skip the move entirely: no position write, no waypoint pop, no
-                // mover record, no moved flag. The unit stays put and retries next
-                // tick (movement recomputes from the path every tick).
-                continue;
+                scratch.gate_passed[i] = false;
+                scratch.diag_blocked += 1;
+                gate_cooldown_set(&mut scratch.blocked_cd, entity, GATE_BACKOFF);
+            } else {
+                gate_cooldown_clear(&mut scratch.blocked_cd, entity);
+                applied_movers += 1;
             }
-            applied_movers += 1;
+        }
+    }
+    let t3b = Instant::now();
+    // Pass B: apply writes, same order as pass A.
+    for (i, (entity, change)) in changes.iter().enumerate() {
+        if is_noop(change) {
+            continue;
+        }
+        let entity = *entity;
+        if change.moved && !scratch.gate_passed[i] {
+            // Blocked in pass A: skip the move entirely — no position write,
+            // no waypoint pop, no mover record, no moved flag, no org drain.
+            continue;
+        }
+        if change.moved {
             // Record this mover for spatialty: (entity, pre-move pos, post-move
             // pos). Spatialty uses these directly — no marker component, no
             // extra ECS writes.
@@ -183,49 +326,46 @@ pub fn run(
                 .movers
                 .push((entity, change.old_pos, change.new_pos));
         }
-        if let Ok((mpos,)) = world.query_one_mut::<(&mut UnitPosition,)>(entity) {
+        // W1-②: ONE multi-component lookup instead of up to four per-entity
+        // query_one_mut calls (position / path / stats / flags). The unit always
+        // has all four (the phase-1 query proves presence); hecs permits one
+        // &mut per distinct component type. Conditionals become field-level
+        // writes; bit-identical results.
+        if let Ok((mpos, mpath, mstats, mflags)) = world.query_one_mut::<(
+            &mut UnitPosition,
+            &mut UnitPath,
+            &mut UnitStats,
+            &mut UnitFlags,
+        )>(entity)
+        {
             // Clamp position to map bounds to prevent out-of-bounds access
             mpos.x = change.new_pos.x.clamp(0.0, map_w - 1.0);
             mpos.y = change.new_pos.y.clamp(0.0, map_h - 1.0);
-        }
-        if let Some(new_path) = &change.new_path {
-            if let Ok((mpath,)) = world.query_one_mut::<(&mut UnitPath,)>(entity) {
+            if let Some(new_path) = &change.new_path {
                 *mpath = (*new_path).clone();
-            }
-        } else if change.pop_head {
-            // Reached first waypoint: pop the head of the path in place. Guarded
-            // + asserted because compute only sets pop_head after `path.first()?`
-            // succeeded and no other system writes UnitPath mid-tick.
-            if let Ok((mpath,)) = world.query_one_mut::<(&mut UnitPath,)>(entity) {
+            } else if change.pop_head {
+                // Reached first waypoint: pop the head of the path in place.
+                // Guarded + asserted because compute only sets pop_head after
+                // `path.first()?` succeeded and no other system writes
+                // UnitPath mid-tick.
                 debug_assert!(!mpath.path.is_empty());
                 if !mpath.path.is_empty() {
                     mpath.path.remove(0);
                 }
             }
-        }
-        if let Some(new_org) = change.new_org {
-            if let Ok((mstats,)) = world.query_one_mut::<(&mut UnitStats,)>(entity) {
+            if let Some(new_org) = change.new_org {
                 mstats.organisation = new_org;
             }
-        }
-        if change.moved {
-            if let Ok((mf,)) = world.query_one_mut::<(&mut UnitFlags,)>(entity) {
-                mf.moved = true;
+            if change.moved {
+                mflags.moved = true;
             }
         }
     }
     let t4 = Instant::now();
 
-    // Build the POST-move spatial grid (reflecting applied positions) — this is
-    // the grid `combat`'s mover scan (target acquisition) consumes this tick.
-    populate_grid_units(world, ctx, grid_scratch);
-    grid_scratch.index = spatial::GridIndex::build(
-        &grid_scratch.units,
-        &mut grid_scratch.entries,
-        &mut grid_scratch.cell_offsets,
-        &mut grid_scratch.cell_sizes,
-    );
-    let t5 = Instant::now();
+    // (The former post-move grid build was dropped: the pre-move grid is the
+    // tick's single grid — combat/city capture trade one tick of position
+    // freshness for the ~0.21 ms/tick saved; see the build above.)
 
     // Record per-phase timings (keyed under "movement/..."; no-op if not
     // enabled or without the debug-overlay feature).
@@ -233,7 +373,8 @@ pub fn run(
     world.record_detailed(world_entity, "movement/p1_setup", to_ms(t1 - t0));
     world.record_detailed(world_entity, "movement/p2_query", to_ms(t2 - t1));
     world.record_detailed(world_entity, "movement/p3_apply", to_ms(t4 - t2));
-    world.record_detailed(world_entity, "movement/p4_spatial", to_ms(t5 - t4));
+    world.record_detailed(world_entity, "movement/p3a_gate", to_ms(t3b - t3a));
+    world.record_detailed(world_entity, "movement/p3b_write", to_ms(t4 - t3b));
 
     applied_movers
 }
@@ -266,7 +407,7 @@ pub fn populate_grid_units(world: &World, ctx: &TickContext, grid_scratch: &mut 
         );
 }
 
-#[allow(clippy::too_many_arguments)] // Pure per-unit computation: pos/path/components + cached unit-type index/settings
+#[allow(clippy::too_many_arguments)] // Pure per-unit computation: pos/path/components + settings/settings
 fn compute_movement(
     pos: UnitPosition,
     path: &UnitPath,
@@ -275,7 +416,6 @@ fn compute_movement(
     equipment: &UnitEquipment,
     terrain: &Arc<Vec<Terrain>>,
     terrain_width: usize,
-    unit_types_index: &HashMap<String, usize>,
     settings: &GameSettings,
 ) -> Option<MovementChange> {
     let (nx, ny) = path.path.first()?;
@@ -283,11 +423,17 @@ fn compute_movement(
     let dy = ny - pos.y;
     let dist = (dx * dx + dy * dy).sqrt();
 
-    // O(1) lookup via the cached index into settings.unit_types (no per-tick map).
-    let unit_type_speed = unit_types_index
-        .get(&utype.name)
-        .map(|&i| settings.unit_types[i].speed)
-        .unwrap_or(1.0);
+    // Resolve the type's base speed by scanning the (few) unit types. A short
+    // string compare (~2–4 ns for the handful of types) beats the old
+    // `unit_types_index.get(&utype.name)` SipHash name→index probe (~15 ns, 55 %
+    // of compute_movement's per-unit cost — see movement_compute_cost_breakdown).
+    // Identical value + the same 1.0 fallback for an unknown type: the old
+    // `unit_types_index` was exactly name→position in `settings.unit_types`.
+    let unit_type_speed = settings
+        .unit_types
+        .iter()
+        .find(|ut| ut.name == utype.name)
+        .map_or(1.0, |ut| ut.speed);
 
     let current_terrain = terrain
         .get((pos.y as usize) * terrain_width + (pos.x as usize))
@@ -399,6 +545,65 @@ mod tests {
         assert_eq!(speed, 1.0);
     }
 
+    // ---------------------------------------------------------------------------
+    // gate backoff (W1-④)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn gate_backoff_counts_down_then_expires() {
+        let mut cd: Vec<u64> = Vec::new();
+        let e = hecs::Entity::from_bits(1u64 << 32).unwrap(); // id 0, gen 1
+        assert!(!gate_cooldown_active(&mut cd, e), "fresh slot is clear");
+        gate_cooldown_set(&mut cd, e, GATE_BACKOFF);
+        for _ in 0..GATE_BACKOFF {
+            assert!(gate_cooldown_active(&mut cd, e));
+        }
+        assert!(!gate_cooldown_active(&mut cd, e), "backoff expired");
+    }
+
+    #[test]
+    fn gate_backoff_generation_mismatch_is_clear() {
+        let mut cd: Vec<u64> = Vec::new();
+        let e3 = hecs::Entity::from_bits((1u64 << 32) | 3).unwrap(); // id 3, gen 1
+        let e3g2 = hecs::Entity::from_bits((2u64 << 32) | 3).unwrap(); // id 3, gen 2
+        gate_cooldown_set(&mut cd, e3, GATE_BACKOFF);
+        // Id reused by a new entity (generation bumped) ⇒ no stale backoff.
+        assert!(!gate_cooldown_active(&mut cd, e3g2));
+    }
+
+    #[test]
+    fn gate_backoff_clear_resets_window() {
+        let mut cd: Vec<u64> = Vec::new();
+        let e = hecs::Entity::from_bits((1u64 << 32) | 1).unwrap();
+        gate_cooldown_set(&mut cd, e, GATE_BACKOFF);
+        assert!(gate_cooldown_active(&mut cd, e));
+        gate_cooldown_clear(&mut cd, e);
+        assert!(
+            !gate_cooldown_active(&mut cd, e),
+            "clear ⇒ immediately retryable"
+        );
+    }
+
+    #[test]
+    fn gate_backoff_independent_per_id() {
+        let mut cd: Vec<u64> = Vec::new();
+        let e5 = hecs::Entity::from_bits(1u64 << 32 | 5).unwrap();
+        let e6 = hecs::Entity::from_bits(1u64 << 32 | 6).unwrap();
+        gate_cooldown_set(&mut cd, e5, GATE_BACKOFF);
+        assert!(!gate_cooldown_active(&mut cd, e6), "other id unaffected");
+    }
+
+    #[test]
+    fn gate_backoff_pathological_id_is_ignored() {
+        // Entity::DANGLING has id = u32::MAX — beyond the cap, so it must be
+        // treated as "no backoff" instead of resizing the vec to gigabytes.
+        let mut cd: Vec<u64> = Vec::new();
+        let d = hecs::Entity::DANGLING;
+        gate_cooldown_set(&mut cd, d, GATE_BACKOFF);
+        assert!(!gate_cooldown_active(&mut cd, d));
+        assert!(cd.is_empty(), "no allocation for out-of-cap ids");
+    }
+
     #[test]
     fn speed_water_uses_water_speed() {
         let water_speed = 0.5;
@@ -466,6 +671,100 @@ mod tests {
         Arc::new(vec![Terrain::Plains; (width * height) as usize])
     }
 
+    /// Fast micro-timing of `compute_movement`'s per-unit cost, to decide
+    /// whether a specific sub-op (the name→index HashMap probe, the `sqrt`, or
+    /// the equipment `iter().sum()`) is worth removing. Pure function, no world.
+    /// Run: `cargo test --release movement_compute_cost -- --test-threads=1 --nocapture`
+    #[test]
+    fn movement_compute_cost_breakdown() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let settings = test_settings();
+        let ut_index = ut_index(&settings);
+        let terrain = test_terrain(100, 100);
+        let pos = UnitPosition { x: 1.0, y: 1.0 };
+        let path = UnitPath {
+            path: [(100.0, 100.0)].into_iter().collect(), // far ⇒ "moving" branch (sqrt)
+        };
+        let utype = UnitTypeId {
+            name: "infantry".to_string(),
+        };
+        let stats = UnitStats {
+            men: 1000.0,
+            max_men: 1000.0,
+            organisation: 100.0,
+            max_organisation: 100.0,
+        };
+        // Realistic equipment: a couple of items (exercises iter().sum()).
+        use crate::game::unit::Equipment;
+        let equipment = UnitEquipment {
+            equipment: vec![
+                Equipment {
+                    name: "a".to_string(),
+                    count: 3,
+                    max_count: 3,
+                    cost_per_item: 1.0,
+                },
+                Equipment {
+                    name: "b".to_string(),
+                    count: 5,
+                    max_count: 5,
+                    cost_per_item: 1.0,
+                },
+            ],
+            max_equipment: vec![],
+            supply_buffer_percent: 10,
+            supply_rate: 5,
+            supply: 2000.0,
+            max_supply: 2000.0,
+        };
+
+        const N: usize = 2_000_000;
+        // Warm.
+        for _ in 0..200_000 {
+            black_box(compute_movement(
+                pos, &path, &utype, &stats, &equipment, &terrain, 100, &settings,
+            ));
+        }
+
+        let t0 = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..N {
+            sink += compute_movement(
+                pos, &path, &utype, &stats, &equipment, &terrain, 100, &settings,
+            )
+            .is_some() as usize;
+        }
+        let full = t0.elapsed() / N as u32;
+        black_box(sink);
+
+        // Isolate the name→index HashMap probe (the old approach, kept for reference).
+        let t1 = Instant::now();
+        let mut s1 = 0.0f32;
+        for _ in 0..N {
+            s1 += ut_index
+                .get(&utype.name)
+                .map_or(1.0, |&i| settings.unit_types[i].speed);
+        }
+        let probe = t1.elapsed() / N as u32;
+        black_box(s1);
+
+        // Isolate the sqrt.
+        let t2 = Instant::now();
+        let s2 = (0..N)
+            .map(|_| (99.0f32 * 99.0f32 + 99.0f32 * 99.0f32).sqrt())
+            .sum::<f32>();
+        let sqrt = t2.elapsed() / N as u32;
+        black_box(s2);
+
+        eprintln!(
+            "compute_movement = {:?}/unit   |   HashMap probe = {:?}/unit   |   sqrt = {:?}/unit",
+            full, probe, sqrt
+        );
+        assert!(full > std::time::Duration::ZERO);
+    }
+
     #[test]
     fn movement_no_path_returns_none() {
         let pos = UnitPosition { x: 5.0, y: 5.0 };
@@ -491,15 +790,7 @@ mod tests {
         let settings = test_settings();
 
         let result = compute_movement(
-            pos,
-            &path,
-            &utype,
-            &stats,
-            &equipment,
-            &terrain,
-            20,
-            &ut_index(&settings),
-            &settings,
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
         );
         assert!(result.is_none());
     }
@@ -531,15 +822,7 @@ mod tests {
         let settings = test_settings();
 
         let change = compute_movement(
-            pos,
-            &path,
-            &utype,
-            &stats,
-            &equipment,
-            &terrain,
-            20,
-            &ut_index(&settings),
-            &settings,
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
         );
         assert!(change.is_some());
         let change = change.unwrap();
@@ -579,15 +862,7 @@ mod tests {
         let settings = test_settings();
 
         let change = compute_movement(
-            pos,
-            &path,
-            &utype,
-            &stats,
-            &equipment,
-            &terrain,
-            20,
-            &ut_index(&settings),
-            &settings,
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
         );
         assert!(change.is_some());
         let change = change.unwrap();
@@ -626,15 +901,7 @@ mod tests {
         let settings = test_settings();
 
         let change = compute_movement(
-            pos,
-            &path,
-            &utype,
-            &stats,
-            &equipment,
-            &terrain,
-            20,
-            &ut_index(&settings),
-            &settings,
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
         );
         assert!(change.is_some());
         let change = change.unwrap();
@@ -669,15 +936,7 @@ mod tests {
         let settings = test_settings();
 
         let change = compute_movement(
-            pos,
-            &path,
-            &utype,
-            &stats,
-            &equipment,
-            &terrain,
-            20,
-            &ut_index(&settings),
-            &settings,
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
         );
         assert!(change.is_some());
         let change = change.unwrap();
@@ -742,7 +1001,6 @@ mod tests {
             world_entity,
             settings,
             &mut scratch,
-            &ut_index(settings),
             ctx,
             grid_scratch,
         )

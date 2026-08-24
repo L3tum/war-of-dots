@@ -81,6 +81,8 @@ pub async fn debug_benchmark_handler(
         bench_prev: None,
         initial_units: None,
         map_size: 200,
+        cities: 12,
+        max_recruits_per_event: 2000,
     };
 
     // Run benchmark in a blocking thread
