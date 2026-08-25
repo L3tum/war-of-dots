@@ -78,6 +78,9 @@ export class ReplayPlayer {
   }
 
   private applyEvent(event: GameEvent): void {
+    // Bump the renderer's data version so the frame dirty gate keeps the
+    // render loop advancing while replay events are still being applied.
+    this.renderer?.markDataDirty();
     // Full game state snapshot
     if (isFullStateEvent(event)) {
       const fs = event.full_state;

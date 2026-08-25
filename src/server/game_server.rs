@@ -521,12 +521,18 @@ impl GameRoom {
                         // --- Run game systems ---
                         game.tick_game();
 
+                        // Snapshot game state once per tick, shared by the
+                        // active-player check and the per-player delta build.
+                        let current_units = game.unit_states();
+                        let current_cities: Vec<CityState> =
+                            game.query_cities().iter().map(|c| c.into()).collect();
+
                         // Update live debug stats (read by /debug/stats)
                         {
                             let mut gs = game_stats.lock().unwrap_or_else(|e| e.into_inner());
                             gs.tick_count = tick_count;
                             gs.last_tick_ms = _tick_start.elapsed().as_secs_f64() * 1000.0;
-                            gs.entity_count = game.unit_states().len() + game.query_cities().len();
+                            gs.entity_count = game.unit_count() + game.query_cities().len();
                         }
 
                         // --- Broadcast state snapshots every 60 ticks (~1 sec) ---
@@ -542,8 +548,8 @@ impl GameRoom {
                         let player_ids: Vec<String> = game.players().keys().cloned().collect();
                         let total_players = player_ids.len();
                         let active_count = player_ids.iter().filter(|pid| {
-                            let has_units = game.unit_states().iter().any(|u| u.owner.as_str() == pid.as_str());
-                            let has_cities = game.query_cities().iter().any(|c| c.owner.as_deref() == Some(pid.as_str()));
+                            let has_units = current_units.iter().any(|u| u.owner.as_str() == pid.as_str());
+                            let has_cities = current_cities.iter().any(|c| c.owner.as_deref() == Some(pid.as_str()));
                             has_units || has_cities
                         }).count();
                         if active_count == 0 {
@@ -605,7 +611,10 @@ impl GameRoom {
                             break;
                         }
 
-                        // --- Build & broadcast delta ---
+                        // all_funds is cheap (no per-unit clones); units/cities
+                        // were already snapshotted above.
+                        let all_funds = game.all_player_funds();
+
                         let spectator_vision_grid = if spectator_vision {
                             let all_pids: Vec<String> = game.players().keys().cloned().collect();
                             game.union_vision_grids(&all_pids)
@@ -632,23 +641,30 @@ impl GameRoom {
                                 ),
                             };
                             let pid = player.id().cloned().unwrap_or_default();
-                            let delta = build_delta_inner(
-                                &game,
+                            if let Some(delta) = build_delta_inner(
                                 &mut prev_units,
                                 &mut prev_cities,
                                 &mut prev_funds,
                                 &mut prev_vision_grid,
                                 &mut prev_border_grid,
+                                &current_units,
+                                &current_cities,
+                                &all_funds,
                                 vision_grid,
                                 border_grid,
                                 &pid,
-                            );
-                            let encoded = encode_message(&delta);
-                            if player.tx().send(encoded).await.is_ok() {
+                            ) {
+                                let encoded = encode_message(&delta);
+                                if player.tx().send(encoded).await.is_ok() {
+                                    alive.push(player);
+                                }
+                            } else {
+                                // Nothing changed for this player; keep the connection alive.
                                 alive.push(player);
                             }
                         }
                         players = alive;
+                        prev_funds = all_funds;
 
                         // End the game when the last human player leaves, even if
                         // LLM agents or spectators remain. Spectators do not count
@@ -1225,20 +1241,31 @@ pub(crate) async fn handle_replay_ws(
                 replay_player.apply_event(&event);
                 let current_vision = replay_player.game.supervisor_vision_grid();
                 let current_border = replay_player.game.supervisor_border_grid();
-                let delta = build_delta_inner(
-                    &replay_player.game,
+                let current_units = replay_player.game.unit_states();
+                let current_cities: Vec<CityState> = replay_player
+                    .game
+                    .query_cities()
+                    .iter()
+                    .map(|c| c.into())
+                    .collect();
+                let all_funds = replay_player.game.all_player_funds();
+                if let Some(delta) = build_delta_inner(
                     &mut prev_units,
                     &mut prev_cities,
                     &mut prev_funds,
                     &mut prev_vision_grid,
                     &mut prev_border_grid,
+                    &current_units,
+                    &current_cities,
+                    &all_funds,
                     current_vision,
                     current_border,
                     "",
-                );
-                let encoded = encode_message(&delta);
-                if ws_sink.send(Message::Binary(encoded)).await.is_err() {
-                    return;
+                ) {
+                    let encoded = encode_message(&delta);
+                    if ws_sink.send(Message::Binary(encoded)).await.is_err() {
+                        return;
+                    }
                 }
                 // Wait for next tick (game speed)
                 let interval_ms = (1000.0f64 / 60.0).ceil() as u64;

@@ -24,7 +24,7 @@
 use crate::game::components::*;
 use crate::game::constants::COMBAT_DISTANCE_SQ;
 use crate::game::game::GameSettings;
-use crate::game::game::{OWNER_NONE, TickContext};
+use crate::game::game::{TickContext, OWNER_NONE};
 use crate::game::spatial::{self, GridIndexScratch};
 use crate::game::world_ext::WorldExt;
 use hecs::Entity;

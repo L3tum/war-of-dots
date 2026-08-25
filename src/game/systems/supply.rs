@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::game::components::*;
-use crate::game::game::{GameSettings, OWNER_NONE, TickContext};
+use crate::game::game::{GameSettings, TickContext, OWNER_NONE};
 use crate::game::world_ext::WorldExt;
 use hecs::World;
 
@@ -220,7 +220,9 @@ pub fn run(
         // out of range — in which case it simply draws no supply (pools empty).
         let owner_idx = {
             let oi = ctx.owner_index(entity);
-            (oi != OWNER_NONE).then_some(oi as usize).filter(|&i| i < remaining_funds.len())
+            (oi != OWNER_NONE)
+                .then_some(oi as usize)
+                .filter(|&i| i < remaining_funds.len())
         };
         // Dead-waiting-for-surrender units are not mutated here.
         if stats.men <= 0.0 {
@@ -236,7 +238,13 @@ pub fn run(
         // index is missing (should not happen in steady state).
         let needed = type_idx
             .and_then(|i| unit_type_total_max_equipment.get(i).copied())
-            .unwrap_or_else(|| equipment.max_equipment.iter().map(|e| e.max_count as f32).sum());
+            .unwrap_or_else(|| {
+                equipment
+                    .max_equipment
+                    .iter()
+                    .map(|e| e.max_count as f32)
+                    .sum()
+            });
 
         // IMPORTANT: `ratio` is computed from the PRE-wear, untouched equipment,
         // matching the original (which read the immutable &UnitEquipment). It
@@ -532,7 +540,15 @@ mod tests {
             .map(|ut| ut.equipment.iter().map(|e| e.max_count as f32).sum())
             .collect();
         let mut s = SupplyScratch::new();
-        let _ = run(world, world_entity, settings, &mut s, &ctx, &ut_index, &ut_total);
+        let _ = run(
+            world,
+            world_entity,
+            settings,
+            &mut s,
+            &ctx,
+            &ut_index,
+            &ut_total,
+        );
     }
 
     #[test]

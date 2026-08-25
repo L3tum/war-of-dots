@@ -70,7 +70,9 @@ impl WorldExt for World {
             .query::<(&WorldBundle,)>()
             .iter()
             .next()
-            .map(|(wb,)| wb.terrain.get(position.0, position.1) == crate::game::unit::Terrain::Water)
+            .map(|(wb,)| {
+                wb.terrain.get(position.0, position.1) == crate::game::unit::Terrain::Water
+            })
             .unwrap_or(false);
         self.spawn((
             UnitOwner {

@@ -4,7 +4,7 @@
 
 use crate::game::components::*;
 use crate::game::constants::MIN_UNIT_DISTANCE_SQ;
-use crate::game::game::{GameSettings, OWNER_NONE, TickContext};
+use crate::game::game::{GameSettings, TickContext, OWNER_NONE};
 use crate::game::spatial::{self, GridIndexScratch};
 use crate::game::unit::Terrain;
 use crate::game::world_ext::WorldExt;
@@ -245,8 +245,7 @@ pub fn run(
     // Pass order and per-entity order are identical to the old single loop, so
     // writes, the movers vec, and the blocked-skip are all bit-identical.
     let changes = &scratch.changes;
-    let is_noop =
-        |c: &MovementChange| !c.moved && !c.pop_head && c.new_org.is_none();
+    let is_noop = |c: &MovementChange| !c.moved && !c.pop_head && c.new_org.is_none();
 
     let t3a = Instant::now();
     // Pass A: occupancy gate — decides which movers proceed. Blocked units get

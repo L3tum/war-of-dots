@@ -53,7 +53,8 @@ pub fn run(world: &mut World, world_entity: hecs::Entity, scratch: &mut WaterScr
     // stay legal. On the (invariant-impossible) missing-world case, an empty
     // grid yields Terrain::Plains for every index — exactly what terrain_at's
     // `unwrap_or(Terrain::Plains)` did, so behavior is bit-identical.
-    let (terrain, terrain_width): (Arc<Vec<Terrain>>, usize) = match world.world_data(world_entity) {
+    let (terrain, terrain_width): (Arc<Vec<Terrain>>, usize) = match world.world_data(world_entity)
+    {
         Some(wb) => (Arc::clone(&wb.terrain.grid), wb.terrain.width as usize),
         None => (Arc::new(Vec::new()), 0),
     };
@@ -166,18 +167,18 @@ mod tests {
         let mut terrain = vec![vec![Terrain::Plains; 4]; 4];
         terrain[2][1] = Terrain::Water;
         let mut world = World::new();
-        let wb = WorldBundle::new(terrain, 4, 4, CityUpgradeSettings::default(), HashMap::new());
+        let wb = WorldBundle::new(
+            terrain,
+            4,
+            4,
+            CityUpgradeSettings::default(),
+            HashMap::new(),
+        );
         let world_entity = world.spawn((wb,));
         (world, world_entity)
     }
 
-    fn spawn_unit(
-        world: &mut World,
-        x: f32,
-        y: f32,
-        moved: bool,
-        on_water: bool,
-    ) -> hecs::Entity {
+    fn spawn_unit(world: &mut World, x: f32, y: f32, moved: bool, on_water: bool) -> hecs::Entity {
         world.spawn((
             UnitPosition { x, y },
             UnitFlags {

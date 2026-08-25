@@ -1134,10 +1134,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
             {
                 let x = 5.0 + (i % 50) as f32 * 1.8;
                 let y = 5.0 + (i / 50) as f32 * 1.8;
-                if let Ok((pos,)) = f
-                    .world
-                    .query_one_mut::<(&mut UnitPosition,)>(e)
-                {
+                if let Ok((pos,)) = f.world.query_one_mut::<(&mut UnitPosition,)>(e) {
                     pos.x = x;
                     pos.y = y;
                 }
@@ -1159,10 +1156,7 @@ fn bench_systems() -> Vec<MicrobenchmarkResult> {
         |f: &mut MovementFixture| {
             // Fixed probe at the center of the dense block (deterministic —
             // the fixture's unit order is HashMap-derived).
-            let probe = UnitPosition {
-                x: 25.0,
-                y: 18.0,
-            };
+            let probe = UnitPosition { x: 25.0, y: 18.0 };
             let mut hits = 0usize;
             crate::game::spatial::for_each_within(
                 &f.grid_scratch.index,

@@ -260,6 +260,7 @@ export class Connection {
 
   private applyFullState(state: GameStateMessage) {
     try {
+      this.renderer.markDataDirty();
       this.gameState.terrain = state.terrain as TerrainType[][];
       this.gameState.visionGrid = state.vision_grid ?? [];
       this.gameState.borderGrid = state.border_grid ?? [];
@@ -312,10 +313,24 @@ export class Connection {
       if (count > 0) {
         this.renderer.camera.x = sumX / count;
         this.renderer.camera.y = sumY / count;
+        this.fitMapZoom();
         return;
       }
     }
     this.centerCameraOnTerrain();
+  }
+
+  /** Zoom out so the whole map fits the viewport (with a 10% margin). */
+  private fitMapZoom(): void {
+    const terrain = this.gameState.terrain;
+    if (!terrain || terrain.length === 0 || terrain[0].length === 0) return;
+    let maxCol = 0;
+    for (const row of terrain) {
+      if (row.length > 0) maxCol = Math.max(maxCol, row.length - 1);
+    }
+    const mapW = (maxCol + 1) * CELL_SIZE;
+    const mapH = terrain.length * CELL_SIZE;
+    this.renderer.fitMapZoom(mapW, mapH);
   }
 
   /** Center the camera on the terrain map */
@@ -340,6 +355,7 @@ export class Connection {
 
     this.renderer.camera.x = centerX;
     this.renderer.camera.y = centerY;
+    this.fitMapZoom();
   }
 
   /** Hide lobby panel and show game UI elements */
@@ -358,6 +374,7 @@ export class Connection {
 
   private applyDelta(delta: GameDeltaMessage) {
     try {
+      this.renderer.markDataDirty();
       if (delta.vision_grid_diff) {
         this.gameState.visionGrid = delta.vision_grid_diff;
         this.renderer.markFogDirty();

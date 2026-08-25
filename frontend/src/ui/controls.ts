@@ -16,6 +16,9 @@ export class Controls {
 
   private isDragging = false;
   private rightDragStart = { x: 0, y: 0 };
+  private lastPointer: { x: number; y: number } | null = null;
+  private canvasRect: DOMRect | null = null;
+  private panFrameId: number | null = null;
   private selectedUnitId: string | null = null;
 
   constructor(
@@ -35,8 +38,13 @@ export class Controls {
     this.setupEventListeners();
   }
 
+  private refreshRect(): DOMRect {
+    this.canvasRect = this.canvas.getBoundingClientRect();
+    return this.canvasRect;
+  }
+
   private mouseToGameCoords(clientX: number, clientY: number): { x: number; y: number } {
-    const rect = this.canvas.getBoundingClientRect();
+    const rect = this.canvasRect ?? this.refreshRect();
     // Mouse CSS pixel → NDC → world-space → grid cell
     const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
     const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
@@ -50,7 +58,7 @@ export class Controls {
 
   private hitTestUnit(clientX: number, clientY: number): string | null {
     // Convert mouse to world-space
-    const rect = this.canvas.getBoundingClientRect();
+    const rect = this.canvasRect ?? this.refreshRect();
     const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
     const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
     // Inverse of shader: worldX = camera.x + ndcX * canvas.width / (2*zoom)
@@ -70,7 +78,7 @@ export class Controls {
 
   private hitTestCity(clientX: number, clientY: number): string | null {
     // Convert mouse to world-space
-    const rect = this.canvas.getBoundingClientRect();
+    const rect = this.canvasRect ?? this.refreshRect();
     const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
     const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
     // Inverse of shader: worldX = camera.x + ndcX * canvas.width / (2*zoom)
@@ -88,8 +96,40 @@ export class Controls {
     return null;
   }
 
+  /** rAF loop that applies the pending camera pan once per frame. */
+  private startPanLoop(): void {
+    if (this.panFrameId !== null) return;
+    const step = () => {
+      if (this.isDragging && this.lastPointer) {
+        const rect = this.canvasRect ?? this.refreshRect();
+        const dx = this.lastPointer.x - this.rightDragStart.x;
+        const dy = this.lastPointer.y - this.rightDragStart.y;
+        // Camera moves opposite the drag; world units per CSS px = scalePx / zoom
+        const scaleX = this.canvas.width / rect.width;
+        const scaleY = this.canvas.height / rect.height;
+        this.camera.x -= (dx * scaleX) / this.camera.zoom;
+        this.camera.y -= (dy * scaleY) / this.camera.zoom;
+        this.rightDragStart = { x: this.lastPointer.x, y: this.lastPointer.y };
+      }
+      this.panFrameId = requestAnimationFrame(step);
+    };
+    this.panFrameId = requestAnimationFrame(step);
+  }
+
+  private endPan(): void {
+    if (this.panFrameId !== null) {
+      cancelAnimationFrame(this.panFrameId);
+      this.panFrameId = null;
+    }
+    this.isDragging = false;
+    this.lastPointer = null;
+  }
+
   private setupEventListeners() {
+    window.addEventListener('resize', () => this.refreshRect());
+
     this.canvas.addEventListener('pointerdown', (e) => {
+      this.refreshRect();
       if (e.button === 0) {
         // First check if we clicked on a unit to select it
         const unitId = this.hitTestUnit(e.clientX, e.clientY);
@@ -123,9 +163,15 @@ export class Controls {
         e.preventDefault();
         this.isDragging = true;
         this.rightDragStart = { x: e.clientX, y: e.clientY };
+        this.lastPointer = { x: e.clientX, y: e.clientY };
         // Capture the pointer so the right-click+drag never triggers browser gestures
         // (e.g. back/forward navigation) and keeps tracking outside the canvas.
-        this.canvas.setPointerCapture(e.pointerId);
+        try {
+          this.canvas.setPointerCapture(e.pointerId);
+        } catch {
+          // pointer no longer active — fall back to plain move tracking
+        }
+        this.startPanLoop();
       }
     });
 
@@ -134,15 +180,16 @@ export class Controls {
         // Suppress browser gestures during a captured right-button drag
         // (e.g. back/forward navigation, scroll, touch gestures).
         e.preventDefault();
-        const dx = e.clientX - this.rightDragStart.x;
-        const dy = e.clientY - this.rightDragStart.y;
-        // Camera moves opposite the drag; world units per CSS px = scalePx / zoom
-        const rect = this.canvas.getBoundingClientRect();
-        const scaleX = this.canvas.width / rect.width;
-        const scaleY = this.canvas.height / rect.height;
-        this.camera.x -= (dx * scaleX) / this.camera.zoom;
-        this.camera.y -= (dy * scaleY) / this.camera.zoom;
-        this.rightDragStart = { x: e.clientX, y: e.clientY };
+        this.lastPointer = { x: e.clientX, y: e.clientY };
+        // Re-capture if the browser dropped it (e.g. after a focus/OS event)
+        // so tracking never silently "loses the mouse" mid-drag.
+        if (!this.canvas.hasPointerCapture(e.pointerId)) {
+          try {
+            this.canvas.setPointerCapture(e.pointerId);
+          } catch {
+            // ignore — move tracking still works while the pointer is inside
+          }
+        }
       } else if (this.renderer.currentPath.length > 0) {
         const gamePos = this.mouseToGameCoords(e.clientX, e.clientY);
         this.renderer.currentPath.push(gamePos);
@@ -163,7 +210,7 @@ export class Controls {
         }
         this.unitInfo.selectUnit(null);
       } else if (e.button === 2) {
-        this.isDragging = false;
+        this.endPan();
         if (this.canvas.hasPointerCapture(e.pointerId)) {
           this.canvas.releasePointerCapture(e.pointerId);
         }
@@ -171,7 +218,7 @@ export class Controls {
     });
 
     this.canvas.addEventListener('pointercancel', (e) => {
-      this.isDragging = false;
+      this.endPan();
       if (this.canvas.hasPointerCapture(e.pointerId)) {
         this.canvas.releasePointerCapture(e.pointerId);
       }

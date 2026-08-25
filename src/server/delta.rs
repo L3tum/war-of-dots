@@ -73,35 +73,44 @@ impl UnitStateDigest {
 }
 
 /// Build a delta message comparing current game state to previous snapshots.
+///
+/// Current-state snapshots (`current_units`, `current_cities`, `all_player_funds`)
+/// are computed **once per tick** by the caller and shared across players, so we
+/// no longer re-snapshot (and re-clone every unit's equipment Vecs) per player.
+///
+/// Returns `None` when nothing this player cares about changed since the last
+/// snapshot — the caller must then skip encoding/sending entirely, which is what
+/// eliminates idle websocket traffic.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_delta_inner(
-    game: &Game,
     prev_units: &mut HashMap<String, UnitState>,
     prev_cities: &mut HashMap<String, CityState>,
     prev_funds: &mut HashMap<String, u32>,
     prev_vision_grid: &mut Option<Vec<Vec<bool>>>,
     prev_border_grid: &mut Option<Vec<Vec<u32>>>,
+    current_units: &[UnitState],
+    current_cities: &[CityState],
+    all_player_funds: &HashMap<String, u32>,
     current_vision_grid: Option<Vec<Vec<bool>>>,
     current_border_grid: Option<Vec<Vec<u32>>>,
     player_id: &str,
-) -> ServerMessage {
-    let current_units: Vec<UnitState> = game.unit_states();
+) -> Option<ServerMessage> {
     let current_unit_map: HashMap<String, UnitState> = current_units
         .iter()
         .cloned()
         .map(|u| (u.id.clone(), u))
         .collect();
-    let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
     let current_city_map: HashMap<String, CityState> = current_cities
         .iter()
         .cloned()
         .map(|c| (c.id.clone(), c))
         .collect();
 
-    // Grid delta: send the FULL current grid only when it changed since the last snapshot.
-    // Keeps per-cell diff machinery out — the map is tiny (20x20 ~ 1 KB), so a per-cell
-    // "diff" costs the same as the full grid but with extra compute. The sparse unit/city
-    // deltas below remain the genuinely valuable bandwidth win.
+    // Grid delta: send the FULL current grid only when it changed since the last
+    // snapshot. The default map is 200×200 (~40 KB of vision bools), so a per-cell
+    // "diff" would cost as much as the full grid with extra compute — per-cell
+    // row-diffing is a deliberate follow-up. The sparse unit/city deltas below
+    // remain the genuinely valuable bandwidth win.
     let vision_grid_diff: Option<Vec<Vec<bool>>> = match (&*prev_vision_grid, &current_vision_grid)
     {
         (Some(prev), Some(curr)) if prev == curr => None,
@@ -266,7 +275,7 @@ pub(crate) fn build_delta_inner(
     }
 
     // E-4: Use per-player funds instead of sum of all players
-    let player_funds: u32 = game.player_funds(player_id);
+    let player_funds: u32 = all_player_funds.get(player_id).copied().unwrap_or(0);
     let units_owned: u32 = current_units
         .iter()
         .filter(|u| u.owner == player_id)
@@ -276,6 +285,22 @@ pub(crate) fn build_delta_inner(
         units_owned,
         player_id: player_id.to_string(),
     };
+
+    // Idle skip: if nothing this player sees changed, do not update the prev
+    // snapshots and return None so the caller skips encoding + sending.
+    let funds_changed = prev_funds.get(player_id).copied() != Some(player_state.funds);
+    let prev_owned: u32 = prev_units.values().filter(|u| u.owner == player_id).count() as u32;
+    if units_added.is_empty()
+        && units_removed.is_empty()
+        && unit_updates.is_empty()
+        && city_updates.is_empty()
+        && vision_grid_diff.is_none()
+        && border_grid_diff.is_none()
+        && !funds_changed
+        && prev_owned == player_state.units_owned
+    {
+        return None;
+    }
 
     let delta = GameDeltaMessage {
         vision_grid_diff,
@@ -289,11 +314,11 @@ pub(crate) fn build_delta_inner(
 
     *prev_units = current_unit_map;
     *prev_cities = current_city_map;
-    *prev_funds = game.all_player_funds().clone();
+    prev_funds.insert(player_id.to_string(), player_funds);
     *prev_vision_grid = current_vision_grid;
     *prev_border_grid = current_border_grid;
 
-    ServerMessage::DeltaState(delta)
+    Some(ServerMessage::DeltaState(delta))
 }
 
 /// Build LLM agent state with filtered units based on vision grid.
@@ -365,5 +390,256 @@ pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameS
         player_id: player_id.to_string(),
         vision_grid,
         border_grid,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(id: &str, owner: &str, x: f32, y: f32) -> UnitState {
+        UnitState {
+            id: id.to_string(),
+            owner: owner.to_string(),
+            position: (x, y),
+            unit_type: "infantry".to_string(),
+            symbol: "i".to_string(),
+            men: 100.0,
+            max_men: 100.0,
+            organisation: 100.0,
+            equipment: vec![],
+            max_equipment: vec![],
+            path: vec![],
+            healing: false,
+            resupply_enabled: true,
+            supply_percent: 100.0,
+            encircled: false,
+            attacking: false,
+            on_water: false,
+            boat_supply_percent: 0.0,
+            embarking: false,
+            disembarking: false,
+        }
+    }
+
+    fn city(id: &str, owner: Option<&str>, level: u32) -> CityState {
+        CityState {
+            id: id.to_string(),
+            position: (1.0, 1.0),
+            owner: owner.map(|s| s.to_string()),
+            manpower: 0,
+            level,
+        }
+    }
+
+    fn units_map(units: &[UnitState]) -> HashMap<String, UnitState> {
+        units.iter().map(|u| (u.id.clone(), u.clone())).collect()
+    }
+
+    fn funds(player_id: &str, amount: u32) -> HashMap<String, u32> {
+        let mut m = HashMap::new();
+        m.insert(player_id.to_string(), amount);
+        m
+    }
+
+    /// Run build_delta_inner with the given current state over the given prev
+    /// snapshots, for a single player. No grids involved.
+    fn run(
+        prev_units: &mut HashMap<String, UnitState>,
+        prev_cities: &mut HashMap<String, CityState>,
+        prev_funds: &mut HashMap<String, u32>,
+        current_units: &[UnitState],
+        current_cities: &[CityState],
+        all_funds: &HashMap<String, u32>,
+        player_id: &str,
+    ) -> Option<ServerMessage> {
+        build_delta_inner(
+            prev_units,
+            prev_cities,
+            prev_funds,
+            &mut None,
+            &mut None,
+            current_units,
+            current_cities,
+            all_funds,
+            None,
+            None,
+            player_id,
+        )
+    }
+
+    fn as_delta(msg: Option<ServerMessage>) -> GameDeltaMessage {
+        match msg {
+            Some(ServerMessage::DeltaState(d)) => d,
+            other => panic!(
+                "expected DeltaState, got {:?}",
+                other.map(|m| std::mem::discriminant(&m))
+            ),
+        }
+    }
+
+    #[test]
+    fn identical_snapshots_return_none_and_leave_prev_untouched() {
+        let units = vec![unit("u1", "a", 1.0, 2.0)];
+        let cities = vec![city("c1", Some("a"), 1)];
+        let all_funds = funds("a", 42);
+        let mut prev_units = units_map(&units);
+        let mut prev_cities: HashMap<String, CityState> =
+            cities.iter().map(|c| (c.id.clone(), c.clone())).collect();
+        let mut prev_funds = all_funds.clone();
+
+        let msg = run(
+            &mut prev_units,
+            &mut prev_cities,
+            &mut prev_funds,
+            &units,
+            &cities,
+            &all_funds,
+            "a",
+        );
+        assert!(msg.is_none());
+
+        // prev snapshots must be unchanged (funds entry still present and equal)
+        assert!(prev_units.contains_key("u1"));
+        assert_eq!(prev_funds.get("a"), Some(&42));
+    }
+
+    #[test]
+    fn single_unit_position_change_yields_one_update() {
+        let prev_units = vec![unit("u1", "a", 1.0, 2.0)];
+        let curr_units = vec![unit("u1", "a", 3.0, 2.0)];
+        let all_funds = funds("a", 10);
+        let mut pu = units_map(&prev_units);
+        let mut pc = HashMap::new();
+        let mut pf = all_funds.clone();
+
+        let msg = run(&mut pu, &mut pc, &mut pf, &curr_units, &[], &all_funds, "a");
+        let d = as_delta(msg);
+        assert_eq!(d.unit_updates.len(), 1);
+        assert_eq!(d.unit_updates[0].id, "u1");
+        assert_eq!(d.unit_updates[0].position, Some((3.0, 2.0)));
+        assert!(d.units_added.is_empty());
+        assert!(d.units_removed.is_empty());
+    }
+
+    #[test]
+    fn funds_only_change_is_sent_to_changed_player_only() {
+        let units = vec![unit("u1", "a", 1.0, 2.0)];
+        let mut prev_units = units_map(&units);
+        let mut prev_cities = HashMap::new();
+
+        // Player a funds 10 -> 20, player b unchanged at 5
+        let mut all_funds = HashMap::new();
+        all_funds.insert("a".to_string(), 20);
+        all_funds.insert("b".to_string(), 5);
+        let mut prev_funds = HashMap::new();
+        prev_funds.insert("a".to_string(), 10);
+        prev_funds.insert("b".to_string(), 5);
+
+        let msg_a = run(
+            &mut prev_units,
+            &mut prev_cities,
+            &mut prev_funds,
+            &units,
+            &[],
+            &all_funds,
+            "a",
+        );
+        let d = as_delta(msg_a);
+        assert_eq!(d.player.funds, 20);
+
+        let msg_b = run(
+            &mut prev_units,
+            &mut prev_cities,
+            &mut prev_funds,
+            &units,
+            &[],
+            &all_funds,
+            "b",
+        );
+        assert!(msg_b.is_none());
+    }
+
+    #[test]
+    fn city_owner_change_yields_city_update() {
+        let prev_cities = [city("c1", Some("a"), 1)];
+        let curr_cities = vec![city("c1", Some("b"), 1)];
+        let all_funds = funds("a", 0);
+        let mut pu = HashMap::new();
+        let mut pc: HashMap<String, CityState> = prev_cities
+            .iter()
+            .map(|c| (c.id.clone(), c.clone()))
+            .collect();
+        let mut pf = all_funds.clone();
+
+        let msg = run(
+            &mut pu,
+            &mut pc,
+            &mut pf,
+            &[],
+            &curr_cities,
+            &all_funds,
+            "a",
+        );
+        let d = as_delta(msg);
+        assert_eq!(d.city_updates.len(), 1);
+        assert_eq!(d.city_updates[0].id, "c1");
+        assert_eq!(d.city_updates[0].owner.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn grid_change_includes_grid_diff() {
+        let all_funds = funds("a", 0);
+        let mut pu = HashMap::new();
+        let mut pc = HashMap::new();
+        let mut pf = all_funds.clone();
+        let vision = vec![vec![true, false], vec![false, true]];
+
+        let msg = build_delta_inner(
+            &mut pu,
+            &mut pc,
+            &mut pf,
+            &mut None,
+            &mut None,
+            &[],
+            &[],
+            &all_funds,
+            Some(vision.clone()),
+            None,
+            "a",
+        );
+        let d = as_delta(msg);
+        assert_eq!(d.vision_grid_diff, Some(vision));
+        assert!(d.border_grid_diff.is_none());
+    }
+
+    #[test]
+    fn first_tick_from_empty_prev_sends_added_units() {
+        let units = vec![unit("u1", "a", 1.0, 2.0), unit("u2", "b", 3.0, 4.0)];
+        let all_funds = funds("a", 7);
+        let mut pu = HashMap::new();
+        let mut pc = HashMap::new();
+        let mut pf = HashMap::new();
+
+        let msg = run(&mut pu, &mut pc, &mut pf, &units, &[], &all_funds, "a");
+        let d = as_delta(msg);
+        assert_eq!(d.units_added.len(), 2);
+        assert_eq!(d.player.units_owned, 1);
+    }
+
+    #[test]
+    fn units_owned_change_is_detected() {
+        // Same unit set, but the unit's owner changed — only units_owned
+        // differs for player a.
+        let prev_units = vec![unit("u1", "a", 1.0, 2.0)];
+        let curr_units = vec![unit("u1", "b", 1.0, 2.0)];
+        let mut all_funds = funds("a", 0);
+        all_funds.insert("b".to_string(), 0);
+        let mut pu = units_map(&prev_units);
+        let mut pc = HashMap::new();
+        let mut pf = all_funds.clone();
+
+        let msg = run(&mut pu, &mut pc, &mut pf, &curr_units, &[], &all_funds, "a");
+        assert!(msg.is_some());
     }
 }

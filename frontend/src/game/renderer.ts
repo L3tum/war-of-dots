@@ -24,6 +24,8 @@ import {
   BUFFER_SIZES,
   CITY_DOT_SIZE,
   CITY_COLORS,
+  ZOOM_MIN,
+  ZOOM_MAX,
 } from './config';
 
 /** Sentinel for "no player has influence at this cell" in the territory grid.
@@ -74,6 +76,9 @@ export class Renderer {
   private cachedTerrainRef: unknown = null;
   private cachedTerrainPositions: number[] | null = null;
   private cachedTerrainColors: number[] | null = null;
+  // Uploaded-data cache — skip GPU writeBuffer calls while the mesh is cached
+  private cachedTerrainPosData: Float32Array<ArrayBuffer> | null = null;
+  private cachedTerrainColData: Float32Array<ArrayBuffer> | null = null;
 
   // Last render/validation error — surfaced via the debug overlay when active
   lastRenderError: string | null = null;
@@ -99,6 +104,14 @@ export class Renderer {
 
   // Symbol cache — track when unit data changes
   private symbolCacheKey: string | null = null;
+
+  // Frame dirty gate
+  private dataVersion = 0;
+  private lastFrameKey: string | null = null;
+
+  // Hoisted bind groups (static, created once)
+  private symbolBindGroup: GPUBindGroup | null = null;
+  private fogBindGroup: GPUBindGroup | null = null;
 
   // Path data for preview
   currentPath: { x: number; y: number }[] = [];
@@ -190,6 +203,8 @@ export class Renderer {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
       ],
     });
+    // Symbol bind group depends only on the static atlas texture/sampler — create once.
+    this.symbolBindGroup = this.createSymbolBindGroup();
 
     // Uniform buffer: cameraX, cameraY, zoom, canvasWidth, canvasHeight (5 floats = 20 bytes, align to 24)
     this.uniformBuffer = device.createBuffer({
@@ -365,6 +380,7 @@ export class Renderer {
           },
         ],
       },
+      primitive: { topology: 'triangle-strip' },
       fragment: {
         module: shaderModule,
         entryPoint: 'frag',
@@ -438,6 +454,7 @@ export class Renderer {
           },
         ],
       },
+      primitive: { topology: 'triangle-strip' },
       fragment: {
         module: shaderModule,
         entryPoint: 'frag',
@@ -517,6 +534,7 @@ export class Renderer {
           },
         ],
       },
+      primitive: { topology: 'triangle-strip' },
       fragment: {
         module: shaderModule,
         entryPoint: 'frag',
@@ -596,6 +614,7 @@ export class Renderer {
           },
         ],
       },
+      primitive: { topology: 'triangle-strip' },
       fragment: {
         module: shaderModule,
         entryPoint: 'frag',
@@ -715,6 +734,7 @@ export class Renderer {
           },
         ],
       },
+      primitive: { topology: 'triangle-strip' },
       fragment: {
         module: shaderModule,
         entryPoint: 'frag',
@@ -764,11 +784,34 @@ export class Renderer {
 
   startRenderLoop() {
     const loop = () => {
-      this.updateCallback?.();
-      this.renderFrame();
+      const key = this.frameKey();
+      if (key !== this.lastFrameKey) {
+        this.lastFrameKey = key;
+        this.updateCallback?.();
+        this.renderFrame();
+      }
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
+  }
+
+  public markDataDirty(): void {
+    this.dataVersion++;
+  }
+
+  private frameKey(): string {
+    return (
+      `${this.camera.x},${this.camera.y},${this.camera.zoom}|` +
+      `${this.canvas.width}x${this.canvas.height}|${this.dataVersion}|` +
+      `${this.currentPath.length}|${this.fogDirty ? 1 : 0}${this.borderDirty ? 1 : 0}`
+    );
+  }
+
+  public fitMapZoom(mapW: number, mapH: number): void {
+    if (this.canvas.width === 0 || this.canvas.height === 0 || mapW === 0 || mapH === 0) return;
+    const zoom = Math.min(this.canvas.width / mapW, this.canvas.height / mapH) * 0.9;
+    this.camera.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
+    this.markDataDirty();
   }
 
   renderFrame() {
@@ -860,8 +903,8 @@ export class Renderer {
         renderPass.setPipeline(this.symbolPipeline);
         renderPass.setVertexBuffer(0, this.symbolPositionBuffer);
         renderPass.setVertexBuffer(1, this.symbolColorBuffer);
-        renderPass.setBindGroup(1, this.createSymbolBindGroup());
-        renderPass.draw(this.unitVertexCount * 4);
+        if (this.symbolBindGroup) renderPass.setBindGroup(1, this.symbolBindGroup);
+        renderPass.draw(this.unitVertexCount);
       }
 
       // Draw fog overlay (fullscreen quad with NDC positions)
@@ -879,7 +922,7 @@ export class Renderer {
         renderPass.setPipeline(this.fogPipeline);
         renderPass.setVertexBuffer(0, this.fogPositionsBuffer);
         renderPass.setBindGroup(0, this.fogUniformBindGroup);
-        renderPass.setBindGroup(1, this.createFogBindGroup());
+        if (this.fogBindGroup) renderPass.setBindGroup(1, this.fogBindGroup);
         renderPass.draw(4);
       }
 
@@ -972,15 +1015,22 @@ export class Renderer {
       }
       if (positions.length > 0) {
         this.terrainVertexCount = positions.length / 2;
-        const posData = new Float32Array(positions);
-        const colData = new Float32Array(colors);
-        this.terrainPositionsBuffer = this.ensureBuffer(
-          this.terrainPositionsBuffer,
-          posData.byteLength,
-        );
-        this.terrainColorBuffer = this.ensureBuffer(this.terrainColorBuffer, colData.byteLength);
-        this.device.queue.writeBuffer(this.terrainPositionsBuffer, 0, posData);
-        this.device.queue.writeBuffer(this.terrainColorBuffer, 0, colData);
+        // Only (re)build the upload data and re-upload when the mesh was
+        // rebuilt this frame; a cache hit means the buffer already holds it.
+        if (!terrainCached) {
+          this.cachedTerrainPosData = new Float32Array(positions);
+          this.cachedTerrainColData = new Float32Array(colors);
+          this.terrainPositionsBuffer = this.ensureBuffer(
+            this.terrainPositionsBuffer,
+            this.cachedTerrainPosData.byteLength,
+          );
+          this.terrainColorBuffer = this.ensureBuffer(
+            this.terrainColorBuffer,
+            this.cachedTerrainColData.byteLength,
+          );
+          this.device.queue.writeBuffer(this.terrainPositionsBuffer, 0, this.cachedTerrainPosData);
+          this.device.queue.writeBuffer(this.terrainColorBuffer, 0, this.cachedTerrainColData);
+        }
       } else {
         this.terrainVertexCount = 0;
       }
@@ -1452,6 +1502,8 @@ export class Renderer {
               format: 'rgba8unorm',
               usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
             });
+            // Fog bind group depends only on the (static) fog texture — create once.
+            this.fogBindGroup = this.createFogBindGroup();
           }
           this.device.queue.writeTexture(
             { texture: this.fogTexture },

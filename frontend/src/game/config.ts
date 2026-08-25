@@ -23,7 +23,7 @@ export const BAR_SPACING = 2.5;
 export const BAR_WIDTH_MULTIPLIER = 1.6;
 
 /** Camera zoom limits */
-export const ZOOM_MIN = 0.5;
+export const ZOOM_MIN = 0.3;
 export const ZOOM_MAX = 3.0;
 
 /** City hit test radius (in screen units at zoom=1) */

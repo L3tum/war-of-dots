@@ -59,7 +59,10 @@ fn stress_benchmark() {
         let _ = std::fs::write("reports/stress_postphase1.json", json);
     }
 
-    println!("BENCH WALL avg={} p50={} p99={} (ms)", s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]);
+    println!(
+        "BENCH WALL avg={} p50={} p99={} (ms)",
+        s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]
+    );
     println!(
         "BENCH SANITY units_remaining={} avg_combats={} avg_system_ms={}",
         s["results"]["units_remaining"],

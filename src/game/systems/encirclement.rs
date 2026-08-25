@@ -295,8 +295,7 @@ pub fn run(world: &mut World, ctx: &TickContext, _tick: u64, scratch: &mut Encir
             let xi = pos.x as i32;
             let yi = pos.y as i32;
             let idx = (yi as usize) * wusize + (xi as usize);
-            let encircled =
-                idx < grid_size && fill_terr[idx] == pidx && safe[idx] != pidx;
+            let encircled = idx < grid_size && fill_terr[idx] == pidx && safe[idx] != pidx;
             // Skip the write when the flag already matches — steady state
             // then does zero ECS mutations in this pass.
             if flags.encircled != encircled {
@@ -583,30 +582,21 @@ mod tests {
             UnitOwner {
                 player_id: "player_0".to_string(),
             },
-            UnitPosition {
-                x: 5.0,
-                y: 5.0,
-            },
+            UnitPosition { x: 5.0, y: 5.0 },
             UnitFlags::default(),
         ));
         let b = world.spawn((
             UnitOwner {
                 player_id: "player_0".to_string(),
             },
-            UnitPosition {
-                x: 2.0,
-                y: 2.0,
-            },
+            UnitPosition { x: 2.0, y: 2.0 },
             UnitFlags::default(),
         ));
         let c = world.spawn((
             UnitOwner {
                 player_id: "player_1".to_string(),
             },
-            UnitPosition {
-                x: 6.0,
-                y: 5.0,
-            },
+            UnitPosition { x: 6.0, y: 5.0 },
             UnitFlags::default(),
         ));
 
@@ -623,7 +613,10 @@ mod tests {
         run(&mut world, &ctx, 30, &mut scratch);
 
         let flag = |e: hecs::Entity| *world.get::<&UnitFlags>(e).unwrap();
-        assert!(flag(a).encircled, "unit inside the pocket must be encircled");
+        assert!(
+            flag(a).encircled,
+            "unit inside the pocket must be encircled"
+        );
         assert!(!flag(b).encircled, "unit near the edge must be safe");
         assert!(
             flag(c).encircled,
