@@ -4,7 +4,7 @@ import { Renderer } from '../game/renderer';
 import { Connection } from '../net/connection';
 import { GameState } from '../game/game_state';
 import { UnitInfoUI } from './unit_info';
-import { CELL_SIZE, UNIT_DOT_SIZE, ZOOM_MIN, ZOOM_MAX, CITY_HIT_RADIUS } from '../game/config';
+import { CELL_SIZE, UNIT_DOT_SIZE, ZOOM_MIN, ZOOM_MAX, CITY_HIT_RADIUS, PAN_SPEED_MULTIPLIER } from '../game/config';
 
 export class Controls {
   private canvas: HTMLCanvasElement;
@@ -20,6 +20,8 @@ export class Controls {
   private canvasRect: DOMRect | null = null;
   private panFrameId: number | null = null;
   private selectedUnitId: string | null = null;
+  private onWindowPointerMove: ((e: PointerEvent) => void) | null = null;
+  private onWindowPointerUp: ((e: PointerEvent) => void) | null = null;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -43,33 +45,29 @@ export class Controls {
     return this.canvasRect;
   }
 
-  private mouseToGameCoords(clientX: number, clientY: number): { x: number; y: number } {
+  /** Convert screen (client) coordinates to world-space coordinates (no floor). */
+  private screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
     const rect = this.canvasRect ?? this.refreshRect();
-    // Mouse CSS pixel → NDC → world-space → grid cell
     const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
     const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
-    // Inverse of shader: worldX = camera.x + ndcX * canvas.width / (2*zoom)
     const worldX = this.camera.x + (ndcX * this.canvas.width) / (2 * this.camera.zoom);
     const worldY = this.camera.y - (ndcY * this.canvas.height) / (2 * this.camera.zoom);
-    const posGameX = worldX / CELL_SIZE;
-    const posGameY = worldY / CELL_SIZE;
-    return { x: Math.floor(posGameX), y: Math.floor(posGameY) };
+    return { x: worldX, y: worldY };
+  }
+
+  private mouseToGameCoords(clientX: number, clientY: number): { x: number; y: number } {
+    const world = this.screenToWorld(clientX, clientY);
+    return { x: Math.floor(world.x / CELL_SIZE), y: Math.floor(world.y / CELL_SIZE) };
   }
 
   private hitTestUnit(clientX: number, clientY: number): string | null {
-    // Convert mouse to world-space
-    const rect = this.canvasRect ?? this.refreshRect();
-    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
-    const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
-    // Inverse of shader: worldX = camera.x + ndcX * canvas.width / (2*zoom)
-    const worldX = this.camera.x + (ndcX * this.canvas.width) / (2 * this.camera.zoom);
-    const worldY = this.camera.y - (ndcY * this.canvas.height) / (2 * this.camera.zoom);
-    const hitSize = UNIT_DOT_SIZE * this.camera.zoom;
+    const world = this.screenToWorld(clientX, clientY);
+    const hitSize = UNIT_DOT_SIZE / 2;
 
     for (const unit of this.gameState.units.values()) {
       const uwx = unit.position.x * CELL_SIZE;
       const uwy = unit.position.y * CELL_SIZE;
-      if (Math.abs(worldX - uwx) < hitSize && Math.abs(worldY - uwy) < hitSize) {
+      if (Math.abs(world.x - uwx) < hitSize && Math.abs(world.y - uwy) < hitSize) {
         return unit.id;
       }
     }
@@ -77,19 +75,13 @@ export class Controls {
   }
 
   private hitTestCity(clientX: number, clientY: number): string | null {
-    // Convert mouse to world-space
-    const rect = this.canvasRect ?? this.refreshRect();
-    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
-    const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
-    // Inverse of shader: worldX = camera.x + ndcX * canvas.width / (2*zoom)
-    const worldX = this.camera.x + (ndcX * this.canvas.width) / (2 * this.camera.zoom);
-    const worldY = this.camera.y - (ndcY * this.canvas.height) / (2 * this.camera.zoom);
-    const hitSize = CITY_HIT_RADIUS * this.camera.zoom;
+    const world = this.screenToWorld(clientX, clientY);
+    const hitSize = CITY_HIT_RADIUS;
 
     for (const [id, city] of this.gameState.cities) {
       const cwx = city.position[0] * CELL_SIZE;
       const cwy = city.position[1] * CELL_SIZE;
-      if (Math.abs(worldX - cwx) < hitSize && Math.abs(worldY - cwy) < hitSize) {
+      if (Math.abs(world.x - cwx) < hitSize && Math.abs(world.y - cwy) < hitSize) {
         return id;
       }
     }
@@ -107,8 +99,8 @@ export class Controls {
         // Camera moves opposite the drag; world units per CSS px = scalePx / zoom
         const scaleX = this.canvas.width / rect.width;
         const scaleY = this.canvas.height / rect.height;
-        this.camera.x -= (dx * scaleX) / this.camera.zoom;
-        this.camera.y -= (dy * scaleY) / this.camera.zoom;
+        this.camera.x -= ((dx * scaleX) / this.camera.zoom) * PAN_SPEED_MULTIPLIER;
+        this.camera.y -= ((dy * scaleY) / this.camera.zoom) * PAN_SPEED_MULTIPLIER;
         this.rightDragStart = { x: this.lastPointer.x, y: this.lastPointer.y };
       }
       this.panFrameId = requestAnimationFrame(step);
@@ -125,8 +117,70 @@ export class Controls {
     this.lastPointer = null;
   }
 
+  /** Install window-level listeners for right-button pan tracking. */
+  private attachWindowPanListeners(): void {
+    if (this.onWindowPointerMove || this.onWindowPointerUp) return;
+
+    this.onWindowPointerMove = (e: PointerEvent) => {
+      // Re-arm pan if pointercancel was received but button is still held
+      if (!this.isDragging && (e.buttons & 2)) {
+        this.isDragging = true;
+        this.rightDragStart = { x: e.clientX, y: e.clientY };
+        this.lastPointer = { x: e.clientX, y: e.clientY };
+        this.startPanLoop();
+      }
+      if (this.isDragging) {
+        this.lastPointer = { x: e.clientX, y: e.clientY };
+      }
+    };
+
+    this.onWindowPointerUp = (e: PointerEvent) => {
+      if (e.button === 2) {
+        this.endPan();
+        if (this.canvas.hasPointerCapture(e.pointerId)) {
+          this.canvas.releasePointerCapture(e.pointerId);
+        }
+      }
+    };
+
+    window.addEventListener('pointermove', this.onWindowPointerMove);
+    window.addEventListener('pointerup', this.onWindowPointerUp);
+  }
+
+  /** Remove window-level pan listeners (for cleanup). */
+  private detachWindowPanListeners(): void {
+    if (this.onWindowPointerMove) {
+      window.removeEventListener('pointermove', this.onWindowPointerMove);
+      this.onWindowPointerMove = null;
+    }
+    if (this.onWindowPointerUp) {
+      window.removeEventListener('pointerup', this.onWindowPointerUp);
+      this.onWindowPointerUp = null;
+    }
+  }
+
+  /** Zoom-to-cursor: zoom while keeping the point under the cursor fixed. */
+  private zoomToCursor(clientX: number, clientY: number, zoomDelta: number): void {
+    // Capture the world point under the cursor before zooming
+    const worldBefore = this.screenToWorld(clientX, clientY);
+
+    // Apply zoom
+    this.camera.zoom *= zoomDelta;
+    this.camera.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, this.camera.zoom));
+
+    // Recompute NDC for the cursor position
+    const rect = this.canvasRect ?? this.refreshRect();
+    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
+
+    // Re-aim camera so the same world point stays under the cursor
+    this.camera.x = worldBefore.x - (ndcX * this.canvas.width) / (2 * this.camera.zoom);
+    this.camera.y = worldBefore.y + (ndcY * this.canvas.height) / (2 * this.camera.zoom);
+  }
+
   private setupEventListeners() {
     window.addEventListener('resize', () => this.refreshRect());
+    this.attachWindowPanListeners();
 
     this.canvas.addEventListener('pointerdown', (e) => {
       this.refreshRect();
@@ -175,22 +229,10 @@ export class Controls {
       }
     });
 
+    // Canvas pointermove handles path drawing for button 0 only;
+    // button-2 pan movement is handled on window (see attachWindowPanListeners)
     this.canvas.addEventListener('pointermove', (e) => {
-      if (this.isDragging) {
-        // Suppress browser gestures during a captured right-button drag
-        // (e.g. back/forward navigation, scroll, touch gestures).
-        e.preventDefault();
-        this.lastPointer = { x: e.clientX, y: e.clientY };
-        // Re-capture if the browser dropped it (e.g. after a focus/OS event)
-        // so tracking never silently "loses the mouse" mid-drag.
-        if (!this.canvas.hasPointerCapture(e.pointerId)) {
-          try {
-            this.canvas.setPointerCapture(e.pointerId);
-          } catch {
-            // ignore — move tracking still works while the pointer is inside
-          }
-        }
-      } else if (this.renderer.currentPath.length > 0) {
+      if (!this.isDragging && this.renderer.currentPath.length > 0) {
         const gamePos = this.mouseToGameCoords(e.clientX, e.clientY);
         this.renderer.currentPath.push(gamePos);
       }
@@ -209,29 +251,32 @@ export class Controls {
           });
         }
         this.unitInfo.selectUnit(null);
-      } else if (e.button === 2) {
-        this.endPan();
-        if (this.canvas.hasPointerCapture(e.pointerId)) {
-          this.canvas.releasePointerCapture(e.pointerId);
-        }
       }
+      // button-2 pointerup is handled on window
     });
 
+    // W9 fix: pointercancel should NOT end the pan.
+    // Just release capture; the window-level pointermove with buttons&2 will re-arm.
     this.canvas.addEventListener('pointercancel', (e) => {
-      this.endPan();
       if (this.canvas.hasPointerCapture(e.pointerId)) {
         this.canvas.releasePointerCapture(e.pointerId);
       }
+      // Do NOT call endPan() — the window pointermove re-arms if button still held
     });
 
     this.canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       const zoomDelta = e.deltaY > 0 ? 0.9 : 1.1;
-      this.camera.zoom *= zoomDelta;
-      this.camera.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, this.camera.zoom));
+      this.zoomToCursor(e.clientX, e.clientY, zoomDelta);
     });
 
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  /** Cleanup — remove window-level listeners. Call on component unmount. */
+  destroy(): void {
+    this.detachWindowPanListeners();
+    this.endPan();
   }
 
   /** Deselect any selected unit/city and clear the path */

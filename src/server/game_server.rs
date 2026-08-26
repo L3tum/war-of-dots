@@ -25,6 +25,7 @@ use crate::map::map_config::load_default_map;
 use crate::map::map_registry;
 use crate::replay::replay::ReplayEvent;
 use crate::server::lobby::LobbyManager;
+use crate::server::delta::{run_network_phase, NetworkBaselines, NetworkPhaseResult};
 use crate::server::protocol::{
     decode_client_message, encode_message, CityState, ClientMessage, GameStateMessage,
     LobbyMessage, LobbySettings, PlayerState, ServerMessage, UnitState,
@@ -182,12 +183,41 @@ impl GameRoom {
                 .entry(pid.clone())
                 .or_insert(starting_funds);
         }
-        // Recruit a starting infantry for each controlled player
+        // Recruit a starting force of 3 units for each controlled player (W8)
         let unit_type_opt = game.settings().unit_types.first().cloned();
         if let Some(unit_type) = unit_type_opt {
+            let cities_with_pos: Vec<(String, (f32, f32))> = game
+                .query_cities()
+                .iter()
+                .map(|c| (c.id.clone(), c.position))
+                .collect();
             for (i, player_id) in controlled_player_ids.iter().enumerate() {
-                if let Some(city_id) = cities_snapshot.get(i) {
-                    let _ = game.recruit_unit(city_id, &unit_type, player_id);
+                if let Some((city_id, (cx, cy))) = cities_snapshot.get(i)
+                    .and_then(|id| cities_with_pos.iter().find(|(cid, _)| cid == id))
+                    .cloned()
+                {
+                    // First unit: standard gated recruit at city position
+                    let result = game.recruit_unit(&city_id, &unit_type, player_id);
+                    if result.is_none() {
+                        tracing::warn!(
+                            player = %player_id,
+                            city = %city_id,
+                            "starting recruit failed: funds/manpower/occupancy gate"
+                        );
+                    }
+                    // Additional units via recruit_unit_at (bypasses occupancy gate)
+                    for offset in [(2.0f32, 0.0f32), (-2.0f32, 0.0f32)] {
+                        let pos = (cx + offset.0, cy + offset.1);
+                        if game.recruit_unit_at(&unit_type, player_id, pos).is_none() {
+                            tracing::debug!(
+                                player = %player_id,
+                                city = %city_id,
+                                x = pos.0,
+                                y = pos.1,
+                                "additional starting recruit failed"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -209,24 +239,6 @@ impl GameRoom {
             let encoded = encode_message(&initial_msg);
             let _ = player.tx().blocking_send(encoded);
         }
-
-        let prev_units: HashMap<String, UnitState> = game
-            .unit_states()
-            .to_vec()
-            .into_iter()
-            .map(|u| (u.id.clone(), u))
-            .collect();
-        let prev_cities: HashMap<String, CityState> = game
-            .query_cities()
-            .iter()
-            .map(|c| (c.id.clone(), c.into()))
-            .collect();
-        let prev_funds = game.all_player_funds().clone();
-        let first_player_id = game.players().keys().next();
-        let mut prev_vision_grid: Option<Vec<Vec<bool>>> =
-            first_player_id.and_then(|pid| game.vision_grid_2d(pid));
-        let mut prev_border_grid: Option<Vec<Vec<u32>>> =
-            first_player_id.and_then(|pid| game.border_grid_2d(pid));
 
         // Create LLM agents from configs
         let mut llm_pairs: Vec<(crate::llm::agent::LlmAgent, crate::llm::clients::LlmClient)> =
@@ -435,9 +447,26 @@ impl GameRoom {
 
         tokio::spawn(async move {
             let mut game = game;
-            let mut prev_units = prev_units;
-            let mut prev_cities = prev_cities;
-            let mut prev_funds = prev_funds;
+            let mut baselines: NetworkBaselines = {
+                let mut b = NetworkBaselines::default();
+                b.prev_units = game
+                    .unit_states()
+                    .into_iter()
+                    .map(|u| (u.id.clone(), u))
+                    .collect();
+                b.prev_cities = game
+                    .query_cities()
+                    .iter()
+                    .map(|c| (c.id.clone(), c.into()))
+                    .collect();
+                b.prev_funds = game.all_player_funds();
+                let first_pid = game.players().keys().next().cloned();
+                b.prev_border = first_pid.as_deref().and_then(|pid| game.border_grid_2d(pid));
+                for pid in game.players().keys() {
+                    b.prev_vision.insert(pid.clone(), game.vision_grid_2d(pid));
+                }
+                b
+            };
             let mut players = players;
             let mut advisors = advisors;
             let server_state = server_state;
@@ -611,51 +640,76 @@ impl GameRoom {
                             break;
                         }
 
-                        // all_funds is cheap (no per-unit clones); units/cities
-                        // were already snapshotted above.
-                        let all_funds = game.all_player_funds();
+                        // --- Network phase: per-player delta build + encode ---
+                        let regular_pids: Vec<String> = players
+                            .iter()
+                            .filter_map(|p| {
+                                if let PlayerConnection::Player { id, .. } = p {
+                                    Some(id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let phase: NetworkPhaseResult =
+                            run_network_phase(&game, &mut baselines, &regular_pids);
+                        let mut send_map: HashMap<String, Vec<u8>> = phase.encoded.into_iter().collect();
 
-                        let spectator_vision_grid = if spectator_vision {
+                        // Spectators get the union vision grid (handled separately
+                        // since their vision differs from per-player vision).
+                        if spectator_vision {
                             let all_pids: Vec<String> = game.players().keys().cloned().collect();
-                            game.union_vision_grids(&all_pids)
-                        } else {
-                            None
-                        };
-                        let spectator_border_grid = if spectator_vision {
-                            let all_pids: Vec<String> = game.players().keys().cloned().collect();
-                            all_pids.first().and_then(|p| game.border_grid_2d(p))
-                        } else {
-                            None
-                        };
+                            let spec_vision = game.union_vision_grids(&all_pids);
+                            let spec_border = game
+                                .players()
+                                .keys()
+                                .next()
+                                .and_then(|p| game.border_grid_2d(p));
+                            let spec_pid = String::new();
+                            let prev_spec_vision = baselines
+                                .prev_vision
+                                .get(&spec_pid)
+                                .cloned()
+                                .unwrap_or_default();
 
-                        let mut alive = Vec::new();
-                        for player in players {
-                            let (vision_grid, border_grid) = match &player {
-                                PlayerConnection::Player { id, .. } => (
-                                    game.vision_grid_2d(id),
-                                    game.border_grid_2d(id),
-                                ),
-                                PlayerConnection::Spectator { .. } => (
-                                    spectator_vision_grid.clone(),
-                                    spectator_border_grid.clone(),
-                                ),
-                            };
-                            let pid = player.id().cloned().unwrap_or_default();
+                            let cur_unit_map: HashMap<String, UnitState> = current_units
+                                .iter()
+                                .cloned()
+                                .map(|u| (u.id.clone(), u))
+                                .collect();
+                            let cur_city_map: HashMap<String, CityState> = current_cities
+                                .iter()
+                                .cloned()
+                                .map(|c| (c.id.clone(), c))
+                                .collect();
+                            let all_funds = game.all_player_funds();
+
                             if let Some(delta) = build_delta_inner(
-                                &mut prev_units,
-                                &mut prev_cities,
-                                &mut prev_funds,
-                                &mut prev_vision_grid,
-                                &mut prev_border_grid,
+                                &baselines.prev_units,
+                                &baselines.prev_cities,
+                                &baselines.prev_funds,
+                                &prev_spec_vision,
+                                &baselines.prev_border,
                                 &current_units,
                                 &current_cities,
+                                &cur_unit_map,
+                                &cur_city_map,
                                 &all_funds,
-                                vision_grid,
-                                border_grid,
-                                &pid,
+                                &spec_vision,
+                                &spec_border,
+                                &spec_pid,
                             ) {
-                                let encoded = encode_message(&delta);
-                                if player.tx().send(encoded).await.is_ok() {
+                                send_map.insert(spec_pid.clone(), encode_message(&delta));
+                            }
+                            baselines.prev_vision.insert(spec_pid, spec_vision);
+                        }
+
+                        // Send encoded deltas; keep alive connections
+                        let mut alive = Vec::new();
+                        for player in players {
+                            let pid = player.id().cloned().unwrap_or_default();
+                            if let Some(encoded) = send_map.get(&pid) {
+                                if player.tx().send(encoded.clone()).await.is_ok() {
                                     alive.push(player);
                                 }
                             } else {
@@ -664,7 +718,6 @@ impl GameRoom {
                             }
                         }
                         players = alive;
-                        prev_funds = all_funds;
 
                         // End the game when the last human player leaves, even if
                         // LLM agents or spectators remain. Spectators do not count
@@ -1249,19 +1302,38 @@ pub(crate) async fn handle_replay_ws(
                     .map(|c| c.into())
                     .collect();
                 let all_funds = replay_player.game.all_player_funds();
+                let current_unit_map: HashMap<String, UnitState> = current_units
+                    .iter()
+                    .cloned()
+                    .map(|u| (u.id.clone(), u))
+                    .collect();
+                let current_city_map: HashMap<String, CityState> = current_cities
+                    .iter()
+                    .cloned()
+                    .map(|c| (c.id.clone(), c))
+                    .collect();
                 if let Some(delta) = build_delta_inner(
-                    &mut prev_units,
-                    &mut prev_cities,
-                    &mut prev_funds,
-                    &mut prev_vision_grid,
-                    &mut prev_border_grid,
+                    &prev_units,
+                    &prev_cities,
+                    &prev_funds,
+                    &prev_vision_grid,
+                    &prev_border_grid,
                     &current_units,
                     &current_cities,
+                    &current_unit_map,
+                    &current_city_map,
                     &all_funds,
-                    current_vision,
-                    current_border,
+                    &current_vision,
+                    &current_border,
                     "",
                 ) {
+                    // Commit the prev state only on non-idle delta
+                    prev_units = current_unit_map;
+                    prev_cities = current_city_map;
+                    prev_funds = all_funds;
+                    prev_vision_grid = current_vision;
+                    prev_border_grid = current_border;
+
                     let encoded = encode_message(&delta);
                     if ws_sink.send(Message::Binary(encoded)).await.is_err() {
                         return;

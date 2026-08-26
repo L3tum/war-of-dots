@@ -34,6 +34,7 @@ use super::debug_stats::DebugSystemGuard;
 /// read by the benchmark and the debug overlay); in release it's a plain
 /// pass-through. The world and world_entity handles are passed explicitly so macro
 /// hygiene does not block the timing code from accessing them.
+#[macro_export]
 #[cfg(any(debug_assertions, feature = "debug-overlay"))]
 macro_rules! tick_system {
     ($name:expr, $world:expr, $world_entity:expr, $expr:expr) => {{
@@ -59,6 +60,7 @@ macro_rules! tick_system {
     }};
 }
 
+#[macro_export]
 #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
 macro_rules! tick_system {
     ($name:expr, $world:expr, $world_entity:expr, $expr:expr) => {
@@ -148,8 +150,8 @@ pub struct PlayerGameStats {
 
 /// The Game facade wraps a hecs::World and dispatches systems on each tick.
 pub struct Game {
-    world: World,
-    world_entity: hecs::Entity,
+    pub(crate) world: World,
+    pub(crate) world_entity: hecs::Entity,
     settings: GameSettings,
     players: HashMap<String, Player>,
     tick: u64,
@@ -1596,6 +1598,8 @@ impl Game {
     pub fn get_debug_stats(&self) -> Option<serde_json::Value> {
         super::debug_stats::get_debug_stats(&self.world, self.world_entity)
     }
+
+
 
     /// Set which systems should record detailed sub-part timings (benchmark mode).
     #[allow(dead_code)]

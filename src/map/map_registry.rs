@@ -24,13 +24,15 @@ pub fn get(name: &str) -> Option<Map> {
         .map(|loader| loader())
 }
 
-/// List all registered map names
+/// List all registered map names (sorted alphabetically for deterministic ordering)
 pub fn list_maps() -> Vec<String> {
     let registry = MAP_REGISTRY.lock().unwrap();
-    registry
+    let mut names: Vec<String> = registry
         .as_ref()
         .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 /// Initialize the registry with the default map and any handcrafted maps

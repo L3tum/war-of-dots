@@ -478,16 +478,16 @@ describe('City dot vertex generation', () => {
     for (const city of cities) {
       const wx = city.position[0] * CELL_SIZE;
       const wy = city.position[1] * CELL_SIZE;
-      const halfSize = CITY_DOT_SIZE * camera.zoom;
+      const halfSizeWorld = (CITY_DOT_SIZE / 2) / camera.zoom;
       positions.push(
-        wx - halfSize,
-        wy - halfSize,
-        wx + halfSize,
-        wy - halfSize,
-        wx + halfSize,
-        wy + halfSize,
-        wx - halfSize,
-        wy + halfSize,
+        wx - halfSizeWorld,
+        wy - halfSizeWorld,
+        wx + halfSizeWorld,
+        wy - halfSizeWorld,
+        wx + halfSizeWorld,
+        wy + halfSizeWorld,
+        wx - halfSizeWorld,
+        wy + halfSizeWorld,
       );
 
       const colorIdx = parseInt((city.owner ?? '').replace('player_', '') || '0') || 0;
@@ -518,21 +518,29 @@ describe('City dot vertex generation', () => {
 
     const wx = 5 * CELL_SIZE; // 160
     const wy = 5 * CELL_SIZE; // 160
-    const halfSize = CITY_DOT_SIZE * 1; // 6
+    const halfSizeWorld = (CITY_DOT_SIZE / 2) / 1; // 6
 
-    expect(positions[0]).toBe(wx - halfSize); // 154
-    expect(positions[1]).toBe(wy - halfSize); // 154
-    expect(positions[2]).toBe(wx + halfSize); // 166
-    expect(positions[3]).toBe(wy - halfSize); // 154
+    expect(positions[0]).toBe(wx - halfSizeWorld); // 154
+    expect(positions[1]).toBe(wy - halfSizeWorld); // 154
+    expect(positions[2]).toBe(wx + halfSizeWorld); // 166
+    expect(positions[3]).toBe(wy - halfSizeWorld); // 154
   });
 
-  it('scales city dot size with zoom', () => {
+  it('maintains constant screen-space city dot size across zoom levels', () => {
     const cities = [{ id: 'city_0', position: [5, 5] as [number, number] }];
-    const { positions } = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 2 });
 
-    // Quad width should be 2 * CITY_DOT_SIZE * zoom = 24
-    const width = positions[2] - positions[0];
-    expect(width).toBe(2 * CITY_DOT_SIZE * 2);
+    // At zoom=1, world-space width = CITY_DOT_SIZE
+    const atZoom1 = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 1 });
+    const widthAtZoom1 = atZoom1.positions[2] - atZoom1.positions[0];
+    expect(widthAtZoom1).toBe(CITY_DOT_SIZE); // 12 world units at zoom 1
+
+    // At zoom=2, world-space width = CITY_DOT_SIZE / 2 (screen size stays constant)
+    const atZoom2 = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 2 });
+    const widthAtZoom2 = atZoom2.positions[2] - atZoom2.positions[0];
+    expect(widthAtZoom2).toBe(CITY_DOT_SIZE / 2); // 6 world units at zoom 2
+
+    // Screen-space size is constant: worldWidth * zoom = constant
+    expect(widthAtZoom1 * 1).toBe(widthAtZoom2 * 2);
   });
 
   it('colors city by owner index', () => {
@@ -641,11 +649,17 @@ describe('Fog fullscreen quad', () => {
 
 describe('Config constants', () => {
   it('CITY_DOT_SIZE is defined', () => {
-    expect(CITY_DOT_SIZE).toBe(6);
+    expect(CITY_DOT_SIZE).toBe(12);
   });
 
-  it('CITY_COLORS has at least 3 player colors', () => {
-    expect(CITY_COLORS.length).toBeGreaterThanOrEqual(3);
+  it('CITY_COLORS has 6 distinct colors', () => {
+    expect(CITY_COLORS.length).toBe(6);
+    // Pairwise inequality
+    for (let i = 0; i < CITY_COLORS.length; i++) {
+      for (let j = i + 1; j < CITY_COLORS.length; j++) {
+        expect(CITY_COLORS[i]).not.toEqual(CITY_COLORS[j]);
+      }
+    }
   });
 
   it('CITY_COLORS[0] is red', () => {

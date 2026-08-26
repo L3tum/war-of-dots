@@ -20,6 +20,7 @@ use crate::config::CityUpgradeSettings;
 use crate::game::economy::UnitType;
 use crate::game::game::{Game, GameSettings, InfluenceSettings};
 use crate::map::map::{Map, MapConfig};
+use crate::server::delta::{run_network_phase, NetworkBaselines};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
 
@@ -52,6 +53,10 @@ pub struct TickData {
     pub bytes: u64,
     /// Biggest single allocation (bytes) during this tick (0 when bench-alloc is off).
     pub max_alloc: u64,
+    /// Network phase: total encoded bytes sent this tick
+    pub net_wire_bytes: u64,
+    /// Network phase duration in ms (0 if not measured)
+    pub net_ms: f64,
 }
 
 /// Benchmark configuration
@@ -545,10 +550,36 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
 
         game.start();
 
+        // Initialize network baselines for the network phase benchmark
+        let player_ids: Vec<String> = (0..BENCH_PLAYERS)
+            .map(|i| format!("player_{}", i))
+            .collect();
+        let mut net_baselines: NetworkBaselines = {
+            let mut b = NetworkBaselines::default();
+            b.prev_units = game
+                .unit_states()
+                .into_iter()
+                .map(|u| (u.id.clone(), u))
+                .collect();
+            b.prev_cities = game
+                .query_cities()
+                .iter()
+                .map(|c| (c.id.clone(), c.into()))
+                .collect();
+            b.prev_funds = game.all_player_funds();
+            let first_pid = game.players().keys().next().cloned();
+            b.prev_border = first_pid.as_deref().and_then(|pid| game.border_grid_2d(pid));
+            for pid in &player_ids {
+                b.prev_vision.insert(pid.clone(), game.vision_grid_2d(pid));
+            }
+            b
+        };
+
         // Warmup (with AI to warm up caches & archetypes)
         for _ in 0..BENCH_WARMUP_TICKS {
             sim.tick(&mut game, &config);
             game.tick_game();
+            let _ = run_network_phase(&game, &mut net_baselines, &player_ids);
         }
 
         // Reset per-system alloc accumulators so the per-system table reflects
@@ -588,6 +619,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             let combats = game.last_engaged_pairs() as u32;
             let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
 
+            // Network phase (W1): build + encode per-player deltas, measured as
+            // a system via tick_system! so it appears in the per-system P90/P99
+            // breakdown and alloc table alongside ECS systems.
+            let net_phase = crate::tick_system!("network", &mut game.world, game.world_entity, {
+                run_network_phase(&game, &mut net_baselines, &player_ids)
+            });
+            let net_wire_bytes = net_phase.wire_bytes;
+
             #[cfg(feature = "bench-alloc")]
             let (td_allocs, td_bytes, td_max) = {
                 let d = crate::bench_alloc::snapshot().diff(alloc_base);
@@ -622,9 +661,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             let td = if let Some(ds) = game.get_debug_stats() {
                 let entity_count = ds["entity_count"].as_u64().unwrap_or(0) as u32;
                 let mut system_sum_ms = 0.0f64;
+                let mut net_ms = 0.0f64;
                 if let Some(st) = ds["system_timings"].as_array() {
                     for s in st {
-                        system_sum_ms += s["last_ms"].as_f64().unwrap_or(0.0);
+                        let ms = s["last_ms"].as_f64().unwrap_or(0.0);
+                        system_sum_ms += ms;
+                        if s["name"] == "network" {
+                            net_ms = ms;
+                        }
                     }
                 }
                 TickData {
@@ -637,6 +681,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     allocs: td_allocs,
                     bytes: td_bytes,
                     max_alloc: td_max,
+                    net_wire_bytes,
+                    net_ms,
                 }
             } else {
                 TickData {
@@ -649,6 +695,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     allocs: td_allocs,
                     bytes: td_bytes,
                     max_alloc: td_max,
+                    net_wire_bytes,
+                    net_ms: 0.0,
                 }
             };
 
@@ -663,6 +711,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 allocs: td_allocs,
                 bytes: td_bytes,
                 max_alloc: td_max,
+                net_wire_bytes,
+                net_ms: 0.0,
             };
 
             run_tick_data.push(td);
@@ -810,6 +860,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     .map(|r| r[i].max_alloc)
                     .max()
                     .unwrap_or(0);
+                let sum_net_wire = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_wire_bytes as f64)
+                    .sum::<f64>();
+                let sum_net_ms = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_ms)
+                    .sum::<f64>();
                 TickData {
                     total_ms: sum_total / n,
                     entity_count: (sum_entity / n).round() as u32,
@@ -820,6 +878,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     allocs: (sum_allocs / n).round() as u64,
                     bytes: (sum_bytes / n).round() as u64,
                     max_alloc: max_max_alloc,
+                    net_wire_bytes: (sum_net_wire / n).round() as u64,
+                    net_ms: sum_net_ms / n,
                 }
             })
             .collect()
@@ -1210,6 +1270,8 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             .iter()
             .map(|td| td.max_alloc as f64)
             .collect::<Vec<f64>>(),
+        "net_wire_bytes_per_tick": avg_tick_data.iter().map(|td| td.net_wire_bytes as f64).collect::<Vec<f64>>(),
+        "net_ms_per_tick": avg_tick_data.iter().map(|td| td.net_ms).collect::<Vec<f64>>(),
         "stack": {
             "Game": std::mem::size_of::<crate::game::game::Game>(),
             "MovementScratch": std::mem::size_of::<crate::game::systems::movement::MovementScratch>(),

@@ -66,15 +66,29 @@ describe('marchingSquares', () => {
   it('scales positions with cellSize', () => {
     const grid = makeGrid(2, 2);
     const result = marchingSquares(grid, 10, { x: 0, y: 0 }, 1, 500, 300);
-    expect(result.positions[0]).toBe(0);
-    expect(result.positions[2]).toBe(10);
+    // With zoom=1, hpX = 0.5, so first x = 0 - 0.5 = -0.5, second x = 0 + 10 + 0.5 = 10.5
+    expect(result.positions[0]).toBe(-0.5);
+    expect(result.positions[2]).toBe(10.5);
   });
 
   it('sends world-space positions (zoom applied by shader)', () => {
     const grid = makeGrid(2, 2);
     const result = marchingSquares(grid, 1, { x: 0, y: 0 }, 2, 500, 300);
-    expect(result.positions[0]).toBe(0);
-    expect(result.positions[2]).toBe(1);
+    // With zoom=2, hpX = 0.25, so first x = 0 - 0.25 = -0.25, second x = 0 + 1 + 0.25 = 1.25
+    expect(result.positions[0]).toBe(-0.25);
+    expect(result.positions[2]).toBe(1.25);
+  });
+
+  it('overlaps adjacent cells by half a pixel so 4-way corners are covered', () => {
+    const grid = makeGrid(2, 2);
+    const result = marchingSquares(grid, 10, { x: 0, y: 0 }, 1, 500, 300);
+    // With zoom=1, hp = 0.5. Cell (0,0) right edge = 0 + 10 + 0.5 = 10.5
+    // Cell (1,0) left edge = 10 - 0.5 = 9.5
+    // They overlap by 1.0 world units (= 2 screen px)
+    const cell00_right = 10 + 0.5;
+    const cell10_left = 10 - 0.5;
+    expect(cell00_right).toBeGreaterThan(cell10_left);
+    expect(cell00_right - cell10_left).toBe(1.0);
   });
 
   it('generates a quad per cell (16 quads) for a 4x4 grid', () => {

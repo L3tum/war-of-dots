@@ -2,6 +2,7 @@
 
 import { GameState } from './game_state';
 import { marchingSquares } from './terrain';
+import { fillTerritory, TERRITORY_NONE } from './territory';
 import {
   CELL_SIZE,
   UNIT_DOT_SIZE,
@@ -94,6 +95,7 @@ export class Renderer {
   // Border cache — store logical edges (camera-independent), recompute positions each frame
   // Exposed dirty flags for external marking
   public borderDirty: boolean = true;
+  private displayGrid: number[][] = [];
   private borderCacheEdges: {
     gridX: number;
     gridY: number;
@@ -1061,8 +1063,7 @@ export class Renderer {
         // Send WORLD-SPACE positions; shader applies camera + zoom + NDC
         const wx = unit.position.x * CELL_SIZE;
         const wy = unit.position.y * CELL_SIZE;
-        const halfSize = UNIT_DOT_SIZE * this.camera.zoom;
-        const halfSizeWorld = halfSize / this.camera.zoom; // Convert to world-space
+        const halfSizeWorld = (UNIT_DOT_SIZE / 2) / this.camera.zoom;
         unitPositions.push(
           wx - halfSizeWorld,
           wy - halfSizeWorld,
@@ -1245,18 +1246,25 @@ export class Renderer {
       if (this.borderDirty) {
         this.borderCacheEdges = [];
         if (borderGrid.length > 0) {
-          for (let y = 0; y < borderGrid.length - 1; y++) {
-            for (let x = 0; x < borderGrid[y].length - 1; x++) {
-              const p1 = borderGrid[y][x];
-              const p2 = borderGrid[y][x + 1];
-              const p3 = borderGrid[y + 1][x];
-              // Only draw borders between two different players — never at the
-              // edge of claimed vs unclaimed (255) territory.
+          // W5: Fill territory so borders form contiguous regions instead of city-connecting blobs
+          const cityAnchors = Array.from(gameState.cities.values()).map((city) => ({
+            x: Math.floor(city.position[0]),
+            y: Math.floor(city.position[1]),
+            ownerIdx: gameState.colorIndexForOwner(city.owner),
+          }));
+          const displayGrid = fillTerritory(borderGrid, gameState.terrain, cityAnchors);
+
+          for (let y = 0; y < displayGrid.length; y++) {
+            for (let x = 0; x < displayGrid[y].length; x++) {
+              const p1 = displayGrid[y][x];
+              const p2 = x + 1 < displayGrid[y].length ? displayGrid[y][x + 1] : TERRITORY_NONE;
+              const p3 = y + 1 < displayGrid.length ? displayGrid[y + 1][x] : TERRITORY_NONE;
+              // Draw borders between two different players
               if (p1 !== p2 && p1 !== TERRITORY_NONE && p2 !== TERRITORY_NONE) {
                 this.borderCacheEdges.push({
                   gridX: x,
                   gridY: y,
-                  dir: 'h',
+                  dir: 'h' as const,
                   ownerA: p1,
                   ownerB: p2,
                 });
@@ -1265,7 +1273,7 @@ export class Renderer {
                 this.borderCacheEdges.push({
                   gridX: x,
                   gridY: y,
-                  dir: 'v',
+                  dir: 'v' as const,
                   ownerA: p1,
                   ownerB: p3,
                 });
@@ -1281,6 +1289,7 @@ export class Renderer {
       // colour (the "player colour / other player colour" two-line request).
       const borderPositions: number[] = [];
       const borderColors: number[] = [];
+      const lw = BORDER_LINE_WIDTH / this.camera.zoom;
       for (const edge of this.borderCacheEdges) {
         const cA = PLAYER_COLORS[edge.ownerA % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
         const cB = PLAYER_COLORS[edge.ownerB % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
@@ -1288,42 +1297,42 @@ export class Renderer {
           // Horizontal border between rows (gridY) and (gridY+1). ownerA is the upper cell.
           const wx = edge.gridX * CELL_SIZE;
           const wy = (edge.gridY + 1) * CELL_SIZE;
-          // Quad A (ownerA) — upper half, [wy - LINE, wy]
+          // Quad A (ownerA) — upper half, [wy - lw, wy]
           borderPositions.push(
             wx,
-            wy - BORDER_LINE_WIDTH,
+            wy - lw,
             wx + CELL_SIZE,
-            wy - BORDER_LINE_WIDTH,
+            wy - lw,
             wx + CELL_SIZE,
             wy,
             wx,
             wy,
           );
-          // Quad B (ownerB) — lower half, [wy, wy + LINE]
+          // Quad B (ownerB) — lower half, [wy, wy + lw]
           borderPositions.push(
             wx,
             wy,
             wx + CELL_SIZE,
             wy,
             wx + CELL_SIZE,
-            wy + BORDER_LINE_WIDTH,
+            wy + lw,
             wx,
-            wy + BORDER_LINE_WIDTH,
+            wy + lw,
           );
         } else {
           // Vertical border between cols (gridX) and (gridX+1). ownerA is the left cell.
           const wx = (edge.gridX + 1) * CELL_SIZE;
           const wy = edge.gridY * CELL_SIZE;
-          // Quad A (ownerA) — left half, [wx - LINE, wx]
-          const xa = wx - BORDER_LINE_WIDTH;
+          // Quad A (ownerA) — left half, [wx - lw, wx]
+          const xa = wx - lw;
           borderPositions.push(xa, wy, wx, wy, wx, wy + CELL_SIZE, xa, wy + CELL_SIZE);
-          // Quad B (ownerB) — right half, [wx, wx + LINE]
+          // Quad B (ownerB) — right half, [wx, wx + lw]
           borderPositions.push(
             wx,
             wy,
-            wx + BORDER_LINE_WIDTH,
+            wx + lw,
             wy,
-            wx + BORDER_LINE_WIDTH,
+            wx + lw,
             wy + CELL_SIZE,
             wx,
             wy + CELL_SIZE,
@@ -1393,8 +1402,13 @@ export class Renderer {
       for (const city of gameState.cities.values()) {
         const wx = city.position[0] * CELL_SIZE;
         const wy = city.position[1] * CELL_SIZE;
-        const halfSize = CITY_DOT_SIZE * this.camera.zoom;
-        const halfSizeWorld = halfSize / this.camera.zoom; // Convert to world-space
+        // W4: screen-space constant size (diameter in screen pixels)
+        let dotSize = CITY_DOT_SIZE;
+        // W6: own cities are 1.5x larger
+        if (city.owner === gameState.ownPlayerId) {
+          dotSize *= 1.5;
+        }
+        const halfSizeWorld = (dotSize / 2) / this.camera.zoom;
         cityPositions.push(
           wx - halfSizeWorld,
           wy - halfSizeWorld,
@@ -1405,9 +1419,16 @@ export class Renderer {
           wx - halfSizeWorld,
           wy + halfSizeWorld,
         );
-        // Color by owner
+        // Color by owner; W6: own cities get 50% white mix for brightness
         const colorIdx = gameState.colorIndexForOwner(city.owner);
-        const color = CITY_COLORS[colorIdx % CITY_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
+        let color = CITY_COLORS[colorIdx % CITY_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
+        if (city.owner === gameState.ownPlayerId) {
+          color = {
+            r: color.r * 0.5 + 0.5,
+            g: color.g * 0.5 + 0.5,
+            b: color.b * 0.5 + 0.5,
+          };
+        }
         for (let i = 0; i < 4; i++) {
           cityColorsArr.push(color.r, color.g, color.b);
         }
@@ -1449,12 +1470,12 @@ export class Renderer {
         };
         for (const unit of gameState.units.values()) {
           if (unit.owner === ownId) {
-            pushOutline(unit.position.x * CELL_SIZE, unit.position.y * CELL_SIZE, UNIT_DOT_SIZE);
+            pushOutline(unit.position.x * CELL_SIZE, unit.position.y * CELL_SIZE, UNIT_DOT_SIZE / 2);
           }
         }
         for (const [, city] of gameState.cities) {
           if (city.owner === ownId) {
-            pushOutline(city.position[0] * CELL_SIZE, city.position[1] * CELL_SIZE, CITY_DOT_SIZE);
+            pushOutline(city.position[0] * CELL_SIZE, city.position[1] * CELL_SIZE, CITY_DOT_SIZE / 2);
           }
         }
       }
