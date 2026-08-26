@@ -1564,6 +1564,32 @@ impl Game {
         )
     }
 
+    /// Returns the per-player flat vision grid as an `Arc` (no allocation —
+    /// just a refcount bump). Used by the network phase for O(1) change
+    /// detection via `Arc::ptr_eq`.
+    pub fn vision_grid_flat(&self, player_id: &str) -> Option<std::sync::Arc<Vec<bool>>> {
+        let wb = self.world.world_data(self.world_entity)?;
+        wb.vision.grids.get(player_id).cloned()
+    }
+
+    /// Returns the global flat territory grid as an `Arc` (no allocation).
+    /// Values are player indices (0..N) or 255 (NONE/unclaimed).
+    pub fn territory_grid_flat(&self) -> Option<std::sync::Arc<Vec<u8>>> {
+        let wb = self.world.world_data(self.world_entity)?;
+        if wb.territory.grid.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::clone(&wb.territory.grid))
+    }
+
+    /// Returns the terrain width in cells (0 if no world data).
+    pub fn terrain_width(&self) -> u32 {
+        self.world
+            .world_data(self.world_entity)
+            .map(|wb| wb.terrain.width)
+            .unwrap_or(0)
+    }
+
     /// Supervisor (spectator/replay) view: union of every player's vision.
     /// A cell is visible if any player currently sees it.
     pub fn supervisor_vision_grid(&self) -> Option<Vec<Vec<bool>>> {
@@ -1669,6 +1695,29 @@ impl Game {
             .map(|y| (0..wusize).map(|x| result_flat[y * wusize + x]).collect())
             .collect();
         Some(result)
+    }
+
+    /// Union of every player's vision as a flat `Vec<bool>` (no 2-D
+    /// conversion). Used by the spectator network path.
+    pub fn union_vision_grid_flat(&self, player_ids: &[String]) -> Option<Vec<bool>> {
+        let wb = self.world.world_data(self.world_entity)?;
+        if player_ids.is_empty() {
+            return None;
+        }
+        let w = wb.terrain.width as usize;
+        let h = wb.terrain.height as usize;
+        let grid_size = w * h;
+        let mut result_flat = vec![false; grid_size];
+        for pid in player_ids {
+            if let Some(grid) = wb.vision.grids.get(pid) {
+                for i in 0..grid_size {
+                    if grid[i] {
+                        result_flat[i] = true;
+                    }
+                }
+            }
+        }
+        Some(result_flat)
     }
 
     pub fn player_funds(&self, player_id: &str) -> u32 {
@@ -1818,6 +1867,88 @@ impl Game {
                 boat_supply_percent: u.boat_supply_percent(),
                 embarking: u.embarking,
                 disembarking: u.disembarking,
+            })
+            .collect()
+    }
+
+    /// Get all unit data as UnitState for serialization (direct single-pass,
+    /// no intermediate `UnitQueryData`). Used by the network phase.
+    pub fn unit_states_direct(&self) -> Vec<crate::server::protocol::UnitState> {
+        use crate::server::protocol::{EquipmentState, UnitState};
+        self.world
+            .query::<(
+                Entity,
+                &UnitOwner,
+                &UnitTypeId,
+                &UnitDisplay,
+                &UnitPosition,
+                &UnitPath,
+                &UnitStats,
+                &UnitEquipment,
+                &UnitFlags,
+                &UnitWaterTransition,
+            )>()
+            .iter()
+            .map(|(entity, owner, utype, display, pos, path, stats, equipment, flags, wt)| {
+                let eid = entity.id();
+                // supply_percent: same formula as UnitQueryData::supply_percent
+                let total_needed: f32 = equipment
+                    .max_equipment
+                    .iter()
+                    .map(|me| (me.max_count as f32) * 0.9)
+                    .sum();
+                let total_carried: f32 = equipment.equipment.iter().map(|e| e.count as f32).sum();
+                let supply_percent = if total_needed <= 0.0 {
+                    100.0
+                } else {
+                    (total_carried / total_needed * 100.0).clamp(0.0, 100.0)
+                };
+                // boat_supply_percent
+                let total_boat_max: f32 = wt.max_boat_supply.iter().map(|e| e.max_count as f32).sum();
+                let total_boat_cur: f32 = wt.boat_supply.iter().map(|e| e.count as f32).sum();
+                let boat_supply_percent = if total_boat_max <= 0.0 {
+                    0.0
+                } else {
+                    (total_boat_cur / total_boat_max * 100.0).clamp(0.0, 100.0)
+                };
+                UnitState {
+                    id: format!("unit_{eid}"),
+                    owner: owner.player_id.clone(),
+                    position: pos.as_tuple(),
+                    unit_type: utype.name.clone(),
+                    symbol: display.symbol.clone(),
+                    men: stats.men,
+                    max_men: stats.max_men,
+                    organisation: stats.organisation,
+                    equipment: equipment
+                        .equipment
+                        .iter()
+                        .map(|e| EquipmentState {
+                            name: e.name.clone(),
+                            count: e.count,
+                            cost_per_item: e.cost_per_item,
+                        })
+                        .collect(),
+                    max_equipment: equipment
+                        .max_equipment
+                        .iter()
+                        .map(|e| EquipmentState {
+                            name: e.name.clone(),
+                            count: e.count,
+                            cost_per_item: e.cost_per_item,
+                        })
+                        .collect(),
+                    path: path.path.to_vec(),
+                    healing: flags.healing,
+                    resupply_enabled: flags.resupply_enabled,
+                    supply_percent,
+                    encircled: flags.encircled,
+                    attacking: flags.fighting,
+                    on_water: flags.on_water,
+                    boat_supply_percent,
+                    embarking: wt.embarking,
+                    disembarking: wt.disembarking,
+                }
             })
             .collect()
     }

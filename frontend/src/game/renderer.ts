@@ -29,9 +29,7 @@ import {
   ZOOM_MAX,
 } from './config';
 
-/** Sentinel for "no player has influence at this cell" in the territory grid.
- *  borderGrid values are player indices (0..N) or 255 (unclaimed/NONE). */
-const TERRITORY_NONE = 255;
+
 
 export class Renderer {
   private canvas: HTMLCanvasElement;
@@ -1082,8 +1080,7 @@ export class Renderer {
         }
 
         // Symbol quad — use world-space size so shader transforms correctly
-        const symHalfSize = halfSize * 0.8;
-        const symHalfSizeWorld = symHalfSize / this.camera.zoom;
+        const symHalfSizeWorld = halfSizeWorld * 0.8;
         const cellX = (unitIndex % SYMBOLS_PER_ROW) * SYMBOL_CELL_SIZE;
         const cellY = Math.floor(unitIndex / SYMBOLS_PER_ROW) * SYMBOL_CELL_SIZE;
         const uvW = SYMBOL_CELL_SIZE / SYMBOL_ATLAS_SIZE;

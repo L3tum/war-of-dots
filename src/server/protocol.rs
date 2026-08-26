@@ -15,8 +15,16 @@ pub struct GameStateMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GameDeltaMessage {
-    pub vision_grid_diff: Option<Vec<Vec<bool>>>,
-    pub border_grid_diff: Option<Vec<Vec<u32>>>,
+    /// Flat vision grid (1 byte per cell, 0 or 1). Row-major, width = terrain width.
+    /// `None` when the grid is unchanged since the client's last snapshot.
+    pub vision_grid_diff: Option<Vec<u8>>,
+    /// Flat border/territory grid (1 byte per cell: player index 0..N or 255).
+    /// Row-major, width = terrain width. `None` when unchanged.
+    pub border_grid_diff: Option<Vec<u8>>,
+    /// Grid width in cells (sent whenever either grid diff is present so the
+    /// client can index the flat arrays). Omitted when no grid changed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grid_width: Option<u32>,
     pub units_added: Vec<UnitState>,
     pub units_removed: Vec<String>,
     pub unit_updates: Vec<UnitUpdate>,
@@ -352,9 +360,31 @@ pub struct LobbyPlayer {
 
 #[allow(dead_code)]
 pub fn encode_message(msg: &ServerMessage) -> Vec<u8> {
-    let mut buf = Vec::new();
+    encode_message_with_hint(msg, 0)
+}
+
+/// Encode with a capacity hint to avoid geometric buffer growth (N5).
+/// Pass a rough byte estimate so `Vec::with_capacity` allocates once.
+#[allow(dead_code)]
+pub fn encode_message_with_hint(msg: &ServerMessage, capacity_hint: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(capacity_hint.max(64));
     ciborium::into_writer(msg, &mut buf).unwrap_or_default();
     buf
+}
+
+/// Estimate the encoded CBOR size of a delta message for buffer pre-sizing.
+/// Grids dominate: vision is 1 byte/cell, border is 1 byte/cell.
+pub fn estimate_delta_size(delta: &GameDeltaMessage) -> usize {
+    let mut cap = 256; // base overhead: enums, arrays, player state
+    if let Some(v) = &delta.vision_grid_diff {
+        cap += v.len() + 16;
+    }
+    if let Some(b) = &delta.border_grid_diff {
+        cap += b.len() + 16;
+    }
+    cap += delta.units_added.len() * 400;
+    cap += delta.unit_updates.len() * 200;
+    cap + delta.city_updates.len() * 80
 }
 
 #[allow(dead_code)]
@@ -449,6 +479,7 @@ mod tests {
         let msg = ServerMessage::DeltaState(GameDeltaMessage {
             vision_grid_diff: None,
             border_grid_diff: None,
+            grid_width: None,
             units_added: vec![],
             units_removed: vec!["unit_old".to_string()],
             unit_updates: vec![UnitUpdate {

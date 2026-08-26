@@ -4,6 +4,7 @@ import { GameState } from '../game/game_state';
 import { Renderer } from '../game/renderer';
 import { Unit } from '../game/units';
 import type { TerrainType } from '../game/terrain';
+import { flatTo2D, flatTo2DBools } from '../net/connection';
 
 export class ReplayPlayer {
   private canvas: HTMLCanvasElement;
@@ -121,11 +122,11 @@ export class ReplayPlayer {
     // Delta state
     if (isDeltaEvent(event)) {
       const delta = event.delta;
-      if (delta.vision_grid_diff) {
-        this.gameState.visionGrid = delta.vision_grid_diff;
+      if (delta.vision_grid_diff && delta.grid_width) {
+        this.gameState.visionGrid = flatTo2DBools(delta.vision_grid_diff, delta.grid_width);
       }
-      if (delta.border_grid_diff) {
-        this.gameState.borderGrid = delta.border_grid_diff;
+      if (delta.border_grid_diff && delta.grid_width) {
+        this.gameState.borderGrid = flatTo2D(delta.border_grid_diff, delta.grid_width);
       }
       // Units added
       for (const unit of delta.units_added || []) {
@@ -220,8 +221,9 @@ interface FullStateEvent {
 interface DeltaEvent {
   full_state?: never;
   delta: {
-    vision_grid_diff?: boolean[][];
-    border_grid_diff?: number[][];
+    vision_grid_diff?: number[];
+    border_grid_diff?: number[];
+    grid_width?: number;
     units_added?: unknown[];
     units_removed?: string[];
     unit_updates?: unknown[];

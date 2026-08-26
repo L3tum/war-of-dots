@@ -1,7 +1,7 @@
 //! Server: HTTP + raw TCP for game state
 
 use sqlite::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
@@ -460,10 +460,11 @@ impl GameRoom {
                     .map(|c| (c.id.clone(), c.into()))
                     .collect();
                 b.prev_funds = game.all_player_funds();
-                let first_pid = game.players().keys().next().cloned();
-                b.prev_border = first_pid.as_deref().and_then(|pid| game.border_grid_2d(pid));
+                b.prev_border = game.territory_grid_flat();
                 for pid in game.players().keys() {
-                    b.prev_vision.insert(pid.clone(), game.vision_grid_2d(pid));
+                    if let Some(v) = game.vision_grid_flat(pid) {
+                        b.prev_vision.insert(pid.clone(), v);
+                    }
                 }
                 b
             };
@@ -659,49 +660,37 @@ impl GameRoom {
                         // since their vision differs from per-player vision).
                         if spectator_vision {
                             let all_pids: Vec<String> = game.players().keys().cloned().collect();
-                            let spec_vision = game.union_vision_grids(&all_pids);
-                            let spec_border = game
-                                .players()
-                                .keys()
-                                .next()
-                                .and_then(|p| game.border_grid_2d(p));
+                            let spec_vision: Option<Arc<Vec<bool>>> =
+                                game.union_vision_grid_flat(&all_pids).map(Arc::new);
+                            let spec_border: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
                             let spec_pid = String::new();
-                            let prev_spec_vision = baselines
-                                .prev_vision
-                                .get(&spec_pid)
-                                .cloned()
-                                .unwrap_or_default();
-
-                            let cur_unit_map: HashMap<String, UnitState> = current_units
-                                .iter()
-                                .cloned()
-                                .map(|u| (u.id.clone(), u))
-                                .collect();
-                            let cur_city_map: HashMap<String, CityState> = current_cities
-                                .iter()
-                                .cloned()
-                                .map(|c| (c.id.clone(), c))
-                                .collect();
+                            let prev_spec_vision: Option<&Arc<Vec<bool>>> =
+                                baselines.prev_vision.get(&spec_pid);
+                            let cur_unit_ids: HashSet<&str> =
+                                current_units.iter().map(|u| u.id.as_str()).collect();
                             let all_funds = game.all_player_funds();
+                            let grid_width = game.terrain_width();
 
                             if let Some(delta) = build_delta_inner(
                                 &baselines.prev_units,
                                 &baselines.prev_cities,
                                 &baselines.prev_funds,
-                                &prev_spec_vision,
-                                &baselines.prev_border,
+                                prev_spec_vision,
+                                baselines.prev_border.as_ref(),
                                 &current_units,
                                 &current_cities,
-                                &cur_unit_map,
-                                &cur_city_map,
+                                &cur_unit_ids,
                                 &all_funds,
                                 &spec_vision,
                                 &spec_border,
+                                grid_width,
                                 &spec_pid,
                             ) {
                                 send_map.insert(spec_pid.clone(), encode_message(&delta));
                             }
-                            baselines.prev_vision.insert(spec_pid, spec_vision);
+                            if let Some(v) = &spec_vision {
+                                baselines.prev_vision.insert(spec_pid, Arc::clone(v));
+                            }
                         }
 
                         // Send encoded deltas; keep alive connections
@@ -1282,8 +1271,9 @@ pub(crate) async fn handle_replay_ws(
                 })
                 .collect();
             let mut prev_funds = replay_player.all_player_funds().clone();
-            let mut prev_vision_grid: Option<Vec<Vec<bool>>> = None;
-            let mut prev_border_grid: Option<Vec<Vec<u32>>> = None;
+            let mut prev_vision_grid: Option<Arc<Vec<bool>>> = None;
+            let mut prev_border_grid: Option<Arc<Vec<u8>>> = None;
+            let grid_width = replay_player.game.terrain_width();
 
             // Loop: consume events and build deltas
             let mut events: Vec<ReplayEvent> = Vec::new();
@@ -1292,8 +1282,19 @@ pub(crate) async fn handle_replay_ws(
             }
             for event in events {
                 replay_player.apply_event(&event);
-                let current_vision = replay_player.game.supervisor_vision_grid();
-                let current_border = replay_player.game.supervisor_border_grid();
+                // Flat grids (no 2-D allocation in replay path either)
+                let all_pids: Vec<String> = replay_player
+                    .game
+                    .players()
+                    .keys()
+                    .cloned()
+                    .collect();
+                let current_vision: Option<Arc<Vec<bool>>> = replay_player
+                    .game
+                    .union_vision_grid_flat(&all_pids)
+                    .map(Arc::new);
+                let current_border: Option<Arc<Vec<u8>>> =
+                    replay_player.game.territory_grid_flat();
                 let current_units = replay_player.game.unit_states();
                 let current_cities: Vec<CityState> = replay_player
                     .game
@@ -1302,34 +1303,32 @@ pub(crate) async fn handle_replay_ws(
                     .map(|c| c.into())
                     .collect();
                 let all_funds = replay_player.game.all_player_funds();
-                let current_unit_map: HashMap<String, UnitState> = current_units
-                    .iter()
-                    .cloned()
-                    .map(|u| (u.id.clone(), u))
-                    .collect();
-                let current_city_map: HashMap<String, CityState> = current_cities
-                    .iter()
-                    .cloned()
-                    .map(|c| (c.id.clone(), c))
-                    .collect();
+                let current_unit_ids: HashSet<&str> =
+                    current_units.iter().map(|u| u.id.as_str()).collect();
                 if let Some(delta) = build_delta_inner(
                     &prev_units,
                     &prev_cities,
                     &prev_funds,
-                    &prev_vision_grid,
-                    &prev_border_grid,
+                    prev_vision_grid.as_ref(),
+                    prev_border_grid.as_ref(),
                     &current_units,
                     &current_cities,
-                    &current_unit_map,
-                    &current_city_map,
+                    &current_unit_ids,
                     &all_funds,
                     &current_vision,
                     &current_border,
+                    grid_width,
                     "",
                 ) {
                     // Commit the prev state only on non-idle delta
-                    prev_units = current_unit_map;
-                    prev_cities = current_city_map;
+                    prev_units = current_units
+                        .iter()
+                        .map(|u| (u.id.clone(), u.clone()))
+                        .collect();
+                    prev_cities = current_cities
+                        .iter()
+                        .map(|c| (c.id.clone(), c.clone()))
+                        .collect();
                     prev_funds = all_funds;
                     prev_vision_grid = current_vision;
                     prev_border_grid = current_border;

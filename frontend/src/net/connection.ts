@@ -29,6 +29,33 @@ const CBOR = {
   },
 };
 
+/** Convert a flat row-major array to a 2-D array (one row per width). */
+function flatTo2D(flat: number[], width: number): number[][] {
+  const h = Math.ceil(flat.length / width);
+  const grid: number[][] = new Array(h);
+  for (let y = 0; y < h; y++) {
+    const row = new Array(width);
+    for (let x = 0; x < width; x++) row[x] = flat[y * width + x];
+    grid[y] = row;
+  }
+  return grid;
+}
+
+/** Convert a flat row-major byte array to a 2-D boolean array. */
+function flatTo2DBools(flat: number[], width: number): boolean[][] {
+  const h = Math.ceil(flat.length / width);
+  const grid: boolean[][] = new Array(h);
+  for (let y = 0; y < h; y++) {
+    const row = new Array(width);
+    for (let x = 0; x < width; x++) row[x] = flat[y * width + x] !== 0;
+    grid[y] = row;
+  }
+  return grid;
+}
+
+/** Re-export for replay player. */
+export { flatTo2D, flatTo2DBools };
+
 /** Recursively remove `undefined` values from plain objects and arrays. */
 function stripUndefined(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
@@ -375,12 +402,12 @@ export class Connection {
   private applyDelta(delta: GameDeltaMessage) {
     try {
       this.renderer.markDataDirty();
-      if (delta.vision_grid_diff) {
-        this.gameState.visionGrid = delta.vision_grid_diff;
+      if (delta.vision_grid_diff && delta.grid_width) {
+        this.gameState.visionGrid = flatTo2DBools(delta.vision_grid_diff, delta.grid_width);
         this.renderer.markFogDirty();
       }
-      if (delta.border_grid_diff) {
-        this.gameState.borderGrid = delta.border_grid_diff;
+      if (delta.border_grid_diff && delta.grid_width) {
+        this.gameState.borderGrid = flatTo2D(delta.border_grid_diff, delta.grid_width);
         this.renderer.markBorderDirty();
       }
       for (const unit of delta.units_added || []) {

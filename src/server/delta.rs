@@ -16,12 +16,13 @@
 //!   any parallelization here needs its own A/B before being assumed to win)
 //! - Consider incremental hashing for grid diff detection
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::game::game::Game;
 use crate::server::protocol::{
-    encode_message, CityState, CityUpdate, GameDeltaMessage, PlayerState, ServerMessage,
-    UnitState, UnitUpdate,
+    encode_message_with_hint, estimate_delta_size, CityState, CityUpdate, GameDeltaMessage,
+    PlayerState, ServerMessage, UnitState, UnitUpdate,
 };
 
 /// Lightweight digest of a UnitState used for change detection.
@@ -75,45 +76,60 @@ impl UnitStateDigest {
 
 /// Build a delta message comparing current game state to previous snapshots.
 ///
-/// Current-state snapshots (`current_units`, `current_cities`, `all_player_funds`)
-/// are computed **once per tick** by the caller and shared across players, so we
-/// no longer re-snapshot (and re-clone every unit's equipment Vecs) per player.
+/// Grids are passed as flat `Arc` slices (N1): the fast path is an O(1)
+/// `Arc::ptr_eq` check; a full `slice == slice` comparison only runs when the
+/// pointer differs. The 2-D `Vec<Vec<_>>` wire format is no longer used —
+/// the protocol now carries flat `Vec<u8>` (N6).
 ///
-/// Returns `None` when nothing this player cares about changed since the last
-/// snapshot — the caller must then skip encoding/sending entirely, which is what
-/// eliminates idle websocket traffic.
+/// `current_unit_ids` (N2) is a `HashSet<&str>` of live unit IDs, used only
+/// for the removed-units check. The full `UnitState` values are never read
+/// from this set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_delta_inner(
     prev_units: &HashMap<String, UnitState>,
     prev_cities: &HashMap<String, CityState>,
     prev_funds: &HashMap<String, u32>,
-    prev_vision_grid: &Option<Vec<Vec<bool>>>,
-    prev_border_grid: &Option<Vec<Vec<u32>>>,
+    prev_vision_grid: Option<&Arc<Vec<bool>>>,
+    prev_border_grid: Option<&Arc<Vec<u8>>>,
     current_units: &[UnitState],
     current_cities: &[CityState],
-    current_unit_map: &HashMap<String, UnitState>,
-    _current_city_map: &HashMap<String, CityState>,
+    current_unit_ids: &HashSet<&str>,
     all_player_funds: &HashMap<String, u32>,
-    current_vision_grid: &Option<Vec<Vec<bool>>>,
-    current_border_grid: &Option<Vec<Vec<u32>>>,
+    current_vision_grid: &Option<Arc<Vec<bool>>>,
+    current_border_grid: &Option<Arc<Vec<u8>>>,
+    grid_width: u32,
     player_id: &str,
 ) -> Option<ServerMessage> {
-    // Grid delta: send the FULL current grid only when it changed since the last
-    // snapshot. The default map is 200×200 (~40 KB of vision bools), so a per-cell
-    // "diff" would cost as much as the full grid with extra compute — per-cell
-    // row-diffing is a deliberate follow-up. The sparse unit/city deltas below
-    // remain the genuinely valuable bandwidth win.
-    let vision_grid_diff: Option<Vec<Vec<bool>>> = match (prev_vision_grid, current_vision_grid)
-    {
-        (Some(prev), Some(curr)) if prev == curr => None,
-        (_, Some(curr)) => Some(curr.clone()),
+    // Grid delta (N1): Arc::ptr_eq fast path, then flat slice equality.
+    // When changed, emit a flat `Vec<u8>` for the wire (N6).
+    let vision_grid_diff: Option<Vec<u8>> = match (prev_vision_grid, current_vision_grid) {
+        (Some(prev), Some(curr)) => {
+            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
+                None
+            } else {
+                Some(curr.iter().map(|b| *b as u8).collect())
+            }
+        }
+        (None, Some(curr)) => Some(curr.iter().map(|b| *b as u8).collect()),
         _ => None,
     };
 
-    let border_grid_diff: Option<Vec<Vec<u32>>> = match (prev_border_grid, current_border_grid) {
-        (Some(prev), Some(curr)) if prev == curr => None,
-        (_, Some(curr)) => Some(curr.clone()),
+    let border_grid_diff: Option<Vec<u8>> = match (prev_border_grid, current_border_grid) {
+        (Some(prev), Some(curr)) => {
+            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
+                None
+            } else {
+                Some(curr.as_slice().to_vec())
+            }
+        }
+        (None, Some(curr)) => Some(curr.as_slice().to_vec()),
         _ => None,
+    };
+
+    let grid_width_out = if vision_grid_diff.is_some() || border_grid_diff.is_some() {
+        Some(grid_width)
+    } else {
+        None
     };
 
     // Units added (new)
@@ -123,10 +139,10 @@ pub(crate) fn build_delta_inner(
         .cloned()
         .collect();
 
-    // Units removed (no longer in game)
+    // Units removed (no longer in game) — N2: check against HashSet<&str>
     let units_removed: Vec<String> = prev_units
         .keys()
-        .filter(|id| !current_unit_map.contains_key(id.as_str()))
+        .filter(|id| !current_unit_ids.contains(id.as_str()))
         .cloned()
         .collect();
 
@@ -297,6 +313,7 @@ pub(crate) fn build_delta_inner(
     let delta = GameDeltaMessage {
         vision_grid_diff,
         border_grid_diff,
+        grid_width: grid_width_out,
         units_added,
         units_removed,
         unit_updates,
@@ -309,12 +326,13 @@ pub(crate) fn build_delta_inner(
 
 /// Per-tick baseline state for the network phase (W0 fix: shared read-only
 /// baseline with per-player vision).
+/// N1: grids are stored as flat `Arc` slices for O(1) change detection.
 pub(crate) struct NetworkBaselines {
     pub prev_units: HashMap<String, UnitState>,
     pub prev_cities: HashMap<String, CityState>,
     pub prev_funds: HashMap<String, u32>,
-    pub prev_vision: HashMap<String, Option<Vec<Vec<bool>>>>,
-    pub prev_border: Option<Vec<Vec<u32>>>,
+    pub prev_vision: HashMap<String, Arc<Vec<bool>>>,
+    pub prev_border: Option<Arc<Vec<u8>>>,
 }
 
 impl Default for NetworkBaselines {
@@ -344,23 +362,17 @@ pub(crate) fn run_network_phase(
     baselines: &mut NetworkBaselines,
     player_ids: &[String],
 ) -> NetworkPhaseResult {
-    // Build current snapshots once
-    let current_units = game.unit_states();
+    // N4: single-pass unit snapshot (no intermediate UnitQueryData)
+    let current_units = game.unit_states_direct();
     let current_cities: Vec<CityState> =
         game.query_cities().iter().map(|c| c.into()).collect();
-    let current_unit_map: HashMap<String, UnitState> = current_units
-        .iter()
-        .cloned()
-        .map(|u| (u.id.clone(), u))
-        .collect();
-    let current_city_map: HashMap<String, CityState> = current_cities
-        .iter()
-        .cloned()
-        .map(|c| (c.id.clone(), c))
-        .collect();
+    // N2: borrowed ID set for removed-units check (no deep clones)
+    let current_unit_ids: HashSet<&str> =
+        current_units.iter().map(|u| u.id.as_str()).collect();
     let all_funds = game.all_player_funds();
-    let border_grid: Option<Vec<Vec<u32>>> =
-        player_ids.first().and_then(|pid| game.border_grid_2d(pid));
+    // N1: flat Arc grids (no 2-D allocation)
+    let border_grid: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
+    let grid_width = game.terrain_width();
 
     let mut result = NetworkPhaseResult {
         wire_bytes: 0,
@@ -369,40 +381,51 @@ pub(crate) fn run_network_phase(
     };
 
     for pid in player_ids {
-        let vision_grid = game.vision_grid_2d(pid);
-        let prev_vision = baselines
-            .prev_vision
-            .get(pid)
-            .cloned()
-            .unwrap_or_default();
+        let vision_grid = game.vision_grid_flat(pid);
+        let prev_vision: Option<&Arc<Vec<bool>>> = baselines.prev_vision.get(pid);
 
         if let Some(delta) = build_delta_inner(
             &baselines.prev_units,
             &baselines.prev_cities,
             &baselines.prev_funds,
-            &prev_vision,
-            &baselines.prev_border,
+            prev_vision,
+            baselines.prev_border.as_ref(),
             &current_units,
             &current_cities,
-            &current_unit_map,
-            &current_city_map,
+            &current_unit_ids,
             &all_funds,
             &vision_grid,
             &border_grid,
+            grid_width,
             pid,
         ) {
-            let encoded = encode_message(&delta);
+            // N5: pre-size the CBOR buffer
+            let delta_ref = match &delta {
+                ServerMessage::DeltaState(d) => d,
+                _ => unreachable!(),
+            };
+            let cap = estimate_delta_size(delta_ref);
+            let encoded = encode_message_with_hint(&delta, cap);
             result.wire_bytes += encoded.len() as u64;
             result.deltas_sent += 1;
             result.encoded.push((pid.clone(), encoded));
         }
 
-        baselines.prev_vision.insert(pid.clone(), vision_grid);
+        // N1: commit Arc refcount bump (no allocation)
+        if let Some(v) = &vision_grid {
+            baselines.prev_vision.insert(pid.clone(), Arc::clone(v));
+        }
     }
 
-    // Commit shared baselines (moves, no extra clones)
-    baselines.prev_units = current_unit_map;
-    baselines.prev_cities = current_city_map;
+    // Commit shared baselines (N2: build map by moving out of Vec — only key Strings cloned)
+    baselines.prev_units = current_units
+        .into_iter()
+        .map(|u| (u.id.clone(), u))
+        .collect();
+    baselines.prev_cities = current_cities
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
     baselines.prev_funds = all_funds;
     baselines.prev_border = border_grid;
 
@@ -541,29 +564,21 @@ mod tests {
         all_funds: &HashMap<String, u32>,
         player_id: &str,
     ) -> Option<ServerMessage> {
-        let current_unit_map: HashMap<String, UnitState> = current_units
-            .iter()
-            .cloned()
-            .map(|u| (u.id.clone(), u))
-            .collect();
-        let current_city_map: HashMap<String, CityState> = current_cities
-            .iter()
-            .cloned()
-            .map(|c| (c.id.clone(), c))
-            .collect();
+        let current_unit_ids: HashSet<&str> =
+            current_units.iter().map(|u| u.id.as_str()).collect();
         build_delta_inner(
             prev_units,
             prev_cities,
             prev_funds,
-            &None,
-            &None,
+            None,
+            None,
             current_units,
             current_cities,
-            &current_unit_map,
-            &current_city_map,
+            &current_unit_ids,
             all_funds,
             &None,
             &None,
+            0,
             player_id,
         )
     }
@@ -689,31 +704,32 @@ mod tests {
         let pu = HashMap::new();
         let pc = HashMap::new();
         let pf = all_funds.clone();
-        let vision = vec![vec![true, false], vec![false, true]];
+        // Flat vision: 2x2 grid, row-major: [T, F, F, T]
+        let vision = Arc::new(vec![true, false, false, true]);
 
-        let current_unit_map: HashMap<String, UnitState> = HashMap::new();
-        let current_city_map: HashMap<String, CityState> = HashMap::new();
-        let none: Option<Vec<Vec<bool>>> = None;
-        let none_border: Option<Vec<Vec<u32>>> = None;
+        let current_unit_ids: HashSet<&str> = HashSet::new();
 
         let msg = build_delta_inner(
             &pu,
             &pc,
             &pf,
-            &None,
-            &None,
+            None,
+            None,
             &[],
             &[],
-            &current_unit_map,
-            &current_city_map,
+            &current_unit_ids,
             &all_funds,
-            &Some(vision.clone()),
-            &none_border,
+            &Some(Arc::clone(&vision)),
+            &None,
+            2,
             "a",
         );
         let d = as_delta(msg);
-        assert_eq!(d.vision_grid_diff, Some(vision));
+        // Wire format is flat Vec<u8>
+        let expected: Vec<u8> = vision.iter().map(|b| *b as u8).collect();
+        assert_eq!(d.vision_grid_diff, Some(expected));
         assert!(d.border_grid_diff.is_none());
+        assert_eq!(d.grid_width, Some(2));
     }
 
     #[test]
@@ -777,46 +793,45 @@ mod tests {
         let pu = HashMap::new();
         let pc = HashMap::new();
         let pf = all_funds.clone();
-        let current_unit_map: HashMap<String, UnitState> = HashMap::new();
-        let current_city_map: HashMap<String, CityState> = HashMap::new();
+        let current_unit_ids: HashSet<&str> = HashSet::new();
 
-        let vision_a = vec![vec![true, false], vec![false, true]];
-        let no_vision: Option<Vec<Vec<bool>>> = None;
-        let no_border: Option<Vec<Vec<u32>>> = None;
+        // Flat vision: 2x2 grid, row-major: [T, F, F, T]
+        let vision_a = Arc::new(vec![true, false, false, true]);
 
-        // Player A: vision changed from empty to Some(vision_a) -> diff present
+        // Player A: vision changed from None to Some(vision_a) -> diff present
         let msg_a = build_delta_inner(
             &pu,
             &pc,
             &pf,
-            &no_vision,
-            &no_border,
+            None,
+            None,
             &[],
             &[],
-            &current_unit_map,
-            &current_city_map,
+            &current_unit_ids,
             &all_funds,
-            &Some(vision_a.clone()),
-            &no_border,
+            &Some(Arc::clone(&vision_a)),
+            &None,
+            2,
             "a",
         );
         let d_a = as_delta(msg_a);
-        assert_eq!(d_a.vision_grid_diff, Some(vision_a.clone()));
+        let expected_a: Vec<u8> = vision_a.iter().map(|b| *b as u8).collect();
+        assert_eq!(d_a.vision_grid_diff, Some(expected_a));
 
         // Player B: vision unchanged (both None) -> no diff
         let msg_b = build_delta_inner(
             &pu,
             &pc,
             &pf,
-            &no_vision,
-            &no_border,
+            None,
+            None,
             &[],
             &[],
-            &current_unit_map,
-            &current_city_map,
+            &current_unit_ids,
             &all_funds,
-            &no_vision,
-            &no_border,
+            &None,
+            &None,
+            2,
             "b",
         );
         assert!(msg_b.is_none());

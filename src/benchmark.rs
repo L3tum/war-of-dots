@@ -567,10 +567,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 .map(|c| (c.id.clone(), c.into()))
                 .collect();
             b.prev_funds = game.all_player_funds();
-            let first_pid = game.players().keys().next().cloned();
-            b.prev_border = first_pid.as_deref().and_then(|pid| game.border_grid_2d(pid));
+            b.prev_border = game.territory_grid_flat();
             for pid in &player_ids {
-                b.prev_vision.insert(pid.clone(), game.vision_grid_2d(pid));
+                if let Some(v) = game.vision_grid_flat(pid) {
+                    b.prev_vision.insert(pid.clone(), v);
+                }
             }
             b
         };
@@ -617,7 +618,6 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             let unit_count = game.unit_count() as u32;
             let movers = game.last_mover_count() as u32;
             let combats = game.last_engaged_pairs() as u32;
-            let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
 
             // Network phase (W1): build + encode per-player deltas, measured as
             // a system via tick_system! so it appears in the per-system P90/P99
@@ -626,6 +626,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 run_network_phase(&game, &mut net_baselines, &player_ids)
             });
             let net_wire_bytes = net_phase.wire_bytes;
+
+            // Capture tick_ms AFTER the network phase so total_ms includes
+            // network time and (total_ms - system_sum_ms) stays non-negative.
+            let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
 
             #[cfg(feature = "bench-alloc")]
             let (td_allocs, td_bytes, td_max) = {
