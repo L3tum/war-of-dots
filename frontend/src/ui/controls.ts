@@ -4,7 +4,14 @@ import { Renderer } from '../game/renderer';
 import { Connection } from '../net/connection';
 import { GameState } from '../game/game_state';
 import { UnitInfoUI } from './unit_info';
-import { CELL_SIZE, UNIT_DOT_SIZE, ZOOM_MIN, ZOOM_MAX, CITY_HIT_RADIUS, PAN_SPEED_MULTIPLIER } from '../game/config';
+import {
+  CELL_SIZE,
+  UNIT_DOT_SIZE,
+  ZOOM_MIN,
+  ZOOM_MAX,
+  CITY_HIT_RADIUS,
+  PAN_SPEED_MULTIPLIER,
+} from '../game/config';
 
 export class Controls {
   private canvas: HTMLCanvasElement;
@@ -123,7 +130,7 @@ export class Controls {
 
     this.onWindowPointerMove = (e: PointerEvent) => {
       // Re-arm pan if pointercancel was received but button is still held
-      if (!this.isDragging && (e.buttons & 2)) {
+      if (!this.isDragging && e.buttons & 2) {
         this.isDragging = true;
         this.rightDragStart = { x: e.clientX, y: e.clientY };
         this.lastPointer = { x: e.clientX, y: e.clientY };

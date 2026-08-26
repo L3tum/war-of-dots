@@ -478,7 +478,7 @@ describe('City dot vertex generation', () => {
     for (const city of cities) {
       const wx = city.position[0] * CELL_SIZE;
       const wy = city.position[1] * CELL_SIZE;
-      const halfSizeWorld = (CITY_DOT_SIZE / 2) / camera.zoom;
+      const halfSizeWorld = CITY_DOT_SIZE / 2 / camera.zoom;
       positions.push(
         wx - halfSizeWorld,
         wy - halfSizeWorld,
@@ -518,7 +518,7 @@ describe('City dot vertex generation', () => {
 
     const wx = 5 * CELL_SIZE; // 160
     const wy = 5 * CELL_SIZE; // 160
-    const halfSizeWorld = (CITY_DOT_SIZE / 2) / 1; // 6
+    const halfSizeWorld = CITY_DOT_SIZE / 2 / 1; // 6
 
     expect(positions[0]).toBe(wx - halfSizeWorld); // 154
     expect(positions[1]).toBe(wy - halfSizeWorld); // 154

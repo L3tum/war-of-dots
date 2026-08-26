@@ -143,13 +143,18 @@ export function marchingSquares(
     ];
     // Deduplicate: at edges/corners, some cells collapse to the same index.
     const seen = new Set<string>();
-    let sumR = 0, sumG = 0, sumB = 0, count = 0;
+    let sumR = 0,
+      sumG = 0,
+      sumB = 0,
+      count = 0;
     for (const [lx, ly] of cells) {
       const key = `${lx},${ly}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const [r, g, b] = cellColor[ly][lx];
-      sumR += r; sumG += g; sumB += b;
+      sumR += r;
+      sumG += g;
+      sumB += b;
       count++;
     }
     return [sumR / count, sumG / count, sumB / count];
@@ -181,18 +186,22 @@ export function marchingSquares(
       const localY = y - expandedStartRow;
 
       // Get the 4 corner colors (TL, TR, BR, BL)
-      let [tlR, tlG, tlB] = cornerColor(localX, localY);           // top-left
-      let [trR, trG, trB] = cornerColor(localX + 1, localY);       // top-right
-      let [brR, brG, brB] = cornerColor(localX + 1, localY + 1);   // bottom-right
-      let [blR, blG, blB] = cornerColor(localX, localY + 1);       // bottom-left
+      let [tlR, tlG, tlB] = cornerColor(localX, localY); // top-left
+      let [trR, trG, trB] = cornerColor(localX + 1, localY); // top-right
+      let [brR, brG, brB] = cornerColor(localX + 1, localY + 1); // bottom-right
+      let [blR, blG, blB] = cornerColor(localX, localY + 1); // bottom-left
 
       // Mountain shading: darken top row, lighten bottom row
       // Only apply if ALL 4 surrounding cells are mountain (or at least the
       // cell itself is mountain) — blend shading when at mountain border.
       if (isMountain(x, y)) {
         // Apply mountain shading to top and bottom corners
-        tlR *= MOUNTAIN_TOP_FACTOR; tlG *= MOUNTAIN_TOP_FACTOR; tlB *= MOUNTAIN_TOP_FACTOR;
-        trR *= MOUNTAIN_TOP_FACTOR; trG *= MOUNTAIN_TOP_FACTOR; trB *= MOUNTAIN_TOP_FACTOR;
+        tlR *= MOUNTAIN_TOP_FACTOR;
+        tlG *= MOUNTAIN_TOP_FACTOR;
+        tlB *= MOUNTAIN_TOP_FACTOR;
+        trR *= MOUNTAIN_TOP_FACTOR;
+        trG *= MOUNTAIN_TOP_FACTOR;
+        trB *= MOUNTAIN_TOP_FACTOR;
         brR = Math.min(255, brR * MOUNTAIN_BOT_FACTOR);
         brG = Math.min(255, brG * MOUNTAIN_BOT_FACTOR);
         brB = Math.min(255, brB * MOUNTAIN_BOT_FACTOR);

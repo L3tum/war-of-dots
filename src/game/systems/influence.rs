@@ -80,7 +80,7 @@ pub struct InfluenceScratch {
     pub city_positions: Vec<(f32, f32)>,
     pub player_influence: Vec<u16>,
     pub territory_max: Vec<u16>,
-    pub vision_pool: HashMap<String, [Arc<Vec<bool>>; 2]>,
+    pub vision_pool: HashMap<String, [Arc<Vec<u8>>; 2]>,
     pub vision_gen: u8,
     pub territory_pool: [Arc<Vec<u8>>; 2],
     pub territory_gen: u8,
@@ -139,7 +139,7 @@ fn add_influence(grid: &mut [u16], idx: usize, delta: u16) {
 #[inline]
 #[allow(clippy::too_many_arguments)] // circle params + 2 output buffers + dims
 fn stamp_circle(
-    vision: &mut [bool],
+    vision: &mut [u8],
     influence: &mut [u16],
     cx: i32,
     cy: i32,
@@ -171,7 +171,7 @@ fn stamp_circle(
         // with a 2-byte RMW in one loop body, which blocked the vectorizer.
         let start = y_off + (lo as usize);
         let end = y_off + (hi as usize) + 1;
-        vision[start..end].fill(true);
+        vision[start..end].fill(1);
         for v in &mut influence[start..end] {
             *v = v.saturating_add(weight);
         }
@@ -198,11 +198,11 @@ fn compute_player(
     w: i32,
     h: i32,
     influence: &mut [u16],
-    vision: &mut [bool],
+    vision: &mut [u8],
 ) {
     let w_usize = w as usize;
 
-    // NOTE: the `vision.fill(false)` / `influence.fill(0)` resets live in the
+    // NOTE: the `vision.fill(0)` / `influence.fill(0)` resets live in the
     // caller (`run`) so they are measured separately from the circle stamping
     // (W3, `influence/p2a_fill` vs `p2_compute`). Callers with fresh buffers
     // (unit tests) pass already-zeroed grids.
@@ -362,7 +362,7 @@ pub fn run(
     }
     terr.fill(NONE);
 
-    let mut updated_vision: HashMap<String, Arc<Vec<bool>>> =
+    let mut updated_vision: HashMap<String, Arc<Vec<u8>>> =
         HashMap::with_capacity(sorted_players.len());
     let vision_gen = scratch.vision_gen as usize;
     let t1 = std::time::Instant::now();
@@ -380,21 +380,21 @@ pub fn run(
             .entry(player_id.clone())
             .or_insert_with(|| {
                 [
-                    Arc::new(vec![false; grid_size]),
-                    Arc::new(vec![false; grid_size]),
+                    Arc::new(vec![0u8; grid_size]),
+                    Arc::new(vec![0u8; grid_size]),
                 ]
             });
         let slot_gen = 1 - vision_gen;
         {
             let slot = Arc::make_mut(&mut pair[slot_gen]);
             if slot.len() != grid_size {
-                slot.resize(grid_size, false);
+                slot.resize(grid_size, 0);
             }
             // W3-①: measure the per-player full-grid clear (1 MB vision +
             // 2 MB influence per player — 12 MB/call at 4 players) separately
             // from the circle stamping to settle the p2_compute split.
             let tf = std::time::Instant::now();
-            slot.fill(false);
+            slot.fill(0);
             scratch.player_influence.fill(0);
             fill_ms += tf.elapsed().as_secs_f64() * 1000.0;
             compute_player(
@@ -511,10 +511,10 @@ mod tests {
         units: &[(f32, f32)],
         cities: &[City],
         terrain: &Arc<Vec<Terrain>>,
-    ) -> (Vec<bool>, Vec<u16>) {
+    ) -> (Vec<u8>, Vec<u16>) {
         let mut city_positions = Vec::new();
         let mut influence = vec![0u16; (W * H) as usize];
-        let mut vision = vec![false; (W * H) as usize];
+        let mut vision = vec![0u8; (W * H) as usize];
         let units: Vec<UnitHandle> = units.iter().map(|&p| unit(p)).collect();
         compute_player(
             &mut city_positions,
@@ -539,17 +539,17 @@ mod tests {
     fn flat_unit_vision_and_influence_shape() {
         let (vision, inf) = compute(&[(20.0, 20.0)], &[], &terrain());
         // Vision = circle r5: dist 3 < 5 → visible
-        assert!(vision[idx(23, 20)]);
+        assert_eq!(vision[idx(23, 20)], 1);
         // dist 4 < 5 → visible (was outside the old r3 square)
-        assert!(vision[idx(24, 20)]);
+        assert_eq!(vision[idx(24, 20)], 1);
         // dist 5 = r5 edge → visible
-        assert!(vision[idx(25, 20)]);
+        assert_eq!(vision[idx(25, 20)], 1);
         // dist 6 > 5 → not visible
-        assert!(!vision[idx(26, 20)]);
+        assert_eq!(vision[idx(26, 20)], 0);
         // (3,3) corner: dist √18 ≈ 4.24 < 5 → visible
-        assert!(vision[idx(23, 23)]);
+        assert_eq!(vision[idx(23, 23)], 1);
         // (4,4) corner: dist √32 ≈ 5.66 > 5 → NOT visible
-        assert!(!vision[idx(24, 24)]);
+        assert_eq!(vision[idx(24, 24)], 0);
         // Influence: same circle, weight 1
         assert_eq!(inf[idx(25, 20)], 1);
         assert_eq!(inf[idx(24, 24)], 0);
@@ -560,11 +560,11 @@ mod tests {
     fn city_vision_and_influence_shape() {
         let (vision, inf) = compute(&[], &[city((20.0, 20.0), "player_0")], &terrain());
         // City circle r7: dist 7 = edge → visible
-        assert!(vision[idx(27, 20)]);
+        assert_eq!(vision[idx(27, 20)], 1);
         // (4,4) corner: dist 5.66 < 7 → visible
-        assert!(vision[idx(24, 24)]);
+        assert_eq!(vision[idx(24, 24)], 1);
         // dist 8 > 7 → not visible
-        assert!(!vision[idx(28, 20)]);
+        assert_eq!(vision[idx(28, 20)], 0);
         // Influence: city weight is 1 (equal to units, per design decision)
         assert_eq!(inf[idx(27, 20)], 1);
         assert_eq!(inf[idx(20, 20)], 1);
@@ -575,13 +575,13 @@ mod tests {
         // Hill at (20,20): circle r10 (5×2) — extends both vision and influence
         let (vision, inf) = compute(&[(20.0, 20.0)], &[], &terrain_with_hills());
         // Vision: dist 6 < 10 → visible
-        assert!(vision[idx(26, 20)]);
+        assert_eq!(vision[idx(26, 20)], 1);
         // (4,4) corner: dist 5.66 < 10 → visible (was not under r5)
-        assert!(vision[idx(24, 24)]);
+        assert_eq!(vision[idx(24, 24)], 1);
         // dist 10 = r10 edge → visible
-        assert!(vision[idx(30, 20)]);
+        assert_eq!(vision[idx(30, 20)], 1);
         // dist 11 > 10 → not visible
-        assert!(!vision[idx(31, 20)]);
+        assert_eq!(vision[idx(31, 20)], 0);
         // Influence: also r10 now
         assert_eq!(inf[idx(26, 20)], 1); // was 0 under r5
         assert_eq!(inf[idx(24, 24)], 1); // was 0 under r5 (dist 5.66 < 10)
@@ -639,7 +639,7 @@ mod tests {
         };
         // Sanity: the dirty run actually produced non-empty vision and a
         // non-trivial territory grid (a unit's r5 circle is not all NONE).
-        assert!(vision_snapshot["player_0"].iter().any(|&v| v));
+        assert!(vision_snapshot["player_0"].iter().any(|&v| v != 0));
         assert!(world
             .world_data(world_entity)
             .unwrap()
@@ -819,7 +819,7 @@ mod tests {
                 let dx = x;
                 let dy = y;
                 let expected = (dx * dx + dy * dy) <= r * r;
-                assert_eq!(vision[idx(x, y)], expected, "cell ({x},{y})");
+                assert_eq!(vision[idx(x, y)], expected as u8, "cell ({x},{y})");
             }
         }
     }
@@ -875,7 +875,7 @@ mod tests {
         // Warmup (allocation + page faults).
         for _ in 0..2 {
             let mut inf = vec![0u16; n];
-            let mut vis = vec![false; n];
+            let mut vis = vec![0u8; n];
             compute_player(
                 &mut city_positions,
                 &terrain,
@@ -895,7 +895,7 @@ mod tests {
         let mut samples = Vec::new();
         for _ in 0..iters {
             let mut inf = vec![0u16; n];
-            let mut vis = vec![false; n];
+            let mut vis = vec![0u8; n];
             let t0 = std::time::Instant::now();
             compute_player(
                 &mut city_positions,

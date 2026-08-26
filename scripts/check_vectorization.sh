@@ -143,13 +143,14 @@ if [[ ! -s "$TMP" ]]; then
     exit 2
 fi
 
-# The ONE verified wide-register (AVX2) auto-vectorization canary. If this loses
-# its vector math, the build fell back below x86-64-v3 (a real regression).
-EXPECT_VECTOR=( 'GridIndex::build' )
-# Expected-scalar (reported, never fails). NOTE: union_vision_grids was initially
-# in EXPECT_VECTOR, but the first real run proved it does NOT wide-vectorize — its
-# element type is `bool` (1-bit in MIR), which LLVM won't vectorize. Moved here so
-# the script reflects reality instead of asserting an unverified hypothesis.
+# The verified wide-register (AVX2) auto-vectorization canaries. If any of
+# these lose their vector math, the build fell back below x86-64-v3 (a real
+# regression).
+EXPECT_VECTOR=( 'GridIndex::build' 'Game::union_vision_grid_flat' )
+# Expected-scalar (reported, never fails). NOTE: union_vision_grids was
+# initially in EXPECT_VECTOR, but it did NOT wide-vectorize when its element
+# type was `bool` (1-bit in MIR). Now that it uses `u8` internally it may
+# vectorize, but is kept here until a release-build check confirms it.
 REPORT_ONLY=( 'Game::union_vision_grids' 'spatial::for_each_within' 'movement::run' 'influence::run' )
 
 # Strict tripwire: a wide-register (ymm/zmm) vector *arithmetic* op on the line.

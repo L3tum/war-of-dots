@@ -29,8 +29,6 @@ import {
   ZOOM_MAX,
 } from './config';
 
-
-
 export class Renderer {
   private canvas: HTMLCanvasElement;
   private device: GPUDevice;
@@ -1061,7 +1059,7 @@ export class Renderer {
         // Send WORLD-SPACE positions; shader applies camera + zoom + NDC
         const wx = unit.position.x * CELL_SIZE;
         const wy = unit.position.y * CELL_SIZE;
-        const halfSizeWorld = (UNIT_DOT_SIZE / 2) / this.camera.zoom;
+        const halfSizeWorld = UNIT_DOT_SIZE / 2 / this.camera.zoom;
         unitPositions.push(
           wx - halfSizeWorld,
           wy - halfSizeWorld,
@@ -1295,27 +1293,9 @@ export class Renderer {
           const wx = edge.gridX * CELL_SIZE;
           const wy = (edge.gridY + 1) * CELL_SIZE;
           // Quad A (ownerA) — upper half, [wy - lw, wy]
-          borderPositions.push(
-            wx,
-            wy - lw,
-            wx + CELL_SIZE,
-            wy - lw,
-            wx + CELL_SIZE,
-            wy,
-            wx,
-            wy,
-          );
+          borderPositions.push(wx, wy - lw, wx + CELL_SIZE, wy - lw, wx + CELL_SIZE, wy, wx, wy);
           // Quad B (ownerB) — lower half, [wy, wy + lw]
-          borderPositions.push(
-            wx,
-            wy,
-            wx + CELL_SIZE,
-            wy,
-            wx + CELL_SIZE,
-            wy + lw,
-            wx,
-            wy + lw,
-          );
+          borderPositions.push(wx, wy, wx + CELL_SIZE, wy, wx + CELL_SIZE, wy + lw, wx, wy + lw);
         } else {
           // Vertical border between cols (gridX) and (gridX+1). ownerA is the left cell.
           const wx = (edge.gridX + 1) * CELL_SIZE;
@@ -1324,16 +1304,7 @@ export class Renderer {
           const xa = wx - lw;
           borderPositions.push(xa, wy, wx, wy, wx, wy + CELL_SIZE, xa, wy + CELL_SIZE);
           // Quad B (ownerB) — right half, [wx, wx + lw]
-          borderPositions.push(
-            wx,
-            wy,
-            wx + lw,
-            wy,
-            wx + lw,
-            wy + CELL_SIZE,
-            wx,
-            wy + CELL_SIZE,
-          );
+          borderPositions.push(wx, wy, wx + lw, wy, wx + lw, wy + CELL_SIZE, wx, wy + CELL_SIZE);
         }
         for (let i = 0; i < 4; i++) borderColors.push(cA.r, cA.g, cA.b);
         for (let i = 0; i < 4; i++) borderColors.push(cB.r, cB.g, cB.b);
@@ -1405,7 +1376,7 @@ export class Renderer {
         if (city.owner === gameState.ownPlayerId) {
           dotSize *= 1.5;
         }
-        const halfSizeWorld = (dotSize / 2) / this.camera.zoom;
+        const halfSizeWorld = dotSize / 2 / this.camera.zoom;
         cityPositions.push(
           wx - halfSizeWorld,
           wy - halfSizeWorld,
@@ -1467,12 +1438,20 @@ export class Renderer {
         };
         for (const unit of gameState.units.values()) {
           if (unit.owner === ownId) {
-            pushOutline(unit.position.x * CELL_SIZE, unit.position.y * CELL_SIZE, UNIT_DOT_SIZE / 2);
+            pushOutline(
+              unit.position.x * CELL_SIZE,
+              unit.position.y * CELL_SIZE,
+              UNIT_DOT_SIZE / 2,
+            );
           }
         }
         for (const [, city] of gameState.cities) {
           if (city.owner === ownId) {
-            pushOutline(city.position[0] * CELL_SIZE, city.position[1] * CELL_SIZE, CITY_DOT_SIZE / 2);
+            pushOutline(
+              city.position[0] * CELL_SIZE,
+              city.position[1] * CELL_SIZE,
+              CITY_DOT_SIZE / 2,
+            );
           }
         }
       }

@@ -24,8 +24,8 @@ use crate::map::map::Map;
 use crate::map::map_config::load_default_map;
 use crate::map::map_registry;
 use crate::replay::replay::ReplayEvent;
-use crate::server::lobby::LobbyManager;
 use crate::server::delta::{run_network_phase, NetworkBaselines, NetworkPhaseResult};
+use crate::server::lobby::LobbyManager;
 use crate::server::protocol::{
     decode_client_message, encode_message, CityState, ClientMessage, GameStateMessage,
     LobbyMessage, LobbySettings, PlayerState, ServerMessage, UnitState,
@@ -37,7 +37,7 @@ pub use crate::server::room::{
 };
 
 // Re-export delta functions
-use crate::server::delta::{build_delta_inner, build_llm_state};
+use crate::server::delta::{build_delta_inner, build_llm_state, compute_shared_deltas};
 
 static FRONTEND: Dir = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -192,7 +192,8 @@ impl GameRoom {
                 .map(|c| (c.id.clone(), c.position))
                 .collect();
             for (i, player_id) in controlled_player_ids.iter().enumerate() {
-                if let Some((city_id, (cx, cy))) = cities_snapshot.get(i)
+                if let Some((city_id, (cx, cy))) = cities_snapshot
+                    .get(i)
                     .and_then(|id| cities_with_pos.iter().find(|(cid, _)| cid == id))
                     .cloned()
                 {
@@ -553,7 +554,7 @@ impl GameRoom {
 
                         // Snapshot game state once per tick, shared by the
                         // active-player check and the per-player delta build.
-                        let current_units = game.unit_states();
+                        let current_units = game.unit_states_direct();
                         let current_cities: Vec<CityState> =
                             game.query_cities().iter().map(|c| c.into()).collect();
 
@@ -653,38 +654,43 @@ impl GameRoom {
                             })
                             .collect();
                         let phase: NetworkPhaseResult =
-                            run_network_phase(&game, &mut baselines, &regular_pids);
+                            run_network_phase(&game, &mut baselines, &regular_pids, &current_units, &current_cities);
                         let mut send_map: HashMap<String, Vec<u8>> = phase.encoded.into_iter().collect();
 
                         // Spectators get the union vision grid (handled separately
                         // since their vision differs from per-player vision).
                         if spectator_vision {
                             let all_pids: Vec<String> = game.players().keys().cloned().collect();
-                            let spec_vision: Option<Arc<Vec<bool>>> =
+                            let spec_vision: Option<Arc<Vec<u8>>> =
                                 game.union_vision_grid_flat(&all_pids).map(Arc::new);
                             let spec_border: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
                             let spec_pid = String::new();
-                            let prev_spec_vision: Option<&Arc<Vec<bool>>> =
+                            let prev_spec_vision: Option<&Arc<Vec<u8>>> =
                                 baselines.prev_vision.get(&spec_pid);
                             let cur_unit_ids: HashSet<&str> =
                                 current_units.iter().map(|u| u.id.as_str()).collect();
                             let all_funds = game.all_player_funds();
                             let grid_width = game.terrain_width();
 
-                            if let Some(delta) = build_delta_inner(
+                            let shared = compute_shared_deltas(
                                 &baselines.prev_units,
                                 &baselines.prev_cities,
-                                &baselines.prev_funds,
-                                prev_spec_vision,
-                                baselines.prev_border.as_ref(),
                                 &current_units,
                                 &current_cities,
                                 &cur_unit_ids,
+                                baselines.prev_border.as_ref(),
+                                &spec_border,
+                            );
+                            if let Some(delta) = build_delta_inner(
+                                &baselines.prev_units,
+                                &baselines.prev_funds,
+                                prev_spec_vision,
+                                &current_units,
                                 &all_funds,
                                 &spec_vision,
-                                &spec_border,
                                 grid_width,
                                 &spec_pid,
+                                &shared,
                             ) {
                                 send_map.insert(spec_pid.clone(), encode_message(&delta));
                             }
@@ -1271,7 +1277,7 @@ pub(crate) async fn handle_replay_ws(
                 })
                 .collect();
             let mut prev_funds = replay_player.all_player_funds().clone();
-            let mut prev_vision_grid: Option<Arc<Vec<bool>>> = None;
+            let mut prev_vision_grid: Option<Arc<Vec<u8>>> = None;
             let mut prev_border_grid: Option<Arc<Vec<u8>>> = None;
             let grid_width = replay_player.game.terrain_width();
 
@@ -1283,18 +1289,12 @@ pub(crate) async fn handle_replay_ws(
             for event in events {
                 replay_player.apply_event(&event);
                 // Flat grids (no 2-D allocation in replay path either)
-                let all_pids: Vec<String> = replay_player
-                    .game
-                    .players()
-                    .keys()
-                    .cloned()
-                    .collect();
-                let current_vision: Option<Arc<Vec<bool>>> = replay_player
+                let all_pids: Vec<String> = replay_player.game.players().keys().cloned().collect();
+                let current_vision: Option<Arc<Vec<u8>>> = replay_player
                     .game
                     .union_vision_grid_flat(&all_pids)
                     .map(Arc::new);
-                let current_border: Option<Arc<Vec<u8>>> =
-                    replay_player.game.territory_grid_flat();
+                let current_border: Option<Arc<Vec<u8>>> = replay_player.game.territory_grid_flat();
                 let current_units = replay_player.game.unit_states();
                 let current_cities: Vec<CityState> = replay_player
                     .game
@@ -1305,20 +1305,25 @@ pub(crate) async fn handle_replay_ws(
                 let all_funds = replay_player.game.all_player_funds();
                 let current_unit_ids: HashSet<&str> =
                     current_units.iter().map(|u| u.id.as_str()).collect();
-                if let Some(delta) = build_delta_inner(
+                let shared = compute_shared_deltas(
                     &prev_units,
                     &prev_cities,
-                    &prev_funds,
-                    prev_vision_grid.as_ref(),
-                    prev_border_grid.as_ref(),
                     &current_units,
                     &current_cities,
                     &current_unit_ids,
+                    prev_border_grid.as_ref(),
+                    &current_border,
+                );
+                if let Some(delta) = build_delta_inner(
+                    &prev_units,
+                    &prev_funds,
+                    prev_vision_grid.as_ref(),
+                    &current_units,
                     &all_funds,
                     &current_vision,
-                    &current_border,
                     grid_width,
                     "",
+                    &shared,
                 ) {
                     // Commit the prev state only on non-idle delta
                     prev_units = current_units

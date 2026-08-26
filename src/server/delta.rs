@@ -9,6 +9,15 @@
 //! matches, the unit is assumed unchanged. This reduces allocation pressure
 //! significantly at scale (100+ units).
 //!
+//! ## Parallelism Decision
+//! Rayon was previously trialed for per-player parallel delta computation but
+//! was **removed** because its thread-pool dispatch overhead (~30–50 µs per
+//! task) negated the gains on the small per-player work items (≈0.2 ms
+//! normal / ≈0.5 ms grid-change).  The encirclement flood A/B showed a 10 %
+//! regression in the micro-bench and +18 % on the real-game p2_bfs path,
+//! while allocs jumped 21 → 89/call.  Any future parallelization here must
+//! be preceded by its own dedicated A/B benchmark.
+
 //! ## Future Optimization (see TODO_PHASE2_NOTES.md)
 //! - Use `Arc` for grid data to enable cheap CoW cloning
 //! - Parallelize per-player delta computation (NOTE: rayon was trialed and
@@ -24,6 +33,21 @@ use crate::server::protocol::{
     encode_message_with_hint, estimate_delta_size, CityState, CityUpdate, GameDeltaMessage,
     PlayerState, ServerMessage, UnitState, UnitUpdate,
 };
+
+/// Quantization step for the `men` field in the unit digest.
+///
+/// The per-tick men drain is `1/600 ≈ 0.0017` (up to `10/600 ≈ 0.017` under
+/// severe supply stress), far below 1.0. Quantizing to whole soldiers keeps a
+/// healthy unit's digest stable across ~60–600 ticks, so sub-threshold
+/// oscillation no longer emits a `UnitUpdate` every tick. When an update IS
+/// emitted, the wire carries the exact `u.men`, not the quantized value, so no
+/// visible information is lost.
+const QUANT_MEN: f32 = 1.0;
+
+/// Quantization step for the `organisation` field in the unit digest (same
+/// rationale as `QUANT_MEN`: organisation recovers slowly, so whole-point
+/// quantization keeps the digest stable between visible changes).
+const QUANT_ORG: f32 = 1.0;
 
 /// Lightweight digest of a UnitState used for change detection.
 /// Comparing two digests is O(1) with no heap allocation, whereas comparing
@@ -55,9 +79,9 @@ impl UnitStateDigest {
     fn from_unit(u: &UnitState) -> Self {
         Self {
             position: u.position,
-            men: u.men,
+            men: (u.men / QUANT_MEN).round() * QUANT_MEN,
             max_men: u.max_men,
-            organisation: u.organisation,
+            organisation: (u.organisation / QUANT_ORG).round() * QUANT_ORG,
             equipment_count: u.equipment.iter().map(|e| e.count as u64).sum(),
             max_equipment_count: u.max_equipment.iter().map(|e| e.count as u64).sum(),
             path_len: u.path.len(),
@@ -74,91 +98,68 @@ impl UnitStateDigest {
     }
 }
 
-/// Build a delta message comparing current game state to previous snapshots.
-///
-/// Grids are passed as flat `Arc` slices (N1): the fast path is an O(1)
-/// `Arc::ptr_eq` check; a full `slice == slice` comparison only runs when the
-/// pointer differs. The 2-D `Vec<Vec<_>>` wire format is no longer used —
-/// the protocol now carries flat `Vec<u8>` (N6).
-///
-/// `current_unit_ids` (N2) is a `HashSet<&str>` of live unit IDs, used only
-/// for the removed-units check. The full `UnitState` values are never read
-/// from this set.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_delta_inner(
+/// Player-independent delta components computed once per tick.
+pub(crate) struct SharedDeltas {
+    pub border_grid_diff: Option<Arc<Vec<u8>>>,
+    pub units_added: Arc<Vec<UnitState>>,
+    pub units_removed: Arc<Vec<String>>,
+    pub unit_updates: Arc<Vec<UnitUpdate>>,
+    pub city_updates: Arc<Vec<CityUpdate>>,
+}
+
+/// Compute the player-independent portions of the per-player delta.
+/// Called once per tick, not once per player.
+pub(crate) fn compute_shared_deltas(
     prev_units: &HashMap<String, UnitState>,
     prev_cities: &HashMap<String, CityState>,
-    prev_funds: &HashMap<String, u32>,
-    prev_vision_grid: Option<&Arc<Vec<bool>>>,
-    prev_border_grid: Option<&Arc<Vec<u8>>>,
     current_units: &[UnitState],
     current_cities: &[CityState],
     current_unit_ids: &HashSet<&str>,
-    all_player_funds: &HashMap<String, u32>,
-    current_vision_grid: &Option<Arc<Vec<bool>>>,
+    prev_border_grid: Option<&Arc<Vec<u8>>>,
     current_border_grid: &Option<Arc<Vec<u8>>>,
-    grid_width: u32,
-    player_id: &str,
-) -> Option<ServerMessage> {
-    // Grid delta (N1): Arc::ptr_eq fast path, then flat slice equality.
-    // When changed, emit a flat `Vec<u8>` for the wire (N6).
-    let vision_grid_diff: Option<Vec<u8>> = match (prev_vision_grid, current_vision_grid) {
+) -> SharedDeltas {
+    // Border grid diff (shared across all players)
+    let border_grid_diff: Option<Arc<Vec<u8>>> = match (prev_border_grid, current_border_grid) {
         (Some(prev), Some(curr)) => {
             if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
                 None
             } else {
-                Some(curr.iter().map(|b| *b as u8).collect())
+                Some(Arc::new(curr.as_slice().to_vec()))
             }
         }
-        (None, Some(curr)) => Some(curr.iter().map(|b| *b as u8).collect()),
+        (None, Some(curr)) => Some(Arc::new(curr.as_slice().to_vec())),
         _ => None,
-    };
-
-    let border_grid_diff: Option<Vec<u8>> = match (prev_border_grid, current_border_grid) {
-        (Some(prev), Some(curr)) => {
-            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
-                None
-            } else {
-                Some(curr.as_slice().to_vec())
-            }
-        }
-        (None, Some(curr)) => Some(curr.as_slice().to_vec()),
-        _ => None,
-    };
-
-    let grid_width_out = if vision_grid_diff.is_some() || border_grid_diff.is_some() {
-        Some(grid_width)
-    } else {
-        None
     };
 
     // Units added (new)
-    let units_added: Vec<UnitState> = current_units
-        .iter()
-        .filter(|u| !prev_units.contains_key(&u.id))
-        .cloned()
-        .collect();
+    let units_added: Arc<Vec<UnitState>> = Arc::new(
+        current_units
+            .iter()
+            .filter(|u| !prev_units.contains_key(&u.id))
+            .cloned()
+            .collect(),
+    );
 
     // Units removed (no longer in game) — N2: check against HashSet<&str>
-    let units_removed: Vec<String> = prev_units
-        .keys()
-        .filter(|id| !current_unit_ids.contains(id.as_str()))
-        .cloned()
-        .collect();
+    let units_removed: Arc<Vec<String>> = Arc::new(
+        prev_units
+            .keys()
+            .filter(|id| !current_unit_ids.contains(id.as_str()))
+            .cloned()
+            .collect(),
+    );
 
     // Units updated (position, stats, equipment changed)
     // Use digest-based comparison to avoid cloning full UnitState structs
     let mut unit_updates: Vec<UnitUpdate> = Vec::new();
     for u in current_units.iter() {
         if let Some(prev) = prev_units.get(&u.id) {
-            // Fast path: compare lightweight digests first
             let curr_digest = UnitStateDigest::from_unit(u);
             let prev_digest = UnitStateDigest::from_unit(prev);
             if curr_digest == prev_digest {
-                continue; // No changes detected, skip full comparison
+                continue;
             }
 
-            // Slow path: digest differed, do field-by-field comparison
             let new_pos = if u.position != prev.position {
                 Some(u.position)
             } else {
@@ -253,17 +254,10 @@ pub(crate) fn build_delta_inner(
     let mut city_updates: Vec<CityUpdate> = Vec::new();
     for city in current_cities.iter() {
         if let Some(prev) = prev_cities.get(&city.id) {
-            let mut changed = false;
             let owner_changed = city.owner != prev.owner;
-            if owner_changed {
-                changed = true;
-            }
             let level_changed = city.level != prev.level;
-            if level_changed {
-                changed = true;
-            }
 
-            if changed {
+            if owner_changed || level_changed {
                 city_updates.push(CityUpdate {
                     id: city.id.clone(),
                     owner: if owner_changed {
@@ -282,7 +276,51 @@ pub(crate) fn build_delta_inner(
         }
     }
 
-    // E-4: Use per-player funds instead of sum of all players
+    SharedDeltas {
+        border_grid_diff,
+        units_added,
+        units_removed,
+        unit_updates: Arc::new(unit_updates),
+        city_updates: Arc::new(city_updates),
+    }
+}
+
+/// Build a per-player delta message using pre-computed shared deltas.
+///
+/// The shared (player-independent) portions are computed once per tick via
+/// `compute_shared_deltas`. This function handles the per-player vision diff,
+/// player state, idle-skip check, and final message assembly.
+pub(crate) fn build_delta_inner(
+    prev_units: &HashMap<String, UnitState>,
+    prev_funds: &HashMap<String, u32>,
+    prev_vision_grid: Option<&Arc<Vec<u8>>>,
+    current_units: &[UnitState],
+    all_player_funds: &HashMap<String, u32>,
+    current_vision_grid: &Option<Arc<Vec<u8>>>,
+    grid_width: u32,
+    player_id: &str,
+    shared: &SharedDeltas,
+) -> Option<ServerMessage> {
+    // Per-player vision grid diff
+    let vision_grid_diff: Option<Vec<u8>> = match (prev_vision_grid, current_vision_grid) {
+        (Some(prev), Some(curr)) => {
+            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
+                None
+            } else {
+                Some(curr.as_slice().to_vec())
+            }
+        }
+        (None, Some(curr)) => Some(curr.as_slice().to_vec()),
+        _ => None,
+    };
+
+    let grid_width_out = if vision_grid_diff.is_some() || shared.border_grid_diff.is_some() {
+        Some(grid_width)
+    } else {
+        None
+    };
+
+    // Per-player state
     let player_funds: u32 = all_player_funds.get(player_id).copied().unwrap_or(0);
     let units_owned: u32 = current_units
         .iter()
@@ -294,16 +332,15 @@ pub(crate) fn build_delta_inner(
         player_id: player_id.to_string(),
     };
 
-    // Idle skip: if nothing this player sees changed, do not update the prev
-    // snapshots and return None so the caller skips encoding + sending.
+    // Idle skip: must check BOTH shared and per-player changes
     let funds_changed = prev_funds.get(player_id).copied() != Some(player_state.funds);
     let prev_owned: u32 = prev_units.values().filter(|u| u.owner == player_id).count() as u32;
-    if units_added.is_empty()
-        && units_removed.is_empty()
-        && unit_updates.is_empty()
-        && city_updates.is_empty()
+    if shared.units_added.is_empty()
+        && shared.units_removed.is_empty()
+        && shared.unit_updates.is_empty()
+        && shared.city_updates.is_empty()
+        && shared.border_grid_diff.is_none()
         && vision_grid_diff.is_none()
-        && border_grid_diff.is_none()
         && !funds_changed
         && prev_owned == player_state.units_owned
     {
@@ -312,12 +349,12 @@ pub(crate) fn build_delta_inner(
 
     let delta = GameDeltaMessage {
         vision_grid_diff,
-        border_grid_diff,
+        border_grid_diff: shared.border_grid_diff.clone(),
         grid_width: grid_width_out,
-        units_added,
-        units_removed,
-        unit_updates,
-        city_updates,
+        units_added: shared.units_added.clone(),
+        units_removed: shared.units_removed.clone(),
+        unit_updates: shared.unit_updates.clone(),
+        city_updates: shared.city_updates.clone(),
         player: player_state,
     };
 
@@ -331,7 +368,7 @@ pub(crate) struct NetworkBaselines {
     pub prev_units: HashMap<String, UnitState>,
     pub prev_cities: HashMap<String, CityState>,
     pub prev_funds: HashMap<String, u32>,
-    pub prev_vision: HashMap<String, Arc<Vec<bool>>>,
+    pub prev_vision: HashMap<String, Arc<Vec<u8>>>,
     pub prev_border: Option<Arc<Vec<u8>>>,
 }
 
@@ -361,14 +398,11 @@ pub(crate) fn run_network_phase(
     game: &Game,
     baselines: &mut NetworkBaselines,
     player_ids: &[String],
+    current_units: &[UnitState],
+    current_cities: &[CityState],
 ) -> NetworkPhaseResult {
-    // N4: single-pass unit snapshot (no intermediate UnitQueryData)
-    let current_units = game.unit_states_direct();
-    let current_cities: Vec<CityState> =
-        game.query_cities().iter().map(|c| c.into()).collect();
     // N2: borrowed ID set for removed-units check (no deep clones)
-    let current_unit_ids: HashSet<&str> =
-        current_units.iter().map(|u| u.id.as_str()).collect();
+    let current_unit_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
     let all_funds = game.all_player_funds();
     // N1: flat Arc grids (no 2-D allocation)
     let border_grid: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
@@ -380,24 +414,31 @@ pub(crate) fn run_network_phase(
         encoded: Vec::new(),
     };
 
+    // W-2: compute player-independent deltas once per tick, not once per player.
+    let shared = compute_shared_deltas(
+        &baselines.prev_units,
+        &baselines.prev_cities,
+        current_units,
+        current_cities,
+        &current_unit_ids,
+        baselines.prev_border.as_ref(),
+        &border_grid,
+    );
+
     for pid in player_ids {
         let vision_grid = game.vision_grid_flat(pid);
-        let prev_vision: Option<&Arc<Vec<bool>>> = baselines.prev_vision.get(pid);
+        let prev_vision: Option<&Arc<Vec<u8>>> = baselines.prev_vision.get(pid);
 
         if let Some(delta) = build_delta_inner(
             &baselines.prev_units,
-            &baselines.prev_cities,
             &baselines.prev_funds,
             prev_vision,
-            baselines.prev_border.as_ref(),
-            &current_units,
-            &current_cities,
-            &current_unit_ids,
+            current_units,
             &all_funds,
             &vision_grid,
-            &border_grid,
             grid_width,
             pid,
+            &shared,
         ) {
             // N5: pre-size the CBOR buffer
             let delta_ref = match &delta {
@@ -417,14 +458,18 @@ pub(crate) fn run_network_phase(
         }
     }
 
-    // Commit shared baselines (N2: build map by moving out of Vec — only key Strings cloned)
+    // Commit shared baselines. `current_units` / `current_cities` are borrowed
+    // from the caller (W-1: the snapshot is now built once upstream and shared
+    // with the active-player check), so the baseline maps are built by cloning
+    // each element out of the slice. This is the single full unit snapshot per
+    // tick — the previous implementation built a *second* one here.
     baselines.prev_units = current_units
-        .into_iter()
-        .map(|u| (u.id.clone(), u))
+        .iter()
+        .map(|u| (u.id.clone(), u.clone()))
         .collect();
     baselines.prev_cities = current_cities
-        .into_iter()
-        .map(|c| (c.id.clone(), c))
+        .iter()
+        .map(|c| (c.id.clone(), c.clone()))
         .collect();
     baselines.prev_funds = all_funds;
     baselines.prev_border = border_grid;
@@ -564,22 +609,26 @@ mod tests {
         all_funds: &HashMap<String, u32>,
         player_id: &str,
     ) -> Option<ServerMessage> {
-        let current_unit_ids: HashSet<&str> =
-            current_units.iter().map(|u| u.id.as_str()).collect();
-        build_delta_inner(
+        let current_unit_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
             prev_units,
             prev_cities,
-            prev_funds,
-            None,
-            None,
             current_units,
             current_cities,
             &current_unit_ids,
-            all_funds,
+            None,
             &None,
+        );
+        build_delta_inner(
+            prev_units,
+            prev_funds,
+            None,
+            current_units,
+            all_funds,
             &None,
             0,
             player_id,
+            &shared,
         )
     }
 
@@ -683,15 +732,7 @@ mod tests {
             .collect();
         let pf = all_funds.clone();
 
-        let msg = run(
-            &pu,
-            &pc,
-            &pf,
-            &[],
-            &curr_cities,
-            &all_funds,
-            "a",
-        );
+        let msg = run(&pu, &pc, &pf, &[], &curr_cities, &all_funds, "a");
         let d = as_delta(msg);
         assert_eq!(d.city_updates.len(), 1);
         assert_eq!(d.city_updates[0].id, "c1");
@@ -704,29 +745,26 @@ mod tests {
         let pu = HashMap::new();
         let pc = HashMap::new();
         let pf = all_funds.clone();
-        // Flat vision: 2x2 grid, row-major: [T, F, F, T]
-        let vision = Arc::new(vec![true, false, false, true]);
+        // Flat vision: 2x2 grid, row-major: [1, 0, 0, 1]
+        let vision = Arc::new(vec![1u8, 0, 0, 1]);
 
         let current_unit_ids: HashSet<&str> = HashSet::new();
 
+        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None);
         let msg = build_delta_inner(
             &pu,
-            &pc,
             &pf,
             None,
-            None,
             &[],
-            &[],
-            &current_unit_ids,
             &all_funds,
             &Some(Arc::clone(&vision)),
-            &None,
             2,
             "a",
+            &shared,
         );
         let d = as_delta(msg);
         // Wire format is flat Vec<u8>
-        let expected: Vec<u8> = vision.iter().map(|b| *b as u8).collect();
+        let expected: Vec<u8> = vision.as_slice().to_vec();
         assert_eq!(d.vision_grid_diff, Some(expected));
         assert!(d.border_grid_diff.is_none());
         assert_eq!(d.grid_width, Some(2));
@@ -795,45 +833,145 @@ mod tests {
         let pf = all_funds.clone();
         let current_unit_ids: HashSet<&str> = HashSet::new();
 
-        // Flat vision: 2x2 grid, row-major: [T, F, F, T]
-        let vision_a = Arc::new(vec![true, false, false, true]);
+        // Flat vision: 2x2 grid, row-major: [1, 0, 0, 1]
+        let vision_a = Arc::new(vec![1u8, 0, 0, 1]);
+
+        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None);
 
         // Player A: vision changed from None to Some(vision_a) -> diff present
         let msg_a = build_delta_inner(
             &pu,
-            &pc,
             &pf,
             None,
-            None,
             &[],
-            &[],
-            &current_unit_ids,
             &all_funds,
             &Some(Arc::clone(&vision_a)),
-            &None,
             2,
             "a",
+            &shared,
         );
         let d_a = as_delta(msg_a);
-        let expected_a: Vec<u8> = vision_a.iter().map(|b| *b as u8).collect();
+        let expected_a: Vec<u8> = vision_a.as_slice().to_vec();
         assert_eq!(d_a.vision_grid_diff, Some(expected_a));
 
         // Player B: vision unchanged (both None) -> no diff
-        let msg_b = build_delta_inner(
-            &pu,
-            &pc,
-            &pf,
-            None,
-            None,
-            &[],
+        let msg_b = build_delta_inner(&pu, &pf, None, &[], &all_funds, &None, 2, "b", &shared);
+        assert!(msg_b.is_none());
+    }
+
+    #[test]
+    fn digest_quantized_men_equal_within_step() {
+        // men differs by 0.3, which is less than QUANT_MEN (1.0)
+        // so the quantized digests should be equal → no update emitted.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.men = 50.0;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.men = 50.3; // only 0.3 difference — within one quantization step
+
+        let all_funds = funds("a", 10);
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let pf = all_funds.clone();
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
             &[],
             &current_unit_ids,
-            &all_funds,
+            None,
             &None,
-            &None,
-            2,
-            "b",
         );
-        assert!(msg_b.is_none());
+
+        // Since the quantized digests are equal, no unit_updates should be produced
+        assert!(shared.unit_updates.is_empty());
+    }
+
+    #[test]
+    fn digest_quantized_men_differs_across_step() {
+        // men differs by 1.0, which equals QUANT_MEN → digests differ → update emitted.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.men = 50.0;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.men = 51.0; // exactly 1.0 difference
+
+        let all_funds = funds("a", 10);
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let pf = all_funds.clone();
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        // Digests differ → one unit update should be produced
+        assert_eq!(shared.unit_updates.len(), 1);
+        assert_eq!(shared.unit_updates[0].id, "u1");
+        // The update carries the exact (unquantized) value
+        assert_eq!(shared.unit_updates[0].men, Some(51.0));
+    }
+
+    #[test]
+    fn digest_quantized_org_equal_within_step() {
+        // organisation differs by 0.3, within one quantization step
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.organisation = 80.0;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.organisation = 80.3;
+
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        assert!(shared.unit_updates.is_empty());
+    }
+
+    #[test]
+    fn digest_quantized_org_differs_across_step() {
+        // organisation differs by 1.0 → digests differ → update emitted
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.organisation = 80.0;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.organisation = 81.0;
+
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        assert_eq!(shared.unit_updates.len(), 1);
+        assert_eq!(shared.unit_updates[0].id, "u1");
+        assert_eq!(shared.unit_updates[0].organisation, Some(81.0));
     }
 }

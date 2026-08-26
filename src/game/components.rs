@@ -141,13 +141,16 @@ impl TerrainGrid {
 }
 
 /// Per-player vision grids.
-/// Stored as flat 1D Vec<T> indexed as [y * width + x] for cache efficiency.
-/// The inner grid is wrapped in `Arc<Vec<bool>>` so influence::run can publish
+/// Stored as flat 1D Vec<u8> indexed as [y * width + x] for cache efficiency.
+/// Values are 0 (not visible) or 1 (visible).
+/// The inner grid is wrapped in `Arc<Vec<u8>>` so influence::run can publish
 /// a reused double-buffered slot by cheap Arc refcount bump instead of cloning
 /// the ~1 MB grid per dirty tick. Readers index through Arc's Deref unchanged.
+/// Using `u8` instead of `bool` enables SIMD-friendly vectorized comparison
+/// and branchless OR operations (SIMD_ROADMAP §W5).
 #[derive(Debug, Clone)]
 pub struct VisionGrids {
-    pub grids: Arc<HashMap<String, Arc<Vec<bool>>>>,
+    pub grids: Arc<HashMap<String, Arc<Vec<u8>>>>,
 }
 impl Default for VisionGrids {
     fn default() -> Self {

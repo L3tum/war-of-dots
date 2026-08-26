@@ -20,9 +20,10 @@ use crate::config::CityUpgradeSettings;
 use crate::game::economy::UnitType;
 use crate::game::game::{Game, GameSettings, InfluenceSettings};
 use crate::map::map::{Map, MapConfig};
-use crate::server::delta::{run_network_phase, NetworkBaselines};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
+use crate::server::delta::{run_network_phase, NetworkBaselines};
+use crate::server::protocol::CityState;
 
 /// Number of measured (timed) runs per benchmark; the per-tick series are
 /// averaged across these runs and summary latency/overhead stats are computed
@@ -580,7 +581,16 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         for _ in 0..BENCH_WARMUP_TICKS {
             sim.tick(&mut game, &config);
             game.tick_game();
-            let _ = run_network_phase(&game, &mut net_baselines, &player_ids);
+            let current_units = game.unit_states_direct();
+            let current_cities: Vec<CityState> =
+                game.query_cities().iter().map(|c| c.into()).collect();
+            let _ = run_network_phase(
+                &game,
+                &mut net_baselines,
+                &player_ids,
+                &current_units,
+                &current_cities,
+            );
         }
 
         // Reset per-system alloc accumulators so the per-system table reflects
@@ -619,11 +629,23 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             let movers = game.last_mover_count() as u32;
             let combats = game.last_engaged_pairs() as u32;
 
-            // Network phase (W1): build + encode per-player deltas, measured as
-            // a system via tick_system! so it appears in the per-system P90/P99
-            // breakdown and alloc table alongside ECS systems.
+            // Network phase (W1): snapshot + build + encode per-player deltas,
+            // measured as a system via tick_system! so it appears in the
+            // per-system P90/P99 breakdown and alloc table alongside ECS systems.
+            // The unit_states_direct() + query_cities() snapshot is inside the
+            // timing block so its allocs are attributed to "network" (matching
+            // the pre-W1 behaviour where run_network_phase called them internally).
             let net_phase = crate::tick_system!("network", &mut game.world, game.world_entity, {
-                run_network_phase(&game, &mut net_baselines, &player_ids)
+                let current_units = game.unit_states_direct();
+                let current_cities: Vec<CityState> =
+                    game.query_cities().iter().map(|c| c.into()).collect();
+                run_network_phase(
+                    &game,
+                    &mut net_baselines,
+                    &player_ids,
+                    &current_units,
+                    &current_cities,
+                )
             });
             let net_wire_bytes = net_phase.wire_bytes;
 
@@ -868,10 +890,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     .iter()
                     .map(|r| r[i].net_wire_bytes as f64)
                     .sum::<f64>();
-                let sum_net_ms = runs_tick_data
-                    .iter()
-                    .map(|r| r[i].net_ms)
-                    .sum::<f64>();
+                let sum_net_ms = runs_tick_data.iter().map(|r| r[i].net_ms).sum::<f64>();
                 TickData {
                     total_ms: sum_total / n,
                     entity_count: (sum_entity / n).round() as u32,

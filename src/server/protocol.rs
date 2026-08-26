@@ -2,6 +2,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GameStateMessage {
@@ -20,15 +21,17 @@ pub struct GameDeltaMessage {
     pub vision_grid_diff: Option<Vec<u8>>,
     /// Flat border/territory grid (1 byte per cell: player index 0..N or 255).
     /// Row-major, width = terrain width. `None` when unchanged.
-    pub border_grid_diff: Option<Vec<u8>>,
+    pub border_grid_diff: Option<Arc<Vec<u8>>>,
     /// Grid width in cells (sent whenever either grid diff is present so the
     /// client can index the flat arrays). Omitted when no grid changed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub grid_width: Option<u32>,
-    pub units_added: Vec<UnitState>,
-    pub units_removed: Vec<String>,
-    pub unit_updates: Vec<UnitUpdate>,
-    pub city_updates: Vec<CityUpdate>,
+    /// Shared across all players in a tick — `Arc` so per-player delta
+    /// construction is a refcount bump, not a deep clone.
+    pub units_added: Arc<Vec<UnitState>>,
+    pub units_removed: Arc<Vec<String>>,
+    pub unit_updates: Arc<Vec<UnitUpdate>>,
+    pub city_updates: Arc<Vec<CityUpdate>>,
     pub player: PlayerState,
 }
 
@@ -480,9 +483,9 @@ mod tests {
             vision_grid_diff: None,
             border_grid_diff: None,
             grid_width: None,
-            units_added: vec![],
-            units_removed: vec!["unit_old".to_string()],
-            unit_updates: vec![UnitUpdate {
+            units_added: Arc::new(vec![]),
+            units_removed: Arc::new(vec!["unit_old".to_string()]),
+            unit_updates: Arc::new(vec![UnitUpdate {
                 id: "unit_1".to_string(),
                 position: Some((11.0, 20.0)),
                 men: Some(950.0),
@@ -498,13 +501,13 @@ mod tests {
                 boat_supply_percent: None,
                 embarking: None,
                 disembarking: None,
-            }],
-            city_updates: vec![CityUpdate {
+            }]),
+            city_updates: Arc::new(vec![CityUpdate {
                 id: "city_0".to_string(),
                 manpower: Some(9000),
                 owner: None,
                 level: None,
-            }],
+            }]),
             player: PlayerState {
                 funds: 1100,
                 units_owned: 2,

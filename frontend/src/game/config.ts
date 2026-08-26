@@ -34,22 +34,22 @@ export const CITY_DOT_SIZE = 12;
 
 /** City dot colors by owner index (6 distinct colors for up to 6 players) */
 export const CITY_COLORS = [
-  { r: 1, g: 0.2, b: 0.2 },   // Red
-  { r: 1, g: 1, b: 0.2 },     // Yellow
-  { r: 0.2, g: 0.4, b: 1 },   // Blue
+  { r: 1, g: 0.2, b: 0.2 }, // Red
+  { r: 1, g: 1, b: 0.2 }, // Yellow
+  { r: 0.2, g: 0.4, b: 1 }, // Blue
   { r: 0.2, g: 0.9, b: 0.3 }, // Green
-  { r: 0.7, g: 0.4, b: 0.95 },// Purple
-  { r: 1, g: 0.55, b: 0.1 },  // Orange
+  { r: 0.7, g: 0.4, b: 0.95 }, // Purple
+  { r: 1, g: 0.55, b: 0.1 }, // Orange
 ];
 
 /** Player colors for units (6 distinct colors for up to 6 players) */
 export const PLAYER_COLORS = [
-  { r: 1, g: 0.2, b: 0.2 },   // Red
-  { r: 1, g: 1, b: 0.2 },     // Yellow
-  { r: 0.2, g: 0.4, b: 1 },   // Blue
+  { r: 1, g: 0.2, b: 0.2 }, // Red
+  { r: 1, g: 1, b: 0.2 }, // Yellow
+  { r: 0.2, g: 0.4, b: 1 }, // Blue
   { r: 0.2, g: 0.9, b: 0.3 }, // Green
-  { r: 0.7, g: 0.4, b: 0.95 },// Purple
-  { r: 1, g: 0.55, b: 0.1 },  // Orange
+  { r: 0.7, g: 0.4, b: 0.95 }, // Purple
+  { r: 1, g: 0.55, b: 0.1 }, // Orange
 ];
 
 /** Border color mapping */
