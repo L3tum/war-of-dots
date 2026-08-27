@@ -27,8 +27,9 @@ use crate::replay::replay::ReplayEvent;
 use crate::server::delta::{run_network_phase, NetworkBaselines, NetworkPhaseResult};
 use crate::server::lobby::LobbyManager;
 use crate::server::protocol::{
-    decode_client_message, encode_message, CityState, ClientMessage, GameStateMessage,
-    LobbyMessage, LobbySettings, PlayerState, ServerMessage, UnitState,
+    decode_client_message, encode_message, encode_message_with_hint, estimate_delta_size,
+    CityState, ClientMessage, GameStateMessage, LobbyMessage, LobbySettings, PlayerState,
+    ServerMessage, UnitState,
 };
 
 // Re-export types from room module for use throughout game_server
@@ -448,26 +449,28 @@ impl GameRoom {
 
         tokio::spawn(async move {
             let mut game = game;
-            let mut baselines: NetworkBaselines = {
-                let mut b = NetworkBaselines::default();
-                b.prev_units = game
+            let mut baselines: NetworkBaselines = NetworkBaselines {
+                prev_units: game
                     .unit_states()
                     .into_iter()
                     .map(|u| (u.id.clone(), u))
-                    .collect();
-                b.prev_cities = game
+                    .collect(),
+                prev_cities: game
                     .query_cities()
                     .iter()
                     .map(|c| (c.id.clone(), c.into()))
-                    .collect();
-                b.prev_funds = game.all_player_funds();
-                b.prev_border = game.territory_grid_flat();
-                for pid in game.players().keys() {
-                    if let Some(v) = game.vision_grid_flat(pid) {
-                        b.prev_vision.insert(pid.clone(), v);
+                    .collect(),
+                prev_funds: game.all_player_funds(),
+                prev_border: game.territory_grid_flat(),
+                prev_vision: {
+                    let mut m = std::collections::HashMap::new();
+                    for pid in game.players().keys() {
+                        if let Some(v) = game.vision_grid_flat(pid) {
+                            m.insert(pid.clone(), v);
+                        }
                     }
-                }
-                b
+                    m
+                },
             };
             let mut players = players;
             let mut advisors = advisors;
@@ -555,15 +558,18 @@ impl GameRoom {
                         // Snapshot game state once per tick, shared by the
                         // active-player check and the per-player delta build.
                         let current_units = game.unit_states_direct();
+                        // W7: convert City → CityState while the world guard is
+                        // alive (no redundant full Vec<City> clone; the CityState
+                        // Vec is the allocation we actually need).
                         let current_cities: Vec<CityState> =
-                            game.query_cities().iter().map(|c| c.into()).collect();
+                            game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
 
                         // Update live debug stats (read by /debug/stats)
                         {
                             let mut gs = game_stats.lock().unwrap_or_else(|e| e.into_inner());
                             gs.tick_count = tick_count;
                             gs.last_tick_ms = _tick_start.elapsed().as_secs_f64() * 1000.0;
-                            gs.entity_count = game.unit_count() + game.query_cities().len();
+                            gs.entity_count = game.unit_count() + game.city_count();
                         }
 
                         // --- Broadcast state snapshots every 60 ticks (~1 sec) ---
@@ -643,70 +649,96 @@ impl GameRoom {
                         }
 
                         // --- Network phase: per-player delta build + encode ---
-                        let regular_pids: Vec<String> = players
+                        // W4: borrowed pids — no per-tick String clones for the id list.
+                        let regular_pids: Vec<&str> = players
                             .iter()
                             .filter_map(|p| {
                                 if let PlayerConnection::Player { id, .. } = p {
-                                    Some(id.clone())
+                                    Some(id.as_str())
                                 } else {
                                     None
                                 }
                             })
                             .collect();
-                        let phase: NetworkPhaseResult =
-                            run_network_phase(&game, &mut baselines, &regular_pids, &current_units, &current_cities);
-                        let mut send_map: HashMap<String, Vec<u8>> = phase.encoded.into_iter().collect();
 
-                        // Spectators get the union vision grid (handled separately
-                        // since their vision differs from per-player vision).
-                        if spectator_vision {
+                        let phase: NetworkPhaseResult = run_network_phase(
+                            &game,
+                            &mut baselines,
+                            &regular_pids,
+                            current_units,
+                            current_cities,
+                            true, // W9 splice path: on — A/B confirmed ~1.5% off the network phase (byte-for-byte verified encoder)
+                        );
+
+                        // W4: outbox by move — the send loop takes ownership of each
+                        // payload, so a tick doesn't memcpy the (up to 200 KB) encoded
+                        // message per player, and no per-tick HashMap/String-key clones
+                        // are needed. The spectator entry (if any) is pushed in before
+                        // the send loop below.
+                        let mut outbox: Vec<(String, Vec<u8>)> = phase.encoded;
+
+                        // W5: the spectator reuses the shared delta phase computed by
+                        // run_network_phase instead of recomputing the whole shared
+                        // diff for the synthetic "" spectator every tick (no fresh
+                        // HashSet of unit ids, no fresh all_player_funds(), no extra
+                        // 40 KB union-grid Arc in the common no-spectator case).
+                        // - The union vision grid is computed only when at least one
+                        //   spectator connection actually exists.
+                        // - Per-owner unit counts come from `phase.shared` (W8),
+                        //   so the spectator no longer needs the unit snapshot
+                        //   that was moved into run_network_phase.
+                        // - Reusing `phase.shared` (pre-commit baseline) means the
+                        //   spectator sees the tick's real unit/city updates — the
+                        //   deliberate W1 behavior; post-commit prev_funds == all_funds.
+                        // - The "" pid has no funds baseline entry, so the idle-skip
+                        //   only fires on truly idle ticks (W5 fix) instead of the
+                        //   spectator receiving a message every tick.
+                        if spectator_vision
+                            && players.iter().any(|p| matches!(p, PlayerConnection::Spectator { .. }))
+                        {
                             let all_pids: Vec<String> = game.players().keys().cloned().collect();
                             let spec_vision: Option<Arc<Vec<u8>>> =
                                 game.union_vision_grid_flat(&all_pids).map(Arc::new);
-                            let spec_border: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
                             let spec_pid = String::new();
                             let prev_spec_vision: Option<&Arc<Vec<u8>>> =
                                 baselines.prev_vision.get(&spec_pid);
-                            let cur_unit_ids: HashSet<&str> =
-                                current_units.iter().map(|u| u.id.as_str()).collect();
-                            let all_funds = game.all_player_funds();
-                            let grid_width = game.terrain_width();
-
-                            let shared = compute_shared_deltas(
-                                &baselines.prev_units,
-                                &baselines.prev_cities,
-                                &current_units,
-                                &current_cities,
-                                &cur_unit_ids,
-                                baselines.prev_border.as_ref(),
-                                &spec_border,
-                            );
                             if let Some(delta) = build_delta_inner(
-                                &baselines.prev_units,
                                 &baselines.prev_funds,
                                 prev_spec_vision,
-                                &current_units,
-                                &all_funds,
+                                &baselines.prev_funds,
                                 &spec_vision,
-                                grid_width,
+                                phase.grid_width,
                                 &spec_pid,
-                                &shared,
+                                &phase.shared,
                             ) {
-                                send_map.insert(spec_pid.clone(), encode_message(&delta));
-                            }
-                            if let Some(v) = &spec_vision {
+                                // N5: pre-size the CBOR buffer (the old path used bare encode_message).
+                                let dref = match &delta {
+                                    ServerMessage::DeltaState(d) => d,
+                                    _ => unreachable!(),
+                                };
+                                let encoded = encode_message_with_hint(&delta, estimate_delta_size(dref));
+                                if let Some(v) = &spec_vision {
+                                    baselines.prev_vision.insert(spec_pid.clone(), Arc::clone(v));
+                                }
+                                outbox.push((spec_pid, encoded));
+                            } else if let Some(v) = &spec_vision {
                                 baselines.prev_vision.insert(spec_pid, Arc::clone(v));
                             }
                         }
 
-                        // Send encoded deltas; keep alive connections
+                        // Send encoded deltas; keep alive connections.
+                        // W4: take-by-move via a linear scan (players ≤ 16); the
+                        // is_ok() check is the sole drop condition (send failed →
+                        // the player is dropped), same semantics as before.
                         let mut alive = Vec::new();
                         for player in players {
                             let pid = player.id().cloned().unwrap_or_default();
-                            if let Some(encoded) = send_map.get(&pid) {
-                                if player.tx().send(encoded.clone()).await.is_ok() {
+                            if let Some(pos) = outbox.iter().position(|(p, _)| p.as_str() == pid) {
+                                let (_, bytes) = outbox.swap_remove(pos);
+                                if player.tx().send(bytes).await.is_ok() {
                                     alive.push(player);
                                 }
+                                // else: connection died -> player dropped
                             } else {
                                 // Nothing changed for this player; keep the connection alive.
                                 alive.push(player);
@@ -1315,10 +1347,8 @@ pub(crate) async fn handle_replay_ws(
                     &current_border,
                 );
                 if let Some(delta) = build_delta_inner(
-                    &prev_units,
                     &prev_funds,
                     prev_vision_grid.as_ref(),
-                    &current_units,
                     &all_funds,
                     &current_vision,
                     grid_width,

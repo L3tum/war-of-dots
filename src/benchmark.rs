@@ -11,6 +11,7 @@
 //! Outputs detailed HTML report with per-tick charts and per-system P90/P99.
 //! Requires `--features debug-overlay` for detailed per-system stats.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use rand::rngs::StdRng;
@@ -22,8 +23,10 @@ use crate::game::game::{Game, GameSettings, InfluenceSettings};
 use crate::map::map::{Map, MapConfig};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
-use crate::server::delta::{run_network_phase, NetworkBaselines};
-use crate::server::protocol::CityState;
+use crate::server::delta::{build_delta_inner, run_network_phase, NetworkBaselines};
+use crate::server::protocol::{
+    encode_message_with_hint, estimate_delta_size, CityState, ServerMessage,
+};
 
 /// Number of measured (timed) runs per benchmark; the per-tick series are
 /// averaged across these runs and summary latency/overhead stats are computed
@@ -58,6 +61,8 @@ pub struct TickData {
     pub net_wire_bytes: u64,
     /// Network phase duration in ms (0 if not measured)
     pub net_ms: f64,
+    /// Network phase: shared unit updates this tick (W6 churn metric)
+    pub net_unit_updates: u32,
 }
 
 /// Benchmark configuration
@@ -91,6 +96,15 @@ pub struct BenchmarkConfig {
     /// cities get one extra). Default 2000. Raise for heavier recruitment
     /// pressure; lower to keep the population roughly stable.
     pub max_recruits_per_event: u32,
+    /// W5: run the synthetic-spectator network path each tick (mirrors the
+    /// game_server `spectator_vision` code path) so the A/B harness can measure
+    /// the spectator delta cost. Seeds a baseline for pid "" from the union
+    /// vision grid before warmup.
+    pub bench_spectator: bool,
+    /// W9 (stretch): enable the splice encoder path in the benchmark's network
+    /// phase so the A/B harness can measure `net_ms` with the shared segments
+    /// encoded once and spliced per player. Default off (production path).
+    pub bench_splice: bool,
 }
 
 impl Default for BenchmarkConfig {
@@ -105,6 +119,8 @@ impl Default for BenchmarkConfig {
             map_size: 200,
             cities: 12,
             max_recruits_per_event: 2000,
+            bench_spectator: false,
+            bench_splice: false,
         }
     }
 }
@@ -252,6 +268,65 @@ pub fn recruit_event_plan(config: &BenchmarkConfig, n_cities: usize) -> (usize, 
     let per_city = (config.units_per_city / 2).max(1) as usize;
     let total = (per_city * n_cities).min(config.max_recruits_per_event as usize);
     (total / n_cities, total % n_cities)
+}
+
+/// W5: build + encode the synthetic-spectator delta, mirroring the
+/// game_server `spectator_vision` path: `phase.shared` (pre-commit baseline)
+/// is reused instead of recomputing the shared phase; the union vision grid
+/// is the only spectator-specific work. Per-owner counts come from `phase.shared` (W8). Returns the encoded byte length (0 when the
+/// idle-skip fires) and commits the spectator vision baseline.
+fn bench_spectator_delta(
+    game: &Game,
+    net_baselines: &mut NetworkBaselines,
+    player_ids: &[String],
+    phase: &crate::server::delta::NetworkPhaseResult,
+    spliced: bool,
+) -> u64 {
+    let spec_pid = String::new();
+    let spec_vision: Option<Arc<Vec<u8>>> = game.union_vision_grid_flat(player_ids).map(Arc::new);
+    let prev_spec_vision: Option<&Arc<Vec<u8>>> = net_baselines.prev_vision.get(&spec_pid);
+    let emitted = if let Some(delta) = build_delta_inner(
+        &net_baselines.prev_funds,
+        prev_spec_vision,
+        &net_baselines.prev_funds,
+        &spec_vision,
+        phase.grid_width,
+        &spec_pid,
+        &phase.shared,
+    ) {
+        let dref = match &delta {
+            ServerMessage::DeltaState(d) => d,
+            _ => unreachable!(),
+        };
+        if spliced {
+            let ss = crate::server::protocol::SpliceShared::build(
+                phase.shared.border_grid_diff.as_ref(),
+                &phase.shared.units_added,
+                &phase.shared.units_removed,
+                &phase.shared.unit_updates,
+                &phase.shared.city_updates,
+            );
+            let map_bytes = crate::server::protocol::encode_delta_spliced(dref, &ss);
+            let mut out = Vec::with_capacity(
+                crate::server::protocol::DELTA_STATE_VARIANT_WRAPPER.len() + map_bytes.len(),
+            );
+            out.extend_from_slice(&crate::server::protocol::DELTA_STATE_VARIANT_WRAPPER);
+            out.extend_from_slice(&map_bytes);
+            Some(out)
+        } else {
+            Some(encode_message_with_hint(&delta, estimate_delta_size(dref)))
+        }
+    } else {
+        None
+    };
+    // Commit the vision baseline unconditionally (game_server does the same
+    // even when the idle-skip fires).
+    if let Some(v) = &spec_vision {
+        net_baselines
+            .prev_vision
+            .insert(spec_pid.clone(), Arc::clone(v));
+    }
+    emitted.map(|e| e.len() as u64).unwrap_or(0)
 }
 
 /// Run a benchmark using a fresh game and return detailed results.
@@ -555,42 +630,66 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         let player_ids: Vec<String> = (0..BENCH_PLAYERS)
             .map(|i| format!("player_{}", i))
             .collect();
-        let mut net_baselines: NetworkBaselines = {
-            let mut b = NetworkBaselines::default();
-            b.prev_units = game
+        // W4: run_network_phase takes &[&str] — borrowed pid list, no clones.
+        let player_id_strs: Vec<&str> = player_ids.iter().map(|s| s.as_str()).collect();
+        let mut net_baselines: NetworkBaselines = NetworkBaselines {
+            prev_units: game
                 .unit_states()
                 .into_iter()
                 .map(|u| (u.id.clone(), u))
-                .collect();
-            b.prev_cities = game
+                .collect(),
+            prev_cities: game
                 .query_cities()
                 .iter()
                 .map(|c| (c.id.clone(), c.into()))
-                .collect();
-            b.prev_funds = game.all_player_funds();
-            b.prev_border = game.territory_grid_flat();
-            for pid in &player_ids {
-                if let Some(v) = game.vision_grid_flat(pid) {
-                    b.prev_vision.insert(pid.clone(), v);
+                .collect(),
+            prev_funds: game.all_player_funds(),
+            prev_border: game.territory_grid_flat(),
+            prev_vision: {
+                let mut m = std::collections::HashMap::new();
+                for pid in &player_ids {
+                    if let Some(v) = game.vision_grid_flat(pid) {
+                        m.insert(pid.clone(), v);
+                    }
                 }
-            }
-            b
+                m
+            },
         };
+
+        // W5: synthetic spectator baseline (pid ""), seeded from the union
+        // vision grid so warmup reaches steady state like game_server does.
+        if config.bench_spectator {
+            if let Some(v) = game.union_vision_grid_flat(&player_ids) {
+                net_baselines.prev_vision.insert(String::new(), Arc::new(v));
+            }
+        }
 
         // Warmup (with AI to warm up caches & archetypes)
         for _ in 0..BENCH_WARMUP_TICKS {
             sim.tick(&mut game, &config);
             game.tick_game();
             let current_units = game.unit_states_direct();
+            // W7: convert City → CityState while the world guard is alive (no
+            // redundant full Vec<City> clone).
             let current_cities: Vec<CityState> =
-                game.query_cities().iter().map(|c| c.into()).collect();
-            let _ = run_network_phase(
+                game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
+            let phase = run_network_phase(
                 &game,
                 &mut net_baselines,
-                &player_ids,
-                &current_units,
-                &current_cities,
+                &player_id_strs,
+                current_units,
+                current_cities,
+                config.bench_splice,
             );
+            if config.bench_spectator {
+                bench_spectator_delta(
+                    &game,
+                    &mut net_baselines,
+                    &player_ids,
+                    &phase,
+                    config.bench_splice,
+                );
+            }
         }
 
         // Reset per-system alloc accumulators so the per-system table reflects
@@ -637,17 +736,35 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // the pre-W1 behaviour where run_network_phase called them internally).
             let net_phase = crate::tick_system!("network", &mut game.world, game.world_entity, {
                 let current_units = game.unit_states_direct();
+                // W7: convert City → CityState while the world guard is alive
+                // (no per-tick Vec<City> clone).
                 let current_cities: Vec<CityState> =
-                    game.query_cities().iter().map(|c| c.into()).collect();
+                    game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
                 run_network_phase(
                     &game,
                     &mut net_baselines,
-                    &player_ids,
-                    &current_units,
-                    &current_cities,
+                    &player_id_strs,
+                    current_units,
+                    current_cities,
+                    config.bench_splice,
                 )
             });
-            let net_wire_bytes = net_phase.wire_bytes;
+            let mut net_wire_bytes = net_phase.wire_bytes;
+
+            // W5: synthetic spectator (mirrors the game_server spectator_vision
+            // path) — kept OUT of the "network" tick_system block, matching
+            // game_server where the spectator build is plain tick overhead.
+            // Its encoded bytes are added to net_wire_bytes so idle-skip savings
+            // show up in the wire metric.
+            if config.bench_spectator {
+                net_wire_bytes += bench_spectator_delta(
+                    &game,
+                    &mut net_baselines,
+                    &player_ids,
+                    &net_phase,
+                    config.bench_splice,
+                );
+            }
 
             // Capture tick_ms AFTER the network phase so total_ms includes
             // network time and (total_ms - system_sum_ms) stays non-negative.
@@ -709,6 +826,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     max_alloc: td_max,
                     net_wire_bytes,
                     net_ms,
+                    net_unit_updates: net_phase.unit_updates,
                 }
             } else {
                 TickData {
@@ -723,6 +841,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     max_alloc: td_max,
                     net_wire_bytes,
                     net_ms: 0.0,
+                    net_unit_updates: net_phase.unit_updates,
                 }
             };
 
@@ -739,6 +858,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 max_alloc: td_max,
                 net_wire_bytes,
                 net_ms: 0.0,
+                net_unit_updates: net_phase.unit_updates,
             };
 
             run_tick_data.push(td);
@@ -891,6 +1011,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     .map(|r| r[i].net_wire_bytes as f64)
                     .sum::<f64>();
                 let sum_net_ms = runs_tick_data.iter().map(|r| r[i].net_ms).sum::<f64>();
+                let sum_net_updates = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_unit_updates as f64)
+                    .sum::<f64>();
                 TickData {
                     total_ms: sum_total / n,
                     entity_count: (sum_entity / n).round() as u32,
@@ -903,6 +1027,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     max_alloc: max_max_alloc,
                     net_wire_bytes: (sum_net_wire / n).round() as u64,
                     net_ms: sum_net_ms / n,
+                    net_unit_updates: (sum_net_updates / n).round() as u32,
                 }
             })
             .collect()
@@ -1228,7 +1353,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "total_units_initial": total_units, "total_units_recruited": total_recruited,
             "ticks": config.ticks, "seed": config.seed,
             "measured_runs": MEASURED_RUNS, "warmup_ticks": BENCH_WARMUP_TICKS,
-            "bench_prev": config.bench_prev, "detailed_systems": config.detailed_systems,
+            "bench_prev": config.bench_prev, "detailed_systems": config.detailed_systems, "bench_spectator": config.bench_spectator, "bench_splice": config.bench_splice,
         },
         "results": {
             "wall_time_ms": bench_elapsed.as_secs_f64() * 1000.0,
@@ -1294,6 +1419,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             .map(|td| td.max_alloc as f64)
             .collect::<Vec<f64>>(),
         "net_wire_bytes_per_tick": avg_tick_data.iter().map(|td| td.net_wire_bytes as f64).collect::<Vec<f64>>(),
+        "net_unit_updates_per_tick": avg_tick_data.iter().map(|td| td.net_unit_updates as f64).collect::<Vec<f64>>(),
         "net_ms_per_tick": avg_tick_data.iter().map(|td| td.net_ms).collect::<Vec<f64>>(),
         "stack": {
             "Game": std::mem::size_of::<crate::game::game::Game>(),

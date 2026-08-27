@@ -18,9 +18,13 @@ pub struct GameStateMessage {
 pub struct GameDeltaMessage {
     /// Flat vision grid (1 byte per cell, 0 or 1). Row-major, width = terrain width.
     /// `None` when the grid is unchanged since the client's last snapshot.
-    pub vision_grid_diff: Option<Vec<u8>>,
+    /// `Arc` so the per-player build shares the influence grid instead of
+    /// copying 40 KB (W3); CBOR-serializes as a plain byte array.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vision_grid_diff: Option<Arc<Vec<u8>>>,
     /// Flat border/territory grid (1 byte per cell: player index 0..N or 255).
     /// Row-major, width = terrain width. `None` when unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub border_grid_diff: Option<Arc<Vec<u8>>>,
     /// Grid width in cells (sent whenever either grid diff is present so the
     /// client can index the flat arrays). Omitted when no grid changed.
@@ -73,19 +77,36 @@ pub struct EquipmentState {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UnitUpdate {
     pub id: String,
+    // Absent fields are omitted on the wire (compact form); clients guard with
+    // null/undefined checks, and `default` keeps Deserialize happy for the
+    // full (null-bearing) form recorded by older clients/replays.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub position: Option<(f32, f32)>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub men: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub organisation: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub equipment: Option<Vec<EquipmentState>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub path: Option<Vec<(f32, f32)>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub healing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resupply_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supply_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub encircled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attacking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub on_water: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub boat_supply_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub embarking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub disembarking: Option<bool>,
 }
 
@@ -101,8 +122,11 @@ pub struct CityState {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CityUpdate {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub manpower: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub level: Option<u32>,
 }
 
@@ -371,7 +395,15 @@ pub fn encode_message(msg: &ServerMessage) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn encode_message_with_hint(msg: &ServerMessage, capacity_hint: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(capacity_hint.max(64));
-    ciborium::into_writer(msg, &mut buf).unwrap_or_default();
+    if let Err(e) = ciborium::into_writer(msg, &mut buf) {
+        // W7: a failed encode leaves `buf` holding a TRUNCATED/partial CBOR
+        // message — sending that frame would desync the client. The old code
+        // did `unwrap_or_default()`, silently emitting this partial (or, if
+        // nothing was written yet, 0-byte) frame.
+        log::error!("CBOR encode failed for ServerMessage: {e}");
+        #[cfg(debug_assertions)]
+        panic!("CBOR encode failed for ServerMessage: {e}");
+    }
     buf
 }
 
@@ -395,6 +427,122 @@ pub fn decode_client_message(data: &[u8]) -> anyhow::Result<ClientMessage> {
     let msg: ClientMessage = ciborium::from_reader(data)?;
     Ok(msg)
 }
+
+// ---------------------------------------------------------------------------
+// W9 (stretch, opt-in): splice the shared delta segments into per-player
+// frames instead of re-encoding them P times.
+// ---------------------------------------------------------------------------
+
+/// W9: encode `field` as a single CBOR map entry (`key, value`) for splicing
+/// into a larger map. The key is a fixed ASCII field name, so it encodes as a
+/// CBOR text string (`0x60 | len`, then raw bytes) — identical to what
+/// ciborium emits for the same key inside any map. The value goes through the
+/// identical `Serialize` path as the full message, so float int-coercion and
+/// every other serialization quirk is inherited automatically.
+fn encode_entry(key: &'static str, field: &impl serde::Serialize) -> Vec<u8> {
+    assert!(
+        key.len() <= 23 && key.is_ascii(),
+        "splice key must be a short ASCII string"
+    );
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    buf.push(0x60 | key.len() as u8);
+    buf.extend_from_slice(key.as_bytes());
+    ciborium::into_writer(field, &mut buf).expect("splice entry encode failed");
+    buf
+}
+
+/// W9: the shared `GameDeltaMessage` segments, each pre-encoded ONCE per tick
+/// as raw map-entry bytes (key + value) in `GameDeltaMessage` declaration
+/// order.
+///
+/// The per-player splice layout (declaration order, per the spec):
+/// `[map header] [vision_grid_diff?] [border_grid_diff?] [grid_width?]
+/// [units_added] [units_removed] [unit_updates] [city_updates] [player]`
+///
+/// `grid_width` is NOT shared: it is present per player when that player's
+/// vision OR the shared border changed, so it is encoded per player. The
+/// shared pieces are `border_grid_diff` (first shared entry) and the
+/// `units_added..city_updates` block.
+pub struct SpliceShared {
+    pub border_grid: Vec<u8>,
+    pub units_and_cities: Vec<u8>,
+    /// 1 when `border_grid` is non-empty (border changed this tick), else 0.
+    pub has_border: bool,
+}
+
+impl SpliceShared {
+    /// Pre-encode the shared segments of one tick's deltas. The segments are
+    /// identical for every player, so this runs ONCE per tick regardless of
+    /// player count.
+    pub fn build(
+        border_grid_diff: Option<&Arc<Vec<u8>>>,
+        units_added: &Vec<UnitState>,
+        units_removed: &Vec<String>,
+        unit_updates: &Vec<UnitUpdate>,
+        city_updates: &Vec<CityUpdate>,
+    ) -> SpliceShared {
+        let border_grid = match border_grid_diff {
+            Some(b) => encode_entry("border_grid_diff", b),
+            None => Vec::new(),
+        };
+        let mut units_and_cities = Vec::new();
+        units_and_cities.extend(encode_entry("units_added", units_added));
+        units_and_cities.extend(encode_entry("units_removed", units_removed));
+        units_and_cities.extend(encode_entry("unit_updates", unit_updates));
+        units_and_cities.extend(encode_entry("city_updates", city_updates));
+        SpliceShared {
+            has_border: !border_grid.is_empty(),
+            border_grid,
+            units_and_cities,
+        }
+    }
+}
+
+/// W9: encode a per-player `GameDeltaMessage` by splicing the pre-encoded
+/// shared segments in, instead of re-serializing them for this player.
+/// Returns the map bytes only (the 2-byte `ServerMessage` variant prefix
+/// `[1]` is added by the caller via `with_delta_state_prefix`). The output
+/// MUST be byte-for-byte identical to the map portion of
+/// `encode_message(&ServerMessage::DeltaState(delta))` — the byte-for-byte
+/// test in the test module pins this invariant.
+pub fn encode_delta_spliced(delta: &GameDeltaMessage, shared: &SpliceShared) -> Vec<u8> {
+    let vision_entries = usize::from(delta.vision_grid_diff.is_some());
+    let grid_entries = usize::from(delta.grid_width.is_some());
+    // vision(?) + border(0|1) + width(0|1) + units&cities(4) + player(1)
+    let count = vision_entries + usize::from(shared.has_border) + grid_entries + 5;
+    // Base overhead + shared bytes + per-player grid estimate.
+    let cap = shared
+        .border_grid
+        .len()
+        .saturating_add(shared.units_and_cities.len())
+        .saturating_add(delta.vision_grid_diff.as_ref().map_or(16, |v| v.len() + 16))
+        .saturating_add(256);
+    let mut buf = Vec::with_capacity(cap);
+    // Map header: 0xa0..0xb7 for counts 0..=23 (count is 5..=8 here).
+    debug_assert!((5..=8).contains(&count));
+    buf.push(0xa0 + count as u8);
+    if let Some(vision) = &delta.vision_grid_diff {
+        buf.extend(encode_entry("vision_grid_diff", vision));
+    }
+    if shared.has_border {
+        buf.extend_from_slice(&shared.border_grid);
+    }
+    if let Some(width) = delta.grid_width {
+        buf.extend(encode_entry("grid_width", &width));
+    }
+    buf.extend_from_slice(&shared.units_and_cities);
+    buf.extend(encode_entry("player", &delta.player));
+    buf
+}
+
+/// W9: the `ServerMessage` variant wrapper for the newtype variant
+/// `DeltaState(..)`. ciborium serializes this as a 1-entry CBOR map keyed by
+/// the variant name: `a1` (map with 1 entry) `6a` (text string, 10 bytes)
+/// `"DeltaState"`, then the wrapped value. The spliced delta map is the value
+/// of that single entry, so the wrapper bytes are `a1 6a 44 65 6c 74 61 53 74 61 74 65`.
+pub const DELTA_STATE_VARIANT_WRAPPER: [u8; 12] = [
+    0xa1, 0x6a, 0x44, 0x65, 0x6c, 0x74, 0x61, 0x53, 0x74, 0x61, 0x74, 0x65,
+];
 
 #[cfg(test)]
 mod tests {
@@ -524,6 +672,199 @@ mod tests {
             assert_eq!(delta.unit_updates[0].id, "unit_1");
             assert_eq!(delta.unit_updates[0].position, Some((11.0, 20.0)));
             assert_eq!(delta.player.funds, 1100);
+        } else {
+            panic!("Expected DeltaState");
+        }
+    }
+
+    /// W9: a populated `GameDeltaMessage` with all shared segments filled and
+    /// an optional per-player vision diff, used to exercise the spliced encoder.
+    fn full_delta(player_id: &str, vision: Option<Vec<u8>>) -> GameDeltaMessage {
+        GameDeltaMessage {
+            vision_grid_diff: vision.map(Arc::new),
+            border_grid_diff: Some(Arc::new(vec![0u8, 1, 2, 255, 0, 1, 2, 3])),
+            grid_width: Some(4),
+            units_added: Arc::new(vec![UnitState {
+                id: "unit_1".to_string(),
+                owner: "a".to_string(),
+                position: (1.0, 2.0),
+                unit_type: "infantry".to_string(),
+                symbol: "I".to_string(),
+                men: 1000.0,
+                max_men: 1000.0,
+                organisation: 100.0,
+                equipment: vec![EquipmentState {
+                    name: "rifle".to_string(),
+                    count: 100,
+                    cost_per_item: 2.5,
+                }],
+                max_equipment: vec![],
+                path: vec![(2.0, 2.0)],
+                healing: true,
+                resupply_enabled: true,
+                supply_percent: 100.0,
+                encircled: false,
+                attacking: false,
+                on_water: false,
+                boat_supply_percent: 0.0,
+                embarking: false,
+                disembarking: false,
+            }]),
+            units_removed: Arc::new(vec!["unit_gone".to_string()]),
+            unit_updates: Arc::new(vec![UnitUpdate {
+                id: "unit_1".to_string(),
+                position: Some((3.0, 4.0)),
+                men: Some(999.0),
+                organisation: Some(97.0),
+                equipment: None,
+                path: None,
+                healing: Some(false),
+                resupply_enabled: None,
+                supply_percent: Some(87.5),
+                encircled: Some(true),
+                attacking: None,
+                on_water: None,
+                boat_supply_percent: None,
+                embarking: None,
+                disembarking: None,
+            }]),
+            city_updates: Arc::new(vec![CityUpdate {
+                id: "city_0".to_string(),
+                manpower: Some(500),
+                owner: Some("a".to_string()),
+                level: Some(3),
+            }]),
+            player: PlayerState {
+                funds: 1200,
+                units_owned: 42,
+                player_id: player_id.to_string(),
+            },
+        }
+    }
+
+    /// W9: the spliced encoder must be byte-for-byte identical to
+    /// `encode_message(&ServerMessage::DeltaState(delta))` and must decode
+    /// back to the same logical message. Exercises both the border-present and
+    /// vision-present/vision-absent map-count branches with 2 players.
+    #[test]
+    fn splice_matches_encode_message_byte_for_byte() {
+        let vision_a = vec![0u8, 1, 0, 1, 1, 0, 1, 1];
+        // Player A: WITH a per-player vision diff (max map entries).
+        let msg_a = full_delta("player_a", Some(vision_a));
+        // Player B: NO vision diff (exercises the dynamic map count).
+        let msg_b = full_delta("player_b", None);
+
+        for (delta, label) in [(&msg_a, "player_a"), (&msg_b, "player_b")] {
+            let shared = SpliceShared::build(
+                delta.border_grid_diff.as_ref(),
+                &delta.units_added,
+                &delta.units_removed,
+                &delta.unit_updates,
+                &delta.city_updates,
+            );
+            let spliced = encode_delta_spliced(delta, &shared);
+
+            // Full frame = 12-byte variant wrapper (1-entry map keyed "DeltaState")
+            // + the spliced delta map (the wrapper's single value).
+            let mut full = Vec::with_capacity(DELTA_STATE_VARIANT_WRAPPER.len() + spliced.len());
+            full.extend_from_slice(&DELTA_STATE_VARIANT_WRAPPER);
+            full.extend_from_slice(&spliced);
+
+            // Byte-for-byte against the standard encoder.
+            let reference = encode_message(&ServerMessage::DeltaState(delta.clone()));
+            assert_eq!(
+                full.as_slice(),
+                reference.as_slice(),
+                "{label}: spliced bytes must equal encode_message byte-for-byte"
+            );
+
+            // Decode equality: re-encode the decoded message and compare.
+            let decoded: ServerMessage =
+                ciborium::from_reader(full.as_slice()).expect("spliced decode failed");
+            assert_eq!(
+                encode_message(&decoded),
+                reference,
+                "{label}: spliced decode must round-trip to the same message"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_update_compact_roundtrip() {
+        // W2: absent Option fields are omitted from the wire (no CBOR nulls),
+        // and the compact form decodes back with `default` to all-None.
+        let msg = ServerMessage::DeltaState(GameDeltaMessage {
+            vision_grid_diff: None,
+            border_grid_diff: None,
+            grid_width: None,
+            units_added: Arc::new(vec![]),
+            units_removed: Arc::new(vec![]),
+            unit_updates: Arc::new(vec![UnitUpdate {
+                id: "unit_1".to_string(),
+                position: Some((3.0, 2.0)),
+                men: None,
+                organisation: None,
+                equipment: None,
+                path: None,
+                healing: None,
+                resupply_enabled: None,
+                supply_percent: None,
+                encircled: None,
+                attacking: None,
+                on_water: None,
+                boat_supply_percent: None,
+                embarking: None,
+                disembarking: None,
+            }]),
+            city_updates: Arc::new(vec![CityUpdate {
+                id: "city_0".to_string(),
+                manpower: None,
+                owner: Some("a".to_string()),
+                level: None,
+            }]),
+            player: PlayerState {
+                funds: 0,
+                units_owned: 0,
+                player_id: "p1".to_string(),
+            },
+        });
+
+        let encoded = encode_message(&msg);
+        // No CBOR null (0xf6) or undefined (0xf7) items anywhere in the frame.
+        assert!(
+            !encoded.iter().any(|&b| b == 0xf6 || b == 0xf7),
+            "compact form must not contain CBOR null/undefined: {:02x?}",
+            encoded
+        );
+
+        let decoded: ServerMessage = ciborium::from_reader(encoded.as_slice()).unwrap();
+        if let ServerMessage::DeltaState(delta) = decoded {
+            assert_eq!(delta.unit_updates.len(), 1);
+            let u = &delta.unit_updates[0];
+            assert_eq!(u.id, "unit_1");
+            assert_eq!(u.position, Some((3.0, 2.0)));
+            assert!(u.men.is_none());
+            assert!(u.organisation.is_none());
+            assert!(u.equipment.is_none());
+            assert!(u.path.is_none());
+            assert!(u.healing.is_none());
+            assert!(u.resupply_enabled.is_none());
+            assert!(u.supply_percent.is_none());
+            assert!(u.encircled.is_none());
+            assert!(u.attacking.is_none());
+            assert!(u.on_water.is_none());
+            assert!(u.boat_supply_percent.is_none());
+            assert!(u.embarking.is_none());
+            assert!(u.disembarking.is_none());
+            assert_eq!(delta.city_updates.len(), 1);
+            let c = &delta.city_updates[0];
+            assert_eq!(c.id, "city_0");
+            assert_eq!(c.owner.as_deref(), Some("a"));
+            assert!(c.manpower.is_none());
+            assert!(c.level.is_none());
+            assert!(delta.vision_grid_diff.is_none());
+            assert!(delta.border_grid_diff.is_none());
+            assert!(delta.grid_width.is_none());
         } else {
             panic!("Expected DeltaState");
         }

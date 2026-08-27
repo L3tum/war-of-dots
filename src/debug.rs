@@ -83,6 +83,8 @@ pub async fn debug_benchmark_handler(
         map_size: 200,
         cities: 12,
         max_recruits_per_event: 2000,
+        bench_spectator: false,
+        bench_splice: false,
     };
 
     // Run benchmark in a blocking thread

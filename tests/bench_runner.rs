@@ -49,6 +49,8 @@ fn stress_benchmark() {
         map_size: 1000,
         cities: 100,
         max_recruits_per_event: 2000,
+        bench_spectator: false,
+        bench_splice: false,
     };
     let results = run_benchmark(config);
     let s = &results.summary;

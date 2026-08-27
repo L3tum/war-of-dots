@@ -92,6 +92,17 @@ struct Cli {
     /// population roughly stable.
     #[arg(long, default_value_t = 2000)]
     bench_recruiting: u32,
+
+    /// Run the network phase with a synthetic spectator each tick (mirrors the
+    /// game_server `spectator_vision` path) to measure the spectator delta cost.
+    #[arg(long)]
+    bench_spectator: bool,
+
+    /// W9 (stretch): enable the splice encoder in the benchmark's network phase
+    /// (shared segments encoded once, spliced per player) to A/B `net_ms`.
+    /// Default off — production always uses the standard encoder.
+    #[arg(long)]
+    bench_splice: bool,
 }
 
 #[tokio::main]
@@ -115,7 +126,8 @@ async fn main() -> anyhow::Result<()> {
             || cli.bench_initial_units.is_some()
             || cli.bench_map_size != 200
             || cli.bench_cities != 12
-            || cli.bench_recruiting != 2000;
+            || cli.bench_recruiting != 2000
+            || cli.bench_spectator;
 
         if has_bench_args {
             eprintln!("error: bench arguments provided without --benchmark flag");
@@ -148,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
             map_size: cli.bench_map_size,
             cities: cli.bench_cities,
             max_recruits_per_event: cli.bench_recruiting,
+            bench_spectator: cli.bench_spectator,
+            bench_splice: cli.bench_splice,
         };
         let results = benchmark::run_benchmark(bench_cfg);
 

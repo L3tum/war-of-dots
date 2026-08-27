@@ -40,15 +40,15 @@ macro_rules! tick_system {
     ($name:expr, $world:expr, $world_entity:expr, $expr:expr) => {{
         let _start = std::time::Instant::now();
         #[cfg(feature = "bench-alloc")]
-        let _alloc_base = crate::bench_alloc::peek();
+        let _alloc_base = $crate::bench_alloc::peek();
         let _result = $expr;
         let _dur = _start.elapsed().as_secs_f64() * 1000.0;
         #[cfg(feature = "bench-alloc")]
-        let _alloc_delta = crate::bench_alloc::peek().diff(_alloc_base);
-        crate::game::debug_stats::record_system_timing($world, $world_entity, $name, _dur);
+        let _alloc_delta = $crate::bench_alloc::peek().diff(_alloc_base);
+        $crate::game::debug_stats::record_system_timing($world, $world_entity, $name, _dur);
         #[cfg(feature = "bench-alloc")]
         {
-            crate::game::debug_stats::record_system_alloc(
+            $crate::game::debug_stats::record_system_alloc(
                 $world,
                 $world_entity,
                 $name,
@@ -1462,6 +1462,24 @@ impl Game {
             .world_data(self.world_entity)
             .map(|wb| wb.cities.cities.clone())
             .unwrap_or_default()
+    }
+
+    /// W7: run `f` over the world's cities by reference, returning an owned
+    /// `R`. hecs 0.11's `Ref` guard cannot yield an escaping raw borrow, so a
+    /// `cities_ref() -> &[City]` accessor is not expressible; instead the
+    /// conversion (e.g. `City` → wire `CityState`) happens inside `f` while the
+    /// guard is alive, avoiding the redundant full `Vec<City>` clone that
+    /// `query_cities()` performs for these hot per-tick callers.
+    pub fn with_cities<R, F: FnOnce(&[City]) -> R>(&self, f: F) -> R {
+        match self.world.world_data(self.world_entity) {
+            Some(wb) => f(&wb.cities.cities),
+            None => f(&[]),
+        }
+    }
+
+    /// W7: allocation-free city count (for `entity_count` in the tick loop).
+    pub fn city_count(&self) -> usize {
+        self.with_cities(|cities| cities.len())
     }
 
     /// Assign ownership of a city to a player. Returns true if successful.

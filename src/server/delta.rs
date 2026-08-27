@@ -49,6 +49,14 @@ const QUANT_MEN: f32 = 1.0;
 /// quantization keeps the digest stable between visible changes).
 const QUANT_ORG: f32 = 1.0;
 
+/// Quantization step for `supply_percent` / `boat_supply_percent` in the unit
+/// digest (W6). Supply drain is a slow fractional decrease — the same order
+/// as the men drain that motivated `QUANT_MEN` — so any unit whose supply is
+/// not exactly 0/100 used to emit a full `UnitUpdate` every tick. 1% steps
+/// are below the UI supply-bar granularity; when an update IS emitted the
+/// wire carries the exact value, so nothing visible is lost.
+const QUANT_SUPPLY: f32 = 1.0;
+
 /// Lightweight digest of a UnitState used for change detection.
 /// Comparing two digests is O(1) with no heap allocation, whereas comparing
 /// full UnitState structs requires cloning Vec<String>, Vec<EquipmentState>, etc.
@@ -87,11 +95,11 @@ impl UnitStateDigest {
             path_len: u.path.len(),
             healing: u.healing,
             resupply_enabled: u.resupply_enabled,
-            supply_percent: u.supply_percent,
+            supply_percent: (u.supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY,
             encircled: u.encircled,
             attacking: u.attacking,
             on_water: u.on_water,
-            boat_supply_percent: u.boat_supply_percent,
+            boat_supply_percent: (u.boat_supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY,
             embarking: u.embarking,
             disembarking: u.disembarking,
         }
@@ -105,6 +113,24 @@ pub(crate) struct SharedDeltas {
     pub units_removed: Arc<Vec<String>>,
     pub unit_updates: Arc<Vec<UnitUpdate>>,
     pub city_updates: Arc<Vec<CityUpdate>>,
+    /// W8: per-owner unit counts, built once per tick in single O(N) passes so
+    /// `build_delta_inner` does O(1) lookups instead of O(units) scans per
+    /// player. Owned (not borrowed) on purpose: `run_network_phase` reassigns
+    /// `baselines.prev_units` after computing the shared deltas, so a map
+    /// borrowing those keys couldn't live in the result; materializing costs
+    /// one key clone per DISTINCT owner (≤ number of players), not per unit.
+    pub prev_units_by_owner: HashMap<String, u32>,
+    pub current_units_by_owner: HashMap<String, u32>,
+}
+
+/// W8: count units per owner in one pass. `owners` yields each unit's owner
+/// (borrowed); the owned result clones one key per DISTINCT owner.
+fn count_by_owner<'a>(owners: impl Iterator<Item = &'a str> + 'a) -> HashMap<String, u32> {
+    let mut tmp: HashMap<&str, u32> = HashMap::new();
+    for o in owners {
+        *tmp.entry(o).or_insert(0) += 1;
+    }
+    tmp.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
 /// Compute the player-independent portions of the per-player delta.
@@ -118,18 +144,26 @@ pub(crate) fn compute_shared_deltas(
     prev_border_grid: Option<&Arc<Vec<u8>>>,
     current_border_grid: &Option<Arc<Vec<u8>>>,
 ) -> SharedDeltas {
-    // Border grid diff (shared across all players)
+    // Border grid diff (shared across all players).
+    // W3: share the published Arc instead of copying the 40 KB grid — the
+    // influence double-buffer publishes by refcount and never mutates the
+    // buffer in place during the encode window.
     let border_grid_diff: Option<Arc<Vec<u8>>> = match (prev_border_grid, current_border_grid) {
         (Some(prev), Some(curr)) => {
             if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
                 None
             } else {
-                Some(Arc::new(curr.as_slice().to_vec()))
+                Some(Arc::clone(curr))
             }
         }
-        (None, Some(curr)) => Some(Arc::new(curr.as_slice().to_vec())),
+        (None, Some(curr)) => Some(Arc::clone(curr)),
         _ => None,
     };
+
+    // W8: per-owner unit counts, single O(N) pass each (build_delta_inner
+    // previously rescanned every unit per player for these counts).
+    let prev_units_by_owner = count_by_owner(prev_units.values().map(|u| u.owner.as_str()));
+    let current_units_by_owner = count_by_owner(current_units.iter().map(|u| u.owner.as_str()));
 
     // Units added (new)
     let units_added: Arc<Vec<UnitState>> = Arc::new(
@@ -282,6 +316,8 @@ pub(crate) fn compute_shared_deltas(
         units_removed,
         unit_updates: Arc::new(unit_updates),
         city_updates: Arc::new(city_updates),
+        prev_units_by_owner,
+        current_units_by_owner,
     }
 }
 
@@ -290,27 +326,31 @@ pub(crate) fn compute_shared_deltas(
 /// The shared (player-independent) portions are computed once per tick via
 /// `compute_shared_deltas`. This function handles the per-player vision diff,
 /// player state, idle-skip check, and final message assembly.
+///
+/// W8: the per-owner unit counts are read from `shared` (precomputed in a
+/// single O(N) pass) instead of taking `prev_units`/`current_units` and
+/// scanning every unit per player.
 pub(crate) fn build_delta_inner(
-    prev_units: &HashMap<String, UnitState>,
     prev_funds: &HashMap<String, u32>,
     prev_vision_grid: Option<&Arc<Vec<u8>>>,
-    current_units: &[UnitState],
     all_player_funds: &HashMap<String, u32>,
     current_vision_grid: &Option<Arc<Vec<u8>>>,
     grid_width: u32,
     player_id: &str,
     shared: &SharedDeltas,
 ) -> Option<ServerMessage> {
-    // Per-player vision grid diff
-    let vision_grid_diff: Option<Vec<u8>> = match (prev_vision_grid, current_vision_grid) {
+    // Per-player vision grid diff.
+    // W3: share the published Arc instead of copying the 40 KB grid (see the
+    // border diff above for the lifetime invariant).
+    let vision_grid_diff: Option<Arc<Vec<u8>>> = match (prev_vision_grid, current_vision_grid) {
         (Some(prev), Some(curr)) => {
             if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
                 None
             } else {
-                Some(curr.as_slice().to_vec())
+                Some(Arc::clone(curr))
             }
         }
-        (None, Some(curr)) => Some(curr.as_slice().to_vec()),
+        (None, Some(curr)) => Some(Arc::clone(curr)),
         _ => None,
     };
 
@@ -322,19 +362,27 @@ pub(crate) fn build_delta_inner(
 
     // Per-player state
     let player_funds: u32 = all_player_funds.get(player_id).copied().unwrap_or(0);
-    let units_owned: u32 = current_units
-        .iter()
-        .filter(|u| u.owner == player_id)
-        .count() as u32;
-    let player_state = PlayerState {
-        funds: player_funds,
-        units_owned,
-        player_id: player_id.to_string(),
-    };
+    // W8: O(1) per-owner lookup (previously scanned all units per player).
+    let units_owned: u32 = shared
+        .current_units_by_owner
+        .get(player_id)
+        .copied()
+        .unwrap_or(0);
 
-    // Idle skip: must check BOTH shared and per-player changes
-    let funds_changed = prev_funds.get(player_id).copied() != Some(player_state.funds);
-    let prev_owned: u32 = prev_units.values().filter(|u| u.owner == player_id).count() as u32;
+    // Idle skip: must check BOTH shared and per-player changes.
+    // W5: the spectator pid "" has no funds baseline entry, so a plain lookup
+    // would report "funds changed" every tick and disable the idle-skip;
+    // treat it as unchanged (spectator funds are always 0).
+    let funds_changed = if player_id.is_empty() {
+        false
+    } else {
+        prev_funds.get(player_id).copied() != Some(player_funds)
+    };
+    let prev_owned: u32 = shared
+        .prev_units_by_owner
+        .get(player_id)
+        .copied()
+        .unwrap_or(0);
     if shared.units_added.is_empty()
         && shared.units_removed.is_empty()
         && shared.unit_updates.is_empty()
@@ -342,10 +390,18 @@ pub(crate) fn build_delta_inner(
         && shared.border_grid_diff.is_none()
         && vision_grid_diff.is_none()
         && !funds_changed
-        && prev_owned == player_state.units_owned
+        && prev_owned == units_owned
     {
         return None;
     }
+
+    // W7: only after the idle-skip passes — the `to_string()` below allocates
+    // per player per tick, and the skip is the common path.
+    let player_state = PlayerState {
+        funds: player_funds,
+        units_owned,
+        player_id: player_id.to_string(),
+    };
 
     let delta = GameDeltaMessage {
         vision_grid_diff,
@@ -364,6 +420,7 @@ pub(crate) fn build_delta_inner(
 /// Per-tick baseline state for the network phase (W0 fix: shared read-only
 /// baseline with per-player vision).
 /// N1: grids are stored as flat `Arc` slices for O(1) change detection.
+#[derive(Default)]
 pub(crate) struct NetworkBaselines {
     pub prev_units: HashMap<String, UnitState>,
     pub prev_cities: HashMap<String, CityState>,
@@ -372,23 +429,21 @@ pub(crate) struct NetworkBaselines {
     pub prev_border: Option<Arc<Vec<u8>>>,
 }
 
-impl Default for NetworkBaselines {
-    fn default() -> Self {
-        Self {
-            prev_units: HashMap::new(),
-            prev_cities: HashMap::new(),
-            prev_funds: HashMap::new(),
-            prev_vision: HashMap::new(),
-            prev_border: None,
-        }
-    }
-}
-
 /// Result of a single network-phase invocation.
 pub(crate) struct NetworkPhaseResult {
     pub wire_bytes: u64,
     pub deltas_sent: u32,
     pub encoded: Vec<(String, Vec<u8>)>,
+    /// W5: the shared (player-independent) deltas, exposed so the spectator
+    /// path can reuse them instead of recomputing the whole shared phase.
+    /// Computed against the pre-commit baseline (what the players saw).
+    pub shared: SharedDeltas,
+    pub grid_width: u32,
+    /// W6: number of shared unit updates this tick (before the P× per-player
+    /// fan-out) — the churn metric for digest quantization. Only read by the
+    /// benchmark harness, hence the allow.
+    #[allow(dead_code)]
+    pub unit_updates: u32,
 }
 
 /// Run the full per-tick network phase: snapshot, per-player delta build,
@@ -397,9 +452,10 @@ pub(crate) struct NetworkPhaseResult {
 pub(crate) fn run_network_phase(
     game: &Game,
     baselines: &mut NetworkBaselines,
-    player_ids: &[String],
-    current_units: &[UnitState],
-    current_cities: &[CityState],
+    player_ids: &[&str],
+    current_units: Vec<UnitState>,
+    current_cities: Vec<CityState>,
+    spliced: bool,
 ) -> NetworkPhaseResult {
     // N2: borrowed ID set for removed-units check (no deep clones)
     let current_unit_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
@@ -408,68 +464,98 @@ pub(crate) fn run_network_phase(
     let border_grid: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
     let grid_width = game.terrain_width();
 
-    let mut result = NetworkPhaseResult {
-        wire_bytes: 0,
-        deltas_sent: 0,
-        encoded: Vec::new(),
-    };
-
     // W-2: compute player-independent deltas once per tick, not once per player.
     let shared = compute_shared_deltas(
         &baselines.prev_units,
         &baselines.prev_cities,
-        current_units,
-        current_cities,
+        &current_units,
+        &current_cities,
         &current_unit_ids,
         baselines.prev_border.as_ref(),
         &border_grid,
     );
 
+    // W9 (stretch, opt-in): pre-encode the shared delta segments ONCE per
+    // tick so the per-player encode splices them in instead of re-serializing
+    // them P times. Only built when the caller enables the splice path; the
+    // standard `encode_message_with_hint` path (default) is untouched.
+    let splice_shared = spliced.then(|| {
+        crate::server::protocol::SpliceShared::build(
+            shared.border_grid_diff.as_ref(),
+            &shared.units_added,
+            &shared.units_removed,
+            &shared.unit_updates,
+            &shared.city_updates,
+        )
+    });
+
+    // W6: capture the shared update count before `shared` is moved into result.
+    let unit_updates = shared.unit_updates.len() as u32;
+
+    let mut result = NetworkPhaseResult {
+        wire_bytes: 0,
+        deltas_sent: 0,
+        encoded: Vec::new(),
+        shared,
+        grid_width,
+        unit_updates,
+    };
+
     for pid in player_ids {
         let vision_grid = game.vision_grid_flat(pid);
-        let prev_vision: Option<&Arc<Vec<u8>>> = baselines.prev_vision.get(pid);
+        let prev_vision: Option<&Arc<Vec<u8>>> = baselines.prev_vision.get(*pid);
 
         if let Some(delta) = build_delta_inner(
-            &baselines.prev_units,
             &baselines.prev_funds,
             prev_vision,
-            current_units,
             &all_funds,
             &vision_grid,
             grid_width,
             pid,
-            &shared,
+            &result.shared,
         ) {
-            // N5: pre-size the CBOR buffer
             let delta_ref = match &delta {
                 ServerMessage::DeltaState(d) => d,
                 _ => unreachable!(),
             };
-            let cap = estimate_delta_size(delta_ref);
-            let encoded = encode_message_with_hint(&delta, cap);
+            let encoded = if let Some(ss) = &splice_shared {
+                // W9: splice the shared segments in (byte-for-byte identical to
+                // the standard encoder, pinned by the byte-for-byte test).
+                let map_bytes = crate::server::protocol::encode_delta_spliced(delta_ref, ss);
+                let mut out = Vec::with_capacity(
+                    crate::server::protocol::DELTA_STATE_VARIANT_WRAPPER.len() + map_bytes.len(),
+                );
+                out.extend_from_slice(&crate::server::protocol::DELTA_STATE_VARIANT_WRAPPER);
+                out.extend_from_slice(&map_bytes);
+                out
+            } else {
+                // N5: pre-size the CBOR buffer
+                let cap = estimate_delta_size(delta_ref);
+                encode_message_with_hint(&delta, cap)
+            };
             result.wire_bytes += encoded.len() as u64;
             result.deltas_sent += 1;
-            result.encoded.push((pid.clone(), encoded));
+            result.encoded.push((pid.to_string(), encoded));
         }
 
         // N1: commit Arc refcount bump (no allocation)
         if let Some(v) = &vision_grid {
-            baselines.prev_vision.insert(pid.clone(), Arc::clone(v));
+            baselines.prev_vision.insert(pid.to_string(), Arc::clone(v));
         }
     }
 
-    // Commit shared baselines. `current_units` / `current_cities` are borrowed
-    // from the caller (W-1: the snapshot is now built once upstream and shared
-    // with the active-player check), so the baseline maps are built by cloning
-    // each element out of the slice. This is the single full unit snapshot per
-    // tick — the previous implementation built a *second* one here.
+    // Commit shared baselines by move. The caller hands us the tick's snapshot
+    // (W-1: built once upstream and shared with the active-player check), so
+    // the baseline maps are built by moving each element in — only the key
+    // String is cloned. This replaces the per-element deep clone of every
+    // UnitState (4 Strings + 3 Vecs) / CityState that happened here every tick.
     baselines.prev_units = current_units
-        .iter()
-        .map(|u| (u.id.clone(), u.clone()))
+        .into_iter()
+        .map(|u| (u.id.clone(), u))
         .collect();
     baselines.prev_cities = current_cities
-        .iter()
-        .map(|c| (c.id.clone(), c.clone()))
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
         .collect();
     baselines.prev_funds = all_funds;
     baselines.prev_border = border_grid;
@@ -517,25 +603,22 @@ pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameS
         })
         .collect();
 
-    let cities: Vec<crate::llm::agent::CityState> = game
-        .query_cities()
-        .iter()
-        .filter(|city| {
-            let (gx, gy) = (city.position.0 as usize, city.position.1 as usize);
-            city.owner.as_deref() == Some(player_id)
-                || (gy < vision_grid.len() && gx < vision_grid[gy].len() && vision_grid[gy][gx])
-        })
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|c| crate::llm::agent::CityState {
-            id: c.id,
-            owner: c.owner,
-            level: c.level,
-            position: c.position,
-            manpower: 0,
-        })
-        .collect();
+    let cities: Vec<crate::llm::agent::CityState> = game.with_cities(|all| {
+        all.iter()
+            .filter(|city| {
+                let (gx, gy) = (city.position.0 as usize, city.position.1 as usize);
+                city.owner.as_deref() == Some(player_id)
+                    || (gy < vision_grid.len() && gx < vision_grid[gy].len() && vision_grid[gy][gx])
+            })
+            .map(|c| crate::llm::agent::CityState {
+                id: c.id.clone(),
+                owner: c.owner.clone(),
+                level: c.level,
+                position: c.position,
+                manpower: 0,
+            })
+            .collect()
+    });
 
     let funds: u32 = game.all_player_funds().get(player_id).copied().unwrap_or(0);
 
@@ -619,17 +702,7 @@ mod tests {
             None,
             &None,
         );
-        build_delta_inner(
-            prev_units,
-            prev_funds,
-            None,
-            current_units,
-            all_funds,
-            &None,
-            0,
-            player_id,
-            &shared,
-        )
+        build_delta_inner(prev_funds, None, all_funds, &None, 0, player_id, &shared)
     }
 
     fn as_delta(msg: Option<ServerMessage>) -> GameDeltaMessage {
@@ -680,6 +753,45 @@ mod tests {
         assert_eq!(d.unit_updates[0].position, Some((3.0, 2.0)));
         assert!(d.units_added.is_empty());
         assert!(d.units_removed.is_empty());
+    }
+
+    #[test]
+    fn spectator_pre_commit_baseline_sees_shared_updates() {
+        // W1 backfill: the spectator block runs against the PRE-commit
+        // baseline (the snapshot is moved into run_network_phase after the
+        // spectator delta is built), so a moved unit appears in the spectator's
+        // shared unit_updates. pid "" has no prev_funds entry, mirroring
+        // production (PlayerConnection::Spectator -> id "").
+        let prev_units = vec![unit("u1", "a", 1.0, 2.0)];
+        let curr_units = vec![unit("u1", "a", 3.0, 2.0)];
+        let all_funds = funds("a", 10);
+        let pu = units_map(&prev_units);
+        let pc = HashMap::new();
+        let pf = all_funds.clone();
+
+        let msg = run(&pu, &pc, &pf, &curr_units, &[], &all_funds, "");
+        let d = as_delta(msg);
+        assert_eq!(d.player.player_id, "");
+        assert_eq!(d.unit_updates.len(), 1);
+        assert_eq!(d.unit_updates[0].id, "u1");
+        assert_eq!(d.unit_updates[0].position, Some((3.0, 2.0)));
+    }
+
+    #[test]
+    fn spectator_idle_tick_returns_none() {
+        // W5: the spectator pid "" has no funds baseline entry, so before the
+        // empty-pid special case `funds_changed` was always true and the
+        // spectator received a delta message every tick. A truly idle tick
+        // (no shared deltas, no vision diff, no ownership change) must yield
+        // None now.
+        let units = vec![unit("u1", "a", 1.0, 2.0)];
+        let all_funds = funds("a", 10); // no "" entry, mirroring production
+        let pu = units_map(&units);
+        let pc = HashMap::new();
+        let pf = all_funds.clone();
+
+        let msg = run(&pu, &pc, &pf, &units, &[], &all_funds, "");
+        assert!(msg.is_none());
     }
 
     #[test]
@@ -752,10 +864,8 @@ mod tests {
 
         let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None);
         let msg = build_delta_inner(
-            &pu,
             &pf,
             None,
-            &[],
             &all_funds,
             &Some(Arc::clone(&vision)),
             2,
@@ -763,11 +873,59 @@ mod tests {
             &shared,
         );
         let d = as_delta(msg);
-        // Wire format is flat Vec<u8>
-        let expected: Vec<u8> = vision.as_slice().to_vec();
-        assert_eq!(d.vision_grid_diff, Some(expected));
+        // Wire format is flat u8; W3: the Arc is shared, not copied.
+        assert_eq!(
+            d.vision_grid_diff.as_ref().map(|v| v.as_slice()),
+            Some(vision.as_slice())
+        );
+        assert!(Arc::ptr_eq(d.vision_grid_diff.as_ref().unwrap(), &vision));
         assert!(d.border_grid_diff.is_none());
         assert_eq!(d.grid_width, Some(2));
+    }
+
+    #[test]
+    fn grid_diff_shares_arc() {
+        // W3: changed border and vision grids are shared via Arc refcount
+        // instead of 40 KB deep copies.
+        let all_funds = funds("a", 0);
+        let pu = HashMap::new();
+        let pc = HashMap::new();
+        let pf = all_funds.clone();
+        let current_unit_ids: HashSet<&str> = HashSet::new();
+
+        // Border: prev differs from curr -> diff must BE the curr Arc.
+        let prev_border = Arc::new(vec![255u8, 255, 255, 255]);
+        let curr_border = Arc::new(vec![0u8, 1, 2, 3]);
+        let shared = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            Some(&prev_border),
+            &Some(Arc::clone(&curr_border)),
+        );
+        assert!(
+            Arc::ptr_eq(shared.border_grid_diff.as_ref().unwrap(), &curr_border),
+            "border diff must share the published Arc"
+        );
+
+        // Vision: no prev -> diff must BE the curr Arc.
+        let vision = Arc::new(vec![1u8, 0, 0, 1]);
+        let msg = build_delta_inner(
+            &pf,
+            None,
+            &all_funds,
+            &Some(Arc::clone(&vision)),
+            2,
+            "a",
+            &shared,
+        );
+        let d = as_delta(msg);
+        assert!(
+            Arc::ptr_eq(d.vision_grid_diff.as_ref().unwrap(), &vision),
+            "vision diff must share the published Arc"
+        );
     }
 
     #[test]
@@ -840,10 +998,8 @@ mod tests {
 
         // Player A: vision changed from None to Some(vision_a) -> diff present
         let msg_a = build_delta_inner(
-            &pu,
             &pf,
             None,
-            &[],
             &all_funds,
             &Some(Arc::clone(&vision_a)),
             2,
@@ -851,12 +1007,69 @@ mod tests {
             &shared,
         );
         let d_a = as_delta(msg_a);
-        let expected_a: Vec<u8> = vision_a.as_slice().to_vec();
-        assert_eq!(d_a.vision_grid_diff, Some(expected_a));
+        assert_eq!(
+            d_a.vision_grid_diff.as_ref().map(|v| v.as_slice()),
+            Some(vision_a.as_slice())
+        );
 
         // Player B: vision unchanged (both None) -> no diff
-        let msg_b = build_delta_inner(&pu, &pf, None, &[], &all_funds, &None, 2, "b", &shared);
+        let msg_b = build_delta_inner(&pf, None, &all_funds, &None, 2, "b", &shared);
         assert!(msg_b.is_none());
+    }
+
+    #[test]
+    fn owner_count_maps_match_scan() {
+        // W8: the precomputed per-owner count maps must equal the brute-force
+        // per-unit scan they replace.
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        // 3 owners × 5 units, plus one owner that disappears and one that appears.
+        for i in 0..5 {
+            prev.push(unit(&format!("p0_{}", i), "a", 0.0, 0.0));
+            prev.push(unit(&format!("p1_{}", i), "b", 0.0, 0.0));
+            prev.push(unit(&format!("p2_{}", i), "gone", 0.0, 0.0));
+        }
+        for i in 0..5 {
+            curr.push(unit(&format!("c0_{}", i), "a", 0.0, 0.0));
+            curr.push(unit(&format!("c1_{}", i), "b", 0.0, 0.0));
+            curr.push(unit(&format!("c2_{}", i), "new", 0.0, 0.0));
+        }
+        let pu = units_map(&prev);
+        let cu = curr.clone();
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            &pu,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        // Brute-force counts for the CURRENT set.
+        for (owner, expected) in [("a", 5u32), ("b", 5), ("new", 5)] {
+            assert_eq!(
+                shared
+                    .current_units_by_owner
+                    .get(owner)
+                    .copied()
+                    .unwrap_or(0),
+                expected,
+                "current count for {owner}"
+            );
+        }
+        assert_eq!(shared.current_units_by_owner.len(), 3);
+
+        // Brute-force counts for the PREV set (owner "gone" present, "new" absent).
+        for (owner, expected) in [("a", 5u32), ("b", 5), ("gone", 5)] {
+            assert_eq!(
+                shared.prev_units_by_owner.get(owner).copied().unwrap_or(0),
+                expected,
+                "prev count for {owner}"
+            );
+        }
+        assert_eq!(shared.prev_units_by_owner.len(), 3);
     }
 
     #[test]
@@ -868,10 +1081,8 @@ mod tests {
         let mut curr = unit("u1", "a", 1.0, 2.0);
         curr.men = 50.3; // only 0.3 difference — within one quantization step
 
-        let all_funds = funds("a", 10);
         let pu = units_map(&[prev.clone()]);
         let pu_ref = &pu;
-        let pf = all_funds.clone();
         let cu = vec![curr];
 
         let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
@@ -897,10 +1108,8 @@ mod tests {
         let mut curr = unit("u1", "a", 1.0, 2.0);
         curr.men = 51.0; // exactly 1.0 difference
 
-        let all_funds = funds("a", 10);
         let pu = units_map(&[prev.clone()]);
         let pu_ref = &pu;
-        let pf = all_funds.clone();
         let cu = vec![curr];
 
         let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
@@ -973,5 +1182,117 @@ mod tests {
         assert_eq!(shared.unit_updates.len(), 1);
         assert_eq!(shared.unit_updates[0].id, "u1");
         assert_eq!(shared.unit_updates[0].organisation, Some(81.0));
+    }
+
+    #[test]
+    fn digest_quantized_supply_equal_within_step() {
+        // W6: supply differs by 0.2, within one QUANT_SUPPLY step (99.7 and
+        // 99.9 both round to 100.0) → digests equal → no update emitted.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.supply_percent = 99.7;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.supply_percent = 99.9;
+
+        let pu = units_map(&[prev.clone()]);
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            &pu,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        assert!(shared.unit_updates.is_empty());
+    }
+
+    #[test]
+    fn digest_quantized_supply_differs_across_step() {
+        // W6: supply differs by 1.0 (99.7 → 98.7: 100.0 vs 99.0) → digests
+        // differ → update emitted, carrying the EXACT (unquantized) value.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.supply_percent = 99.7;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.supply_percent = 98.7;
+
+        let pu = units_map(&[prev.clone()]);
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            &pu,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        assert_eq!(shared.unit_updates.len(), 1);
+        assert_eq!(shared.unit_updates[0].id, "u1");
+        assert_eq!(shared.unit_updates[0].supply_percent, Some(98.7));
+    }
+
+    #[test]
+    fn digest_quantized_boat_supply_equal_within_step() {
+        // W6: boat supply differs by 0.3, within one step (55.1 and 55.4
+        // both round to 55.0) → no update emitted.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.on_water = true;
+        prev.boat_supply_percent = 55.1;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.on_water = true;
+        curr.boat_supply_percent = 55.4;
+
+        let pu = units_map(&[prev.clone()]);
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            &pu,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        assert!(shared.unit_updates.is_empty());
+    }
+
+    #[test]
+    fn digest_quantized_boat_supply_differs_across_step() {
+        // W6: boat supply crosses a step (55.4 → 55.9: 55.0 vs 56.0) →
+        // update emitted, carrying the exact value.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.on_water = true;
+        prev.boat_supply_percent = 55.4;
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.on_water = true;
+        curr.boat_supply_percent = 55.9;
+
+        let pu = units_map(&[prev.clone()]);
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            &pu,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+        );
+
+        assert_eq!(shared.unit_updates.len(), 1);
+        assert_eq!(shared.unit_updates[0].id, "u1");
+        assert_eq!(shared.unit_updates[0].boat_supply_percent, Some(55.9));
     }
 }
