@@ -10,6 +10,8 @@
 #   --bench-cities 100            10×10 city lattice (realistic city:unit ratio; the
 #                                 authored 12-city layout is a poor fit for a 10k army)
 #   --bench-ticks 1500            tick count (pass --bench-ticks N for a short smoke run)
+#   --bench-splice                splice encoder (production parity: game_server always
+#                                 runs the splice path, so the A/B harness must too)
 # Any other args (e.g. --bench-seed) are forwarded as-is.
 
 SUFFIX="${1:?usage: run-stresstest.sh <report-suffix> [extra args]}"
@@ -31,6 +33,7 @@ has_flag --bench-initial-units "${EXTRA[@]}" || EXTRA+=(--bench-initial-units 10
 has_flag --bench-map-size "${EXTRA[@]}" || EXTRA+=(--bench-map-size 1000)
 has_flag --bench-cities "${EXTRA[@]}" || EXTRA+=(--bench-cities 100)
 has_flag --bench-ticks "${EXTRA[@]}" || EXTRA+=(--bench-ticks 1500)
+has_flag --bench-splice "${EXTRA[@]}" || EXTRA+=(--bench-splice)
 
 cargo run --profile release --features debug-overlay,microbenchmarks,bench-alloc -- \
     --benchmark --bench-seed 42 \

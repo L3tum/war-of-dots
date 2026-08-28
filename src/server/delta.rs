@@ -444,6 +444,23 @@ pub(crate) struct NetworkPhaseResult {
     /// benchmark harness, hence the allow.
     #[allow(dead_code)]
     pub unit_updates: u32,
+    /// B0: sub-phase timing — shared compute (`compute_shared_deltas` +
+    /// `SpliceShared::build`) plus the per-player `build_delta_inner` calls,
+    /// in ms. Feature-gated so a production build pays zero timing cost (the
+    /// field doesn't exist).
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    #[allow(dead_code)]
+    pub delta_ms: f64,
+    /// B0: sub-phase timing — the per-player CBOR encode calls
+    /// (`encode_delta_spliced` / `encode_message_with_hint`), in ms.
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    #[allow(dead_code)]
+    pub encode_ms: f64,
+    /// B0: true when this tick emitted a border or per-player vision grid diff
+    /// (the grid-clean vs grid-dirty split for the benchmark's regime table).
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    #[allow(dead_code)]
+    pub grid_dirty: bool,
 }
 
 /// Run the full per-tick network phase: snapshot, per-player delta build,
@@ -464,7 +481,14 @@ pub(crate) fn run_network_phase(
     let border_grid: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
     let grid_width = game.terrain_width();
 
+    // B0: sub-phase timing accumulators (feature-gated; zero cost in a
+    // production build where the corresponding `Instant`s are compiled out).
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    let (mut delta_ms, mut encode_ms) = (0.0f64, 0.0f64);
+
     // W-2: compute player-independent deltas once per tick, not once per player.
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    let shared_start = std::time::Instant::now();
     let shared = compute_shared_deltas(
         &baselines.prev_units,
         &baselines.prev_cities,
@@ -474,11 +498,23 @@ pub(crate) fn run_network_phase(
         baselines.prev_border.as_ref(),
         &border_grid,
     );
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    {
+        delta_ms += shared_start.elapsed().as_secs_f64() * 1000.0;
+    }
+    // B0: border diff is player-independent; per-player vision diffs are
+    // detected in the loop below.
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    let mut grid_dirty = shared.border_grid_diff.is_some();
 
     // W9 (stretch, opt-in): pre-encode the shared delta segments ONCE per
     // tick so the per-player encode splices them in instead of re-serializing
     // them P times. Only built when the caller enables the splice path; the
     // standard `encode_message_with_hint` path (default) is untouched.
+    // B0: `SpliceShared::build` is shared-segment encoding, so it is charged
+    // to the encode sub-phase (the elapsed window is ~0 when `!spliced`).
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    let splice_start = std::time::Instant::now();
     let splice_shared = spliced.then(|| {
         crate::server::protocol::SpliceShared::build(
             shared.border_grid_diff.as_ref(),
@@ -488,6 +524,10 @@ pub(crate) fn run_network_phase(
             &shared.city_updates,
         )
     });
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    {
+        encode_ms += splice_start.elapsed().as_secs_f64() * 1000.0;
+    }
 
     // W6: capture the shared update count before `shared` is moved into result.
     let unit_updates = shared.unit_updates.len() as u32;
@@ -499,13 +539,25 @@ pub(crate) fn run_network_phase(
         shared,
         grid_width,
         unit_updates,
+        // B0: sub-phase fields (feature-gated; see the struct definition).
+        #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+        delta_ms,
+        #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+        encode_ms,
+        #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+        grid_dirty,
     };
 
     for pid in player_ids {
+        // B0: per-player delta-build window (vision lookup + build_delta_inner
+        // are the player-dependent half of the "delta" sub-phase). Deliberately
+        // disjoint from the encode window below, so the report's sub-rows
+        // (snapshot + delta + encode) are non-overlapping parts of `net`.
+        #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+        let player_delta_start = std::time::Instant::now();
         let vision_grid = game.vision_grid_flat(pid);
         let prev_vision: Option<&Arc<Vec<u8>>> = baselines.prev_vision.get(*pid);
-
-        if let Some(delta) = build_delta_inner(
+        let built = build_delta_inner(
             &baselines.prev_funds,
             prev_vision,
             &all_funds,
@@ -513,11 +565,24 @@ pub(crate) fn run_network_phase(
             grid_width,
             pid,
             &result.shared,
-        ) {
+        );
+        #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+        {
+            delta_ms += player_delta_start.elapsed().as_secs_f64() * 1000.0;
+        }
+
+        if let Some(delta) = built {
             let delta_ref = match &delta {
                 ServerMessage::DeltaState(d) => d,
                 _ => unreachable!(),
             };
+            #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+            if delta_ref.vision_grid_diff.is_some() {
+                grid_dirty = true;
+            }
+            // B0: encode sub-phase window (per-player serialize call only).
+            #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+            let encode_start = std::time::Instant::now();
             let encoded = if let Some(ss) = &splice_shared {
                 // W9: splice the shared segments in (byte-for-byte identical to
                 // the standard encoder, pinned by the byte-for-byte test).
@@ -533,6 +598,10 @@ pub(crate) fn run_network_phase(
                 let cap = estimate_delta_size(delta_ref);
                 encode_message_with_hint(&delta, cap)
             };
+            #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+            {
+                encode_ms += encode_start.elapsed().as_secs_f64() * 1000.0;
+            }
             result.wire_bytes += encoded.len() as u64;
             result.deltas_sent += 1;
             result.encoded.push((pid.to_string(), encoded));
@@ -542,6 +611,15 @@ pub(crate) fn run_network_phase(
         if let Some(v) = &vision_grid {
             baselines.prev_vision.insert(pid.to_string(), Arc::clone(v));
         }
+    }
+
+    // B0: the accumulators only reached `result` at construction (Copy types),
+    // so copy the per-player loop totals back in here, after the loop.
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    {
+        result.delta_ms = delta_ms;
+        result.encode_ms = encode_ms;
+        result.grid_dirty = grid_dirty;
     }
 
     // Commit shared baselines by move. The caller hands us the tick's snapshot

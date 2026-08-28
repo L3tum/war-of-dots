@@ -103,3 +103,113 @@ fn stress_benchmark() {
     }
     println!("BENCH DONE");
 }
+
+/// Round-3 (B0) baseline: same config as `reports/stress_22.html` (CLI default
+/// `units_per_city: 20` — NOT the 5 used by the older `stress_benchmark` test)
+/// with the splice encoder ON (production parity — `run-stresstest.sh` now
+/// defaults to `--bench-splice`) and no detailed sub-part systems, matching
+/// the shape of the pre-B0 baseline `reports/stress_22.html`. Writes the HTML
+/// report to `reports/stress_base_r3.html` for the B0 A/B commit and prints
+/// the network sub-phase + idle/movement × grid split for the commit message.
+#[test]
+#[ignore]
+fn stress_benchmark_base_r3() {
+    let config = BenchmarkConfig {
+        units_per_city: 20,
+        ticks: 1500,
+        seed: 42,
+        detailed_systems: vec![],
+        bench_prev: None,
+        initial_units: Some(10_000),
+        map_size: 1000,
+        cities: 100,
+        max_recruits_per_event: 2000,
+        bench_spectator: false,
+        bench_splice: true,
+    };
+    let results = run_benchmark(config);
+    let s = &results.summary;
+
+    if let Ok(()) = std::fs::create_dir_all("reports") {
+        let html = war_of_dots::benchmark::generate_html_report(&results, None);
+        let _ = std::fs::write("reports/stress_base_r3.html", html);
+    }
+
+    println!(
+        "BENCH WALL avg={} p50={} p99={} (ms)",
+        s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]
+    );
+    println!(
+        "BENCH SANITY units_remaining={} avg_combats={} avg_system_ms={}",
+        s["results"]["units_remaining"],
+        s["results"]["avg_combats_per_tick"],
+        s["results"]["avg_system_ms"]
+    );
+    if let Some(arr) = s["system_timings"].as_array() {
+        for row in arr {
+            if row["name"] == "network" {
+                println!(
+                    "BENCH NETWORK avg_ms={} p50={} p90={} p99={} calls={}",
+                    row["avg_ms"].as_f64().unwrap_or(0.0),
+                    row["p50_ms"].as_f64().unwrap_or(0.0),
+                    row["p90_ms"].as_f64().unwrap_or(0.0),
+                    row["p99_ms"].as_f64().unwrap_or(0.0),
+                    row["call_count"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    println!("BENCH NET subphase_ms={}", s["network"]["subphase_ms"]);
+    println!("BENCH NET split={}", s["network"]["split"]);
+    println!("BENCH DONE");
+}
+
+/// Same as `stress_benchmark_base_r3` but with the splice encoder OFF — the
+/// in-environment A/B control for the B0 splice-parity shift (stress_22 was
+/// generated with splice off, before `run-stresstest.sh` defaulted it on).
+#[test]
+#[ignore]
+fn stress_benchmark_base_r3_nosplice() {
+    let config = BenchmarkConfig {
+        units_per_city: 20,
+        ticks: 1500,
+        seed: 42,
+        detailed_systems: vec![],
+        bench_prev: None,
+        initial_units: Some(10_000),
+        map_size: 1000,
+        cities: 100,
+        max_recruits_per_event: 2000,
+        bench_spectator: false,
+        bench_splice: false,
+    };
+    let results = run_benchmark(config);
+    let s = &results.summary;
+
+    if let Ok(()) = std::fs::create_dir_all("reports") {
+        let html = war_of_dots::benchmark::generate_html_report(&results, None);
+        let _ = std::fs::write("reports/stress_base_r3_nosplice.html", html);
+    }
+
+    println!(
+        "BENCH WALL avg={} p50={} p99={} (ms)",
+        s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]
+    );
+    if let Some(arr) = s["system_timings"].as_array() {
+        for row in arr {
+            if row["name"] == "network" {
+                println!(
+                    "BENCH NETWORK avg_ms={} p50={} p90={} p99={} calls={}",
+                    row["avg_ms"].as_f64().unwrap_or(0.0),
+                    row["p50_ms"].as_f64().unwrap_or(0.0),
+                    row["p90_ms"].as_f64().unwrap_or(0.0),
+                    row["p99_ms"].as_f64().unwrap_or(0.0),
+                    row["call_count"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    println!("BENCH NET subphase_ms={}", s["network"]["subphase_ms"]);
+    println!("BENCH NET split={}", s["network"]["split"]);
+    println!("BENCH DONE");
+}

@@ -63,6 +63,23 @@ pub struct TickData {
     pub net_ms: f64,
     /// Network phase: shared unit updates this tick (W6 churn metric)
     pub net_unit_updates: u32,
+    /// B0 sub-phase: unit/city snapshot (`unit_states_direct` + cities read-back)
+    /// in ms. 0 when the timing features are off.
+    pub net_snapshot_ms: f64,
+    /// B0 sub-phase: shared compute (`compute_shared_deltas` +
+    /// `SpliceShared::build`) plus the per-player `build_delta_inner` calls,
+    /// in ms. 0 when the timing features are off.
+    pub net_delta_ms: f64,
+    /// B0 sub-phase: per-player CBOR encode (splice or standard) in ms.
+    /// 0 when the timing features are off.
+    pub net_encode_ms: f64,
+    /// B0 sub-phase: egress send loop in ms. Always 0 in the headless
+    /// benchmark: it encodes bytes in memory but models no outbox/WS bridge.
+    pub net_send_ms: f64,
+    /// B0: true when this tick emitted a vision or border grid diff (any
+    /// player, or the synthetic spectator under --bench-spectator). Drives the
+    /// grid-clean vs grid-dirty sub-split of the idle/movement regimes.
+    pub net_grid_dirty: bool,
 }
 
 /// Benchmark configuration
@@ -101,9 +118,11 @@ pub struct BenchmarkConfig {
     /// the spectator delta cost. Seeds a baseline for pid "" from the union
     /// vision grid before warmup.
     pub bench_spectator: bool,
-    /// W9 (stretch): enable the splice encoder path in the benchmark's network
-    /// phase so the A/B harness can measure `net_ms` with the shared segments
-    /// encoded once and spliced per player. Default off (production path).
+    /// W9 / B0: enable the splice encoder path in the benchmark's network
+    /// phase so the A/B harness measures the SAME encoder production uses
+    /// (`game_server` always passes `spliced = true`). Default off when built
+    /// in code, but `run-stresstest.sh` passes `--bench-splice` by default
+    /// for production parity.
     pub bench_splice: bool,
 }
 
@@ -281,10 +300,13 @@ fn bench_spectator_delta(
     player_ids: &[String],
     phase: &crate::server::delta::NetworkPhaseResult,
     spliced: bool,
-) -> u64 {
+) -> (u64, bool) {
     let spec_pid = String::new();
     let spec_vision: Option<Arc<Vec<u8>>> = game.union_vision_grid_flat(player_ids).map(Arc::new);
     let prev_spec_vision: Option<&Arc<Vec<u8>>> = net_baselines.prev_vision.get(&spec_pid);
+    // B0: second return value — did the emitted spectator delta carry the
+    // union vision grid diff (i.e. did this tick ship a grid diff to a viewer)?
+    let mut spec_grid_dirty = false;
     let emitted = if let Some(delta) = build_delta_inner(
         &net_baselines.prev_funds,
         prev_spec_vision,
@@ -298,6 +320,7 @@ fn bench_spectator_delta(
             ServerMessage::DeltaState(d) => d,
             _ => unreachable!(),
         };
+        spec_grid_dirty = dref.vision_grid_diff.is_some();
         if spliced {
             let ss = crate::server::protocol::SpliceShared::build(
                 phase.shared.border_grid_diff.as_ref(),
@@ -326,7 +349,10 @@ fn bench_spectator_delta(
             .prev_vision
             .insert(spec_pid.clone(), Arc::clone(v));
     }
-    emitted.map(|e| e.len() as u64).unwrap_or(0)
+    (
+        emitted.map(|e| e.len() as u64).unwrap_or(0),
+        spec_grid_dirty,
+    )
 }
 
 /// Run a benchmark using a fresh game and return detailed results.
@@ -734,22 +760,51 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // The unit_states_direct() + query_cities() snapshot is inside the
             // timing block so its allocs are attributed to "network" (matching
             // the pre-W1 behaviour where run_network_phase called them internally).
-            let net_phase = crate::tick_system!("network", &mut game.world, game.world_entity, {
-                let current_units = game.unit_states_direct();
-                // W7: convert City → CityState while the world guard is alive
-                // (no per-tick Vec<City> clone).
-                let current_cities: Vec<CityState> =
-                    game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
-                run_network_phase(
-                    &game,
-                    &mut net_baselines,
-                    &player_id_strs,
-                    current_units,
-                    current_cities,
-                    config.bench_splice,
-                )
-            });
+            let (net_phase, net_snapshot_ms) =
+                crate::tick_system!("network", &mut game.world, game.world_entity, {
+                    // B0: snapshot sub-phase (unit_states_direct + cities
+                    // read-back), feature-gated so production builds pay zero
+                    // timing cost.
+                    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+                    let snapshot_start = std::time::Instant::now();
+                    let current_units = game.unit_states_direct();
+                    // W7: convert City → CityState while the world guard is alive
+                    // (no per-tick Vec<City> clone).
+                    let current_cities: Vec<CityState> =
+                        game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
+                    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+                    let snapshot_ms = snapshot_start.elapsed().as_secs_f64() * 1000.0;
+                    #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+                    let snapshot_ms = 0.0f64;
+                    (
+                        run_network_phase(
+                            &game,
+                            &mut net_baselines,
+                            &player_id_strs,
+                            current_units,
+                            current_cities,
+                            config.bench_splice,
+                        ),
+                        snapshot_ms,
+                    )
+                });
             let mut net_wire_bytes = net_phase.wire_bytes;
+
+            // B0: sub-phase ms reported by run_network_phase (delta = shared
+            // compute + per-player build; encode = per-player serialize).
+            // Feature-gated: the result fields only exist with the timing
+            // features, so fall back to 0.0 otherwise.
+            #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+            let (net_delta_ms, net_encode_ms) = (net_phase.delta_ms, net_phase.encode_ms);
+            #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+            let (net_delta_ms, net_encode_ms) = (0.0f64, 0.0f64);
+            // B0: grid-dirty = a vision/border grid diff was emitted this tick
+            // (players in the network phase, plus the synthetic spectator
+            // when --bench-spectator is on).
+            #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+            let mut net_grid_dirty = net_phase.grid_dirty;
+            #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+            let net_grid_dirty = false;
 
             // W5: synthetic spectator (mirrors the game_server spectator_vision
             // path) — kept OUT of the "network" tick_system block, matching
@@ -757,13 +812,22 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // Its encoded bytes are added to net_wire_bytes so idle-skip savings
             // show up in the wire metric.
             if config.bench_spectator {
-                net_wire_bytes += bench_spectator_delta(
+                let (spec_wire_bytes, spec_grid_dirty) = bench_spectator_delta(
                     &game,
                     &mut net_baselines,
                     &player_ids,
                     &net_phase,
                     config.bench_splice,
                 );
+                net_wire_bytes += spec_wire_bytes;
+                #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+                {
+                    net_grid_dirty |= spec_grid_dirty;
+                }
+                // `spec_grid_dirty` is only meaningful with the timing
+                // features; consume it elsewhere to keep the shared binding.
+                #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+                let _ = spec_grid_dirty;
             }
 
             // Capture tick_ms AFTER the network phase so total_ms includes
@@ -827,6 +891,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     net_wire_bytes,
                     net_ms,
                     net_unit_updates: net_phase.unit_updates,
+                    // B0 sub-phases (send = 0: headless bench models no egress).
+                    net_snapshot_ms,
+                    net_delta_ms,
+                    net_encode_ms,
+                    net_send_ms: 0.0,
+                    net_grid_dirty,
                 }
             } else {
                 TickData {
@@ -842,6 +912,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     net_wire_bytes,
                     net_ms: 0.0,
                     net_unit_updates: net_phase.unit_updates,
+                    // B0 sub-phases (send = 0: headless bench models no egress).
+                    net_snapshot_ms,
+                    net_delta_ms,
+                    net_encode_ms,
+                    net_send_ms: 0.0,
+                    net_grid_dirty,
                 }
             };
 
@@ -859,6 +935,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 net_wire_bytes,
                 net_ms: 0.0,
                 net_unit_updates: net_phase.unit_updates,
+                // B0 sub-phases (send = 0: headless bench models no egress).
+                net_snapshot_ms,
+                net_delta_ms,
+                net_encode_ms,
+                net_send_ms: 0.0,
+                net_grid_dirty,
             };
 
             run_tick_data.push(td);
@@ -1015,6 +1097,23 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     .iter()
                     .map(|r| r[i].net_unit_updates as f64)
                     .sum::<f64>();
+                // B0: sub-phase ms average across runs; grid-dirty is a
+                // per-tick classification (deterministic across runs, so any()
+                // == all() — the sim is seeded identically per run).
+                let sum_net_snap = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_snapshot_ms)
+                    .sum::<f64>();
+                let sum_net_delta = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_delta_ms)
+                    .sum::<f64>();
+                let sum_net_encode = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_encode_ms)
+                    .sum::<f64>();
+                let sum_net_send = runs_tick_data.iter().map(|r| r[i].net_send_ms).sum::<f64>();
+                let grid_dirty = runs_tick_data.iter().any(|r| r[i].net_grid_dirty);
                 TickData {
                     total_ms: sum_total / n,
                     entity_count: (sum_entity / n).round() as u32,
@@ -1028,6 +1127,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     net_wire_bytes: (sum_net_wire / n).round() as u64,
                     net_ms: sum_net_ms / n,
                     net_unit_updates: (sum_net_updates / n).round() as u32,
+                    net_snapshot_ms: sum_net_snap / n,
+                    net_delta_ms: sum_net_delta / n,
+                    net_encode_ms: sum_net_encode / n,
+                    net_send_ms: sum_net_send / n,
+                    net_grid_dirty: grid_dirty,
                 }
             })
             .collect()
@@ -1344,6 +1448,19 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
     };
     let max_alloc_size = tick_data.iter().map(|td| td.max_alloc).max().unwrap_or(0);
 
+    // B0: network sub-phase averages + idle/movement × grid-clean/dirty
+    // regime split, over the raw 3×N measured-tick pool (the same honest
+    // distribution the latency percentiles use). Feeds the "Network Phase"
+    // HTML section and the per-commit A/B tables.
+    let net_n = tick_data.len().max(1) as f64;
+    let net_subphase_ms = serde_json::json!({
+        "net": tick_data.iter().map(|t| t.net_ms).sum::<f64>() / net_n,
+        "snapshot": tick_data.iter().map(|t| t.net_snapshot_ms).sum::<f64>() / net_n,
+        "delta": tick_data.iter().map(|t| t.net_delta_ms).sum::<f64>() / net_n,
+        "encode": tick_data.iter().map(|t| t.net_encode_ms).sum::<f64>() / net_n,
+        "send": tick_data.iter().map(|t| t.net_send_ms).sum::<f64>() / net_n,
+    });
+
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
@@ -1394,6 +1511,19 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "system_allocs": {
             "ticks": config.ticks,
             "systems": system_allocs,
+        },
+        // B0: sub-phase split of net_ms + per-regime aggregates (idle vs
+        // movement × grid-clean vs grid-dirty). `send` is always 0 in the
+        // headless benchmark (no outbox/bridge modeled).
+        "network": {
+            "splice": config.bench_splice,
+            "subphase_ms": net_subphase_ms,
+            "split": {
+                "idle_grid_clean": network_regime_stats(&tick_data, false, false),
+                "idle_grid_dirty": network_regime_stats(&tick_data, false, true),
+                "movement_grid_clean": network_regime_stats(&tick_data, true, false),
+                "movement_grid_dirty": network_regime_stats(&tick_data, true, true),
+            },
         },
         // Per-tick arrays are the averaged series (length == config.ticks),
         // matching the charts. Note overhead_durations_ms above stays the raw
@@ -1494,6 +1624,37 @@ fn percentile(values: &[f64], p: u32) -> f64 {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let idx = ((p as f64 / 100.0) * (sorted.len() - 1) as f64) as usize;
     sorted[idx]
+}
+
+/// B0: per-regime network aggregates over the measured-tick pool. `movement`
+/// selects `movers > 0` ticks (false = idle), `grid_dirty` selects ticks that
+/// emitted a vision/border grid diff. Values are per-tick AVERAGES within the
+/// regime; all-zero when no tick matches (an empty regime is not an error).
+fn network_regime_stats(ticks: &[TickData], movement: bool, grid_dirty: bool) -> serde_json::Value {
+    let matching: Vec<&TickData> = ticks
+        .iter()
+        .filter(|t| (t.movers > 0) == movement && t.net_grid_dirty == grid_dirty)
+        .collect();
+    let n = matching.len();
+    if n == 0 {
+        return serde_json::json!({
+            "ticks": 0,
+            "net_ms": 0.0f64,
+            "net_wire_bytes": 0.0f64,
+            "net_unit_updates": 0.0f64,
+            "allocs": 0.0f64,
+            "bytes": 0.0f64,
+        });
+    }
+    let f = n as f64;
+    serde_json::json!({
+        "ticks": n,
+        "net_ms": matching.iter().map(|t| t.net_ms).sum::<f64>() / f,
+        "net_wire_bytes": matching.iter().map(|t| t.net_wire_bytes as f64).sum::<f64>() / f,
+        "net_unit_updates": matching.iter().map(|t| t.net_unit_updates as f64).sum::<f64>() / f,
+        "allocs": matching.iter().map(|t| t.allocs as f64).sum::<f64>() / f,
+        "bytes": matching.iter().map(|t| t.bytes as f64).sum::<f64>() / f,
+    })
 }
 
 /// Backward compat: return summary JSON
@@ -2349,6 +2510,77 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     .unwrap_or_else(|| "—".to_string());
     let ticks_measured = format!("{} × {}", measured_runs_cfg, tick_count);
 
+    // B0: "Network Phase" section — net_ms sub-phase averages + the
+    // idle/movement × grid-clean/grid-dirty split. Field-presence: reports
+    // generated before B0 have no "network" summary key and the section
+    // degrades to a note; previous-report deltas appear only when the prev
+    // report also carried the section.
+    let net_section_html = (|| {
+        let net = results.summary.get("network")?;
+        let sub = net.get("subphase_ms")?;
+        let cur = |k: &str| -> f64 { sub.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) };
+        let prev_sub = prev_json.get("network").and_then(|n| n.get("subphase_ms"));
+        let prev = |k: &str| -> Option<f64> {
+            prev_sub.and_then(|s| s.get(k)).and_then(|v| v.as_f64())
+        };
+        let splice_str = match net.get("splice").and_then(|v| v.as_bool()) {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "?",
+        };
+        let mut html = format!(
+            "<h2>Network Phase</h2>\n        <p class='note'>Sub-phases of the per-tick network phase (splice encoder <b>{}</b> in the benchmark). <b>net</b> = the whole tick_system!-wrapped phase (snapshot + delta + encode + baseline commit); the sub-rows are the measured parts, so their sum is ≤ net. <b>send</b> is always 0: the headless benchmark encodes in memory and models no outbox/WS bridge. ms/Tick = average over all {} measured ticks.</p>\n        <table>\n            <thead><tr><th>Sub-phase</th><th>ms/Tick (avg)</th></tr></thead>\n            <tbody>\n      ",
+            splice_str, measured_runs_cfg * tick_count.max(1)
+        );
+        for name in ["net", "snapshot", "delta", "encode", "send"] {
+            let value = format!("{:.3}", cur(name));
+            html.push_str(&format!("{}\n      ", cell_delta(&value, cur(name), prev(name), "ms", MS)));
+        }
+        html.push_str("\n            </tbody>\n        </table>");
+
+        if let Some(split) = net.get("split") {
+            html.push_str(
+                "\n        <h3>Idle / Movement × Grid-Clean / Grid-Dirty</h3>\n        <p class='note'>Per-regime averages over measured ticks. Regime = movers == 0 (idle) vs movers &gt; 0 (movement); grid-dirty = a vision/border grid diff was emitted that tick (influence recompute makes ~29% of ticks grid-dirty even at zero movers). Wire/allocs/bytes are per-tick averages within the regime.</p>\n        <table>\n            <thead><tr><th>Regime</th><th>Ticks</th><th>net ms/Tick</th><th>Wire/Tick</th><th>Unit Updates/Tick</th><th>Allocs/Tick</th><th>Bytes/Tick</th></tr></thead>\n            <tbody>",
+            );
+            let regimes: [(&str, &str); 4] = [
+                ("Idle · grid-clean", "idle_grid_clean"),
+                ("Idle · grid-dirty", "idle_grid_dirty"),
+                ("Movement · grid-clean", "movement_grid_clean"),
+                ("Movement · grid-dirty", "movement_grid_dirty"),
+            ];
+            for (label, key) in regimes {
+                let r = match split.get(key) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let n = r.get("ticks").and_then(|v| v.as_u64()).unwrap_or(0);
+                let net_ms = r.get("net_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let wire = r.get("net_wire_bytes").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let updates = r
+                    .get("net_unit_updates")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let allocs = r.get("allocs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let bytes = r.get("bytes").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                html.push_str(&format!(
+                    "\n      <tr><td>{}</td><td>{}</td><td>{:.3}</td><td>{}</td><td>{:.1}</td><td>{:.1}</td><td>{}</td></tr>",
+                    label,
+                    n,
+                    net_ms,
+                    fmt_bytes(wire),
+                    updates,
+                    allocs,
+                    fmt_bytes(bytes)
+                ));
+            }
+            html.push_str("\n            </tbody>\n        </table>");
+        }
+        Some(html)
+    })()
+    .unwrap_or_else(|| {
+        "<h2>Network Phase</h2>\n        <p class='note'>No network sub-phase data (report predates B0, or the timing features are off).</p>".to_string()
+    });
+
     // Pie chart data: top systems by total_ms
     let (pie_labels, pie_data) = if let Some(systems) = system_timings.as_array() {
         let mut sorted: Vec<&serde_json::Value> = systems.iter().collect();
@@ -2690,6 +2922,8 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
       {alloc_rows}
             </tbody>
         </table>
+
+        {net_section_html}
 
         <h2>Microbenchmarks</h2>
         <p class="note">{microbench_count} isolated benchmarks measuring specific operations and systems</p>
@@ -3053,6 +3287,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
         prev_max_alloc_json = prev_max_alloc_json,
         alloc_chart_html = alloc_chart_html,
         stack_table_html = stack_table_html,
+        net_section_html = net_section_html,
         bench_players = BENCH_PLAYERS,
     )
 }

@@ -98,9 +98,10 @@ struct Cli {
     #[arg(long)]
     bench_spectator: bool,
 
-    /// W9 (stretch): enable the splice encoder in the benchmark's network phase
-    /// (shared segments encoded once, spliced per player) to A/B `net_ms`.
-    /// Default off — production always uses the standard encoder.
+    /// W9 / B0: enable the splice encoder in the benchmark's network phase
+    /// (shared segments encoded once, spliced per player). Pass this for
+    /// production parity — `game_server` always runs the splice path, and
+    /// `run-stresstest.sh` passes it by default.
     #[arg(long)]
     bench_splice: bool,
 }
