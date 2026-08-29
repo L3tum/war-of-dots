@@ -272,3 +272,123 @@ fn stress_benchmark_i2a() {
     println!("BENCH NET split={}", s["network"]["split"]);
     println!("BENCH DONE");
 }
+
+/// I2b A/B: same config as `stress_benchmark_i2a` — measures the hot/cold
+/// field split (COLD_EVERY=10 + per-field threshold gates). Writes
+/// `reports/stress_i2b.html` with prev-deltas against the I2a report.
+#[test]
+#[ignore]
+fn stress_benchmark_i2b() {
+    let config = BenchmarkConfig {
+        units_per_city: 20,
+        ticks: 1500,
+        seed: 42,
+        detailed_systems: vec![],
+        bench_prev: None,
+        initial_units: Some(10_000),
+        map_size: 1000,
+        cities: 100,
+        max_recruits_per_event: 2000,
+        bench_spectator: false,
+        bench_splice: true,
+    };
+    let results = run_benchmark(config);
+    let s = &results.summary;
+
+    if let Ok(()) = std::fs::create_dir_all("reports") {
+        let prev = std::fs::read("reports/stress_i2a.html").ok();
+        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
+        let html = war_of_dots::benchmark::generate_html_report(&results, prev_html.as_deref());
+        let _ = std::fs::write("reports/stress_i2b.html", html);
+    }
+
+    println!(
+        "BENCH WALL avg={} p50={} p99={} (ms)",
+        s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]
+    );
+    println!(
+        "BENCH SANITY units_remaining={} avg_combats={} avg_system_ms={}",
+        s["results"]["units_remaining"],
+        s["results"]["avg_combats_per_tick"],
+        s["results"]["avg_system_ms"]
+    );
+    if let Some(arr) = s["system_timings"].as_array() {
+        for row in arr {
+            if row["name"] == "network" {
+                println!(
+                    "BENCH NETWORK avg_ms={} p50={} p90={} p99={} calls={}",
+                    row["avg_ms"].as_f64().unwrap_or(0.0),
+                    row["p50_ms"].as_f64().unwrap_or(0.0),
+                    row["p90_ms"].as_f64().unwrap_or(0.0),
+                    row["p99_ms"].as_f64().unwrap_or(0.0),
+                    row["call_count"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    println!("BENCH NET subphase_ms={}", s["network"]["subphase_ms"]);
+    println!("BENCH NET split={}", s["network"]["split"]);
+    println!("BENCH DONE");
+}
+
+/// I5 A/B: same config as `stress_benchmark_i2b` — measures the
+/// count-map-driven winner/active check. The per-owner map is now built ONCE
+/// by the caller and passed into run_network_phase (previously recomputed
+/// inside compute_shared_deltas); the game-over scan (determine_winner +
+/// the O(P×N) active check) is not exercised by the headless harness.
+/// Gate: flat-to-down, no metric may regress > noise (CPU-hygiene commit).
+/// Writes `reports/stress_i5.html` with prev-deltas against the I2b report.
+#[test]
+#[ignore]
+fn stress_benchmark_i5() {
+    let config = BenchmarkConfig {
+        units_per_city: 20,
+        ticks: 1500,
+        seed: 42,
+        detailed_systems: vec![],
+        bench_prev: None,
+        initial_units: Some(10_000),
+        map_size: 1000,
+        cities: 100,
+        max_recruits_per_event: 2000,
+        bench_spectator: false,
+        bench_splice: true,
+    };
+    let results = run_benchmark(config);
+    let s = &results.summary;
+
+    if let Ok(()) = std::fs::create_dir_all("reports") {
+        let prev = std::fs::read("reports/stress_i2b.html").ok();
+        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
+        let html = war_of_dots::benchmark::generate_html_report(&results, prev_html.as_deref());
+        let _ = std::fs::write("reports/stress_i5.html", html);
+    }
+
+    println!(
+        "BENCH WALL avg={} p50={} p99={} (ms)",
+        s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]
+    );
+    println!(
+        "BENCH SANITY units_remaining={} avg_combats={} avg_system_ms={}",
+        s["results"]["units_remaining"],
+        s["results"]["avg_combats_per_tick"],
+        s["results"]["avg_system_ms"]
+    );
+    if let Some(arr) = s["system_timings"].as_array() {
+        for row in arr {
+            if row["name"] == "network" {
+                println!(
+                    "BENCH NETWORK avg_ms={} p50={} p90={} p99={} calls={}",
+                    row["avg_ms"].as_f64().unwrap_or(0.0),
+                    row["p50_ms"].as_f64().unwrap_or(0.0),
+                    row["p90_ms"].as_f64().unwrap_or(0.0),
+                    row["p99_ms"].as_f64().unwrap_or(0.0),
+                    row["call_count"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    println!("BENCH NET subphase_ms={}", s["network"]["subphase_ms"]);
+    println!("BENCH NET split={}", s["network"]["split"]);
+    println!("BENCH DONE");
+}

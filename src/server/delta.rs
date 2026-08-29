@@ -74,6 +74,42 @@ fn quantize_equip(count: u64) -> u64 {
     (count / QUANT_EQUIP) * QUANT_EQUIP
 }
 
+/// I2b: cold fields (`equipment`, `path`, `supply_percent`,
+/// `boat_supply_percent`) are emitted on every COLD_EVERY-th tick (full
+/// digest, exactly as pre-I2b) or when their per-field threshold trips
+/// between cold ticks. The wire shape is unchanged — these fields are
+/// `Option` + `skip_serializing_if`, so an update simply carries fewer
+/// keys on a hot tick.
+const COLD_EVERY: u64 = 10;
+
+/// I2b: is this a cold tick (full digest, cold fields compared and emitted
+/// exactly as pre-I2b)?
+fn cold_due(tick: u64) -> bool {
+    tick.is_multiple_of(COLD_EVERY)
+}
+
+/// I2b: emit the `equipment` Vec between cold ticks only when the total
+/// item count moved by ≥ 2 × QUANT_EQUIP (10 items) — per-tick wear
+/// (1/slot) never trips it, a combat casualty burst does.
+fn equip_threshold(prev_count: u64, curr_count: u64) -> bool {
+    prev_count.abs_diff(curr_count) >= 2 * QUANT_EQUIP
+}
+
+/// I2b: emit the `path` Vec between cold ticks only when the route starts
+/// or ends (0 ↔ non-0) or its length moved by more than max(3, 10% of
+/// prev_len) — captures "started moving" / "arrived" immediately while
+/// mid-route waypoint reshuffles wait for the next cold tick.
+fn path_threshold(prev_len: usize, curr_len: usize) -> bool {
+    (prev_len == 0) != (curr_len == 0) || prev_len.abs_diff(curr_len) > usize::max(3, prev_len / 10)
+}
+
+/// I2b: emit a supply field between cold ticks only when a 10-point band
+/// is crossed (0–9, 10–19, …). Sub-band drift is already invisible to the
+/// UI (≤ QUANT_SUPPLY per tick), so it waits for the next cold tick.
+fn band_crossed(prev: f32, curr: f32, band: f32) -> bool {
+    (prev / band).floor() != (curr / band).floor()
+}
+
 /// Lightweight digest of a UnitState used for change detection.
 /// Comparing two digests is O(1) with no heap allocation, whereas comparing
 /// full UnitState structs requires cloning Vec<String>, Vec<EquipmentState>, etc.
@@ -101,7 +137,11 @@ struct UnitStateDigest {
 }
 
 impl UnitStateDigest {
-    fn from_unit(u: &UnitState, men_step: f32) -> Self {
+    /// Build a digest; on a HOT tick (`is_cold == false`) the cold supply
+    /// fields are zeroed so they cannot drive an update on their own — a
+    /// cold field is compared only on cold ticks (full digest) or via its
+    /// threshold gate in the update loop. men_step is I2a (see above).
+    fn from_unit(u: &UnitState, men_step: f32, is_cold: bool) -> Self {
         Self {
             position: u.position,
             men: (u.men / men_step).round() * men_step,
@@ -114,11 +154,21 @@ impl UnitStateDigest {
             path_len: u.path.len(),
             healing: u.healing,
             resupply_enabled: u.resupply_enabled,
-            supply_percent: (u.supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY,
+            // I2b: cold — excluded from hot-tick equality.
+            supply_percent: if is_cold {
+                (u.supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY
+            } else {
+                0.0
+            },
             encircled: u.encircled,
             attacking: u.attacking,
             on_water: u.on_water,
-            boat_supply_percent: (u.boat_supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY,
+            // I2b: cold — excluded from hot-tick equality.
+            boat_supply_percent: if is_cold {
+                (u.boat_supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY
+            } else {
+                0.0
+            },
             embarking: u.embarking,
             disembarking: u.disembarking,
         }
@@ -144,7 +194,12 @@ pub(crate) struct SharedDeltas {
 
 /// W8: count units per owner in one pass. `owners` yields each unit's owner
 /// (borrowed); the owned result clones one key per DISTINCT owner.
-fn count_by_owner<'a>(owners: impl Iterator<Item = &'a str> + 'a) -> HashMap<String, u32> {
+/// I5: exported so the tick loop can build the map ONCE and share it between
+/// the active-player check and `compute_shared_deltas` (which no longer
+/// recomputes it).
+pub(crate) fn count_units_by_owner<'a>(
+    owners: impl Iterator<Item = &'a str> + 'a,
+) -> HashMap<String, u32> {
     let mut tmp: HashMap<&str, u32> = HashMap::new();
     for o in owners {
         *tmp.entry(o).or_insert(0) += 1;
@@ -165,7 +220,18 @@ pub(crate) fn compute_shared_deltas(
     current_border_grid: &Option<Arc<Vec<u8>>>,
     // I2a: runtime men digest step = `max(5.0, settings.recruitment_rate)`.
     men_step: f32,
+    // I2b: current tick number — drives the cold-field gate (full digest on
+    // every COLD_EVERY-th tick; threshold-gated cold fields in between).
+    tick: u64,
+    // I5: per-owner unit counts for the CURRENT snapshot, built by the
+    // caller (`count_units_by_owner`) — one map per tick shared with the
+    // active-player check instead of two.
+    current_units_by_owner: HashMap<String, u32>,
 ) -> SharedDeltas {
+    // I2b: on a cold tick the digest is full (cold fields compared and
+    // emitted exactly as pre-I2b); on a hot tick cold fields only emit when
+    // their threshold trips.
+    let is_cold = cold_due(tick);
     // Border grid diff (shared across all players).
     // W3: share the published Arc instead of copying the 40 KB grid — the
     // influence double-buffer publishes by refcount and never mutates the
@@ -184,8 +250,9 @@ pub(crate) fn compute_shared_deltas(
 
     // W8: per-owner unit counts, single O(N) pass each (build_delta_inner
     // previously rescanned every unit per player for these counts).
-    let prev_units_by_owner = count_by_owner(prev_units.values().map(|u| u.owner.as_str()));
-    let current_units_by_owner = count_by_owner(current_units.iter().map(|u| u.owner.as_str()));
+    // I5: the CURRENT map arrives from the caller (shared with the
+    // active-player check); only the PREVIOUS map is still computed here.
+    let prev_units_by_owner = count_units_by_owner(prev_units.values().map(|u| u.owner.as_str()));
 
     // Units added (new)
     let units_added: Arc<Vec<UnitState>> = Arc::new(
@@ -210,8 +277,8 @@ pub(crate) fn compute_shared_deltas(
     let mut unit_updates: Vec<UnitUpdate> = Vec::new();
     for u in current_units.iter() {
         if let Some(prev) = prev_units.get(&u.id) {
-            let curr_digest = UnitStateDigest::from_unit(u, men_step);
-            let prev_digest = UnitStateDigest::from_unit(prev, men_step);
+            let curr_digest = UnitStateDigest::from_unit(u, men_step, is_cold);
+            let prev_digest = UnitStateDigest::from_unit(prev, men_step, is_cold);
             if curr_digest == prev_digest {
                 continue;
             }
@@ -230,8 +297,17 @@ pub(crate) fn compute_shared_deltas(
                 None
             };
 
-            let new_equipment = if u.equipment != prev.equipment {
-                Some(u.equipment.clone())
+            // I2b: cold — on a hot tick only its threshold gate decides.
+            let new_equipment = if is_cold
+                || equip_threshold(
+                    prev.equipment.iter().map(|e| e.count as u64).sum(),
+                    u.equipment.iter().map(|e| e.count as u64).sum(),
+                ) {
+                if u.equipment != prev.equipment {
+                    Some(u.equipment.clone())
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -248,7 +324,10 @@ pub(crate) fn compute_shared_deltas(
                 None
             };
 
-            let new_supply = if u.supply_percent != prev.supply_percent {
+            // I2b: cold — on a hot tick only its threshold gate decides.
+            let new_supply = if u.supply_percent != prev.supply_percent
+                && (is_cold || band_crossed(prev.supply_percent, u.supply_percent, 10.0))
+            {
                 Some(u.supply_percent)
             } else {
                 None
@@ -260,8 +339,13 @@ pub(crate) fn compute_shared_deltas(
                 None
             };
 
-            let new_path = if u.path != prev.path {
-                Some(u.path.clone())
+            // I2b: cold — on a hot tick only its threshold gate decides.
+            let new_path = if is_cold || path_threshold(prev.path.len(), u.path.len()) {
+                if u.path != prev.path {
+                    Some(u.path.clone())
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -287,7 +371,11 @@ pub(crate) fn compute_shared_deltas(
                 } else {
                     None
                 },
-                boat_supply_percent: if u.boat_supply_percent != prev.boat_supply_percent {
+                // I2b: cold — on a hot tick only its threshold gate decides.
+                boat_supply_percent: if u.boat_supply_percent != prev.boat_supply_percent
+                    && (is_cold
+                        || band_crossed(prev.boat_supply_percent, u.boat_supply_percent, 10.0))
+                {
                     Some(u.boat_supply_percent)
                 } else {
                     None
@@ -495,6 +583,9 @@ pub(crate) fn run_network_phase(
     current_units: Vec<UnitState>,
     current_cities: Vec<CityState>,
     spliced: bool,
+    // I5: per-owner unit counts for this tick, built by the caller — shared
+    // with the active-player check instead of a second O(N) pass here.
+    current_units_by_owner: HashMap<String, u32>,
 ) -> NetworkPhaseResult {
     // N2: borrowed ID set for removed-units check (no deep clones)
     let current_unit_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
@@ -523,6 +614,9 @@ pub(crate) fn run_network_phase(
         baselines.prev_border.as_ref(),
         &border_grid,
         men_step,
+        // I2b: cold-field gate driven by the game tick.
+        game.tick_number(),
+        current_units_by_owner,
     );
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     {
@@ -806,6 +900,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
         );
         build_delta_inner(prev_funds, None, all_funds, &None, 0, player_id, &shared)
     }
@@ -967,7 +1063,18 @@ mod tests {
 
         let current_unit_ids: HashSet<&str> = HashSet::new();
 
-        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None, 5.0);
+        let shared = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+            5.0,
+            1000,
+            count_units_by_owner(std::iter::empty::<&str>()),
+        );
         let msg = build_delta_inner(
             &pf,
             None,
@@ -1010,6 +1117,8 @@ mod tests {
             Some(&prev_border),
             &Some(Arc::clone(&curr_border)),
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(std::iter::empty::<&str>()),
         );
         assert!(
             Arc::ptr_eq(shared.border_grid_diff.as_ref().unwrap(), &curr_border),
@@ -1100,7 +1209,18 @@ mod tests {
         // Flat vision: 2x2 grid, row-major: [1, 0, 0, 1]
         let vision_a = Arc::new(vec![1u8, 0, 0, 1]);
 
-        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None, 5.0);
+        let shared = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+            5.0,
+            1000,
+            count_units_by_owner(std::iter::empty::<&str>()),
+        );
 
         // Player A: vision changed from None to Some(vision_a) -> diff present
         let msg_a = build_delta_inner(
@@ -1152,6 +1272,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         // Brute-force counts for the CURRENT set.
@@ -1180,6 +1302,31 @@ mod tests {
     }
 
     #[test]
+    fn count_units_by_owner_matches_brute_force_scan() {
+        // I5: the exported helper is now built by the TICK LOOP (shared with
+        // the active-player check) instead of inside compute_shared_deltas.
+        // Pin its semantics against a brute-force per-unit scan: exact
+        // per-owner counts, owners with zero units absent, empty input →
+        // empty map.
+        let mut curr = Vec::new();
+        for i in 0..5 {
+            curr.push(unit(&format!("p0_{}", i), "a", 0.0, 0.0));
+            curr.push(unit(&format!("p1_{}", i), "b", 0.0, 0.0));
+            if i < 2 {
+                curr.push(unit(&format!("p2_{}", i), "a", 0.0, 0.0));
+            }
+        }
+        let map = count_units_by_owner(curr.iter().map(|u| u.owner.as_str()));
+        assert_eq!(map.get("a").copied(), Some(7)); // 5 + 2
+        assert_eq!(map.get("b").copied(), Some(5));
+        assert_eq!(map.len(), 2);
+
+        // Empty input → empty map (no phantom owners).
+        let empty = count_units_by_owner(std::iter::empty::<&str>());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn digest_quantized_men_equal_within_step() {
         // I2a: the men step is now runtime (max(5.0, recruitment_rate)); the
         // tests pass 5.0 explicitly. men differs by 2.0 (< step 5.0) and both
@@ -1204,6 +1351,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         // Since the quantized digests are equal, no unit_updates should be produced
@@ -1233,6 +1382,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         // Digests differ → one unit update should be produced
@@ -1273,6 +1424,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         // Same 5-item bin → no unit_updates should be produced
@@ -1310,6 +1463,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -1320,6 +1475,156 @@ mod tests {
             .as_ref()
             .expect("equipment present");
         assert_eq!(eq[0].count, 105);
+    }
+
+    // ---- I2b: cold-field gate pure-fn tests ----
+
+    #[test]
+    fn cold_due_boundary_ticks() {
+        // 9 is hot, 10 is cold; the pattern repeats every COLD_EVERY.
+        assert!(!cold_due(9));
+        assert!(cold_due(0)); // tick 0 is cold (0 % 10 == 0)
+        assert!(cold_due(10));
+        assert!(!cold_due(19));
+        assert!(cold_due(20));
+    }
+
+    #[test]
+    fn equip_threshold_boundary() {
+        // 9 items of net wear is below the 2×QUANT_EQUIP=10 gate; 10 trips it.
+        assert!(!equip_threshold(100, 91));
+        assert!(!equip_threshold(91, 100)); // symmetric (abs_diff)
+        assert!(equip_threshold(100, 90));
+        assert!(equip_threshold(90, 100));
+    }
+
+    #[test]
+    fn path_threshold_boundary() {
+        // 0 ↔ non-0 always trips (started moving / arrived).
+        assert!(path_threshold(0, 1));
+        assert!(path_threshold(1, 0));
+        assert!(!path_threshold(0, 0));
+        // Same length: no trip.
+        assert!(!path_threshold(10, 10));
+        // Length change up to max(3, 10% of prev) is absorbed…
+        assert!(!path_threshold(10, 7)); // Δ3 ≤ max(3, 1)
+        assert!(!path_threshold(20, 17)); // Δ3 ≤ max(3, 2); …beyond it trips
+        assert!(path_threshold(10, 6)); // Δ4 > 3
+        assert!(path_threshold(50, 44)); // Δ6 > max(3, 5)
+    }
+
+    #[test]
+    fn band_crossed_boundary() {
+        // Same 10-point band: silent.
+        assert!(!band_crossed(19.9, 19.99, 10.0));
+        assert!(!band_crossed(20.0, 29.9, 10.0));
+        // Crossing a band edge (20.0, 30.0, …): trips.
+        assert!(band_crossed(19.9, 20.1, 10.0));
+        assert!(band_crossed(20.1, 19.9, 10.0)); // symmetric
+        assert!(band_crossed(29.9, 30.1, 10.0));
+        // 0→9 stays in band 0.
+        assert!(!band_crossed(0.0, 9.9, 10.0));
+        assert!(band_crossed(9.9, 10.1, 10.0));
+    }
+
+    /// I2b integration: on a HOT tick a unit whose only visible changes are
+    /// a position move plus sub-threshold cold drift (1 item of equipment
+    /// wear, same-length path, sub-band supply) emits a UnitUpdate carrying
+    /// position but NOT equipment/path/supply_percent. On the next COLD tick
+    /// the same drift is carried in full.
+    #[test]
+    fn hot_tick_omits_cold_fields_cold_tick_carries_them() {
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.equipment = vec![crate::server::protocol::EquipmentState {
+            name: "sword".to_string(),
+            count: 100,
+            cost_per_item: 1.0,
+        }];
+        prev.path = vec![(2.0, 2.0), (3.0, 2.0)];
+        prev.supply_percent = 55.0;
+
+        let mut curr = prev.clone();
+        curr.position = (2.0, 2.0); // hot: moved
+        curr.equipment[0].count = 99; // cold: 1 item of wear — below the 10 gate
+        curr.path = vec![(3.0, 2.0), (4.0, 2.0)]; // cold: same length — no gate trip
+        curr.supply_percent = 56.0; // cold: 1% drift — no band crossing
+
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let cu = vec![curr.clone()];
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+
+        // HOT tick (tick 11): update emitted (position moved) but the cold
+        // fields are omitted — their thresholds did not trip.
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+            5.0,
+            11,
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+        );
+        assert_eq!(shared.unit_updates.len(), 1);
+        let upd = &shared.unit_updates[0];
+        assert_eq!(upd.position, Some((2.0, 2.0)));
+        assert!(
+            upd.equipment.is_none(),
+            "1-item wear must not emit equipment"
+        );
+        assert!(upd.path.is_none(), "same-length path must not emit path");
+        assert!(
+            upd.supply_percent.is_none(),
+            "sub-band supply must not emit"
+        );
+
+        // COLD tick (tick 10 → 20): the same cold drift is carried in full.
+        let prev2 = units_map(&[curr.clone()]);
+        let prev2_ref = &prev2;
+        let mut curr2 = curr.clone();
+        curr2.equipment[0].count = 99; // unchanged now
+        curr2.supply_percent = 56.0;
+        let cu2 = vec![curr2.clone()];
+        let ids2: HashSet<&str> = cu2.iter().map(|u| u.id.as_str()).collect();
+        let shared2 = compute_shared_deltas(
+            prev2_ref,
+            &HashMap::new(),
+            &cu2,
+            &[],
+            &ids2,
+            None,
+            &None,
+            5.0,
+            20,
+            count_units_by_owner(cu2.iter().map(|u| u.owner.as_str())),
+        );
+        // No hot change and no cold change vs prev2 → no update at all on a
+        // cold tick either (digest equality).
+        assert!(shared2.unit_updates.is_empty());
+
+        // Now a COLD tick vs the ORIGINAL prev (cold drift present): the cold
+        // fields ARE carried.
+        let shared3 = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+            5.0,
+            20,
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+        );
+        assert_eq!(shared3.unit_updates.len(), 1);
+        let upd3 = &shared3.unit_updates[0];
+        assert_eq!(upd3.position, Some((2.0, 2.0)));
+        assert!(upd3.equipment.is_some(), "cold tick carries equipment");
+        assert!(upd3.path.is_some(), "cold tick carries path");
+        assert_eq!(upd3.supply_percent, Some(56.0), "cold tick carries supply");
     }
 
     #[test]
@@ -1344,6 +1649,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -1371,6 +1678,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -1400,6 +1709,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -1427,6 +1738,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -1458,6 +1771,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -1487,6 +1802,8 @@ mod tests {
             None,
             &None,
             5.0,
+            1000, // I2b: cold tick — full digest (pre-I2b behavior)
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
         );
 
         assert_eq!(shared.unit_updates.len(), 1);

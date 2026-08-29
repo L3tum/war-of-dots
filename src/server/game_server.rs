@@ -38,7 +38,9 @@ pub use crate::server::room::{
 };
 
 // Re-export delta functions
-use crate::server::delta::{build_delta_inner, build_llm_state, compute_shared_deltas};
+use crate::server::delta::{
+    build_delta_inner, build_llm_state, compute_shared_deltas, count_units_by_owner,
+};
 
 static FRONTEND: Dir = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -581,14 +583,44 @@ impl GameRoom {
                         }
 
                         // --- Check game over ---
-                        let winner_id_opt = game.determine_winner();
+                        // I5: build the per-owner unit count map ONCE (it is
+                        // also passed to run_network_phase, which previously
+                        // recomputed it) plus a city-owner set, and reduce
+                        // the active check from O(P×N) string compares to
+                        // O(P). The predicate is identical to the old scan —
+                        // and identical to determine_winner's own
+                        // `players_with_power` predicate (game.rs) — so when
+                        // active_count == 1 the winner IS the sole active
+                        // player and the per-tick determine_winner() call
+                        // (P archetype + P city scans) is skipped entirely.
+                        let units_by_owner =
+                            count_units_by_owner(current_units.iter().map(|u| u.owner.as_str()));
+                        let city_owners: HashSet<&str> = current_cities
+                            .iter()
+                            .filter_map(|c| c.owner.as_deref())
+                            .collect();
                         let player_ids: Vec<String> = game.players().keys().cloned().collect();
                         let total_players = player_ids.len();
                         let active_count = player_ids.iter().filter(|pid| {
-                            let has_units = current_units.iter().any(|u| u.owner.as_str() == pid.as_str());
-                            let has_cities = current_cities.iter().any(|c| c.owner.as_deref() == Some(pid.as_str()));
-                            has_units || has_cities
+                            units_by_owner.get(pid.as_str()).copied().unwrap_or(0) > 0
+                                || city_owners.contains(pid.as_str())
                         }).count();
+                        // I5: the winner, when the game ends, is the sole
+                        // active player (predicate-identical to the old
+                        // determine_winner call for this case).
+                        let sole_active = (active_count == 1).then(|| {
+                            player_ids
+                                .iter()
+                                .find(|pid| {
+                                    units_by_owner
+                                        .get(pid.as_str())
+                                        .copied()
+                                        .unwrap_or(0)
+                                        > 0
+                                        || city_owners.contains(pid.as_str())
+                                })
+                                .cloned()
+                        }).flatten();
                         if active_count == 0 {
                             let end_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -617,7 +649,7 @@ impl GameRoom {
                             break;
                         }
                         if total_players > 1 && active_count == 1 {
-                            let winner_id = winner_id_opt.unwrap_or_default();
+                            let winner_id = sole_active.unwrap_or_default();
                             let winner_name = game.players().get(&winner_id)
                                 .map(|p| p.name.clone())
                                 .unwrap_or_else(|| winner_id.clone());
@@ -668,6 +700,10 @@ impl GameRoom {
                             current_units,
                             current_cities,
                             true, // W9 splice path: on — A/B confirmed ~1.5% off the network phase (byte-for-byte verified encoder)
+                            // I5: the per-owner count map built for the
+                            // active check above — one map per tick instead
+                            // of two.
+                            units_by_owner,
                         );
 
                         // W4: outbox by move — the send loop takes ownership of each
@@ -1347,6 +1383,11 @@ pub(crate) async fn handle_replay_ws(
                     &current_border,
                     // I2a: same runtime men step as the live path.
                     replay_player.game.settings().recruitment_rate.max(5.0),
+                    // I2b: cold-field gate driven by the replayed tick.
+                    replay_player.game.tick_number(),
+                    // I5: replay path has no active-check consumer — build
+                    // the map the same way the live path does.
+                    count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
                 );
                 if let Some(delta) = build_delta_inner(
                     &prev_funds,

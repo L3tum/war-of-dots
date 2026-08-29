@@ -2356,6 +2356,62 @@ mod tests {
         );
     }
 
+    /// I5 invariant: the game-server's game-over branch no longer calls
+    /// `determine_winner()` per tick — it takes the sole ACTIVE player
+    /// (units or cities) as the winner. This test pins the property that
+    /// replacement relies on: `determine_winner`'s `players_with_power`
+    /// membership is exactly `unit_count > 0 || city_count > 0` (funds only
+    /// affect the sort key), so with exactly one active player it IS the
+    /// winner, and with zero active players it is None (→ Draw).
+    #[test]
+    fn i5_winner_is_sole_active_player() {
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        assert!(game.assign_city_owner("city_1", "player_1"));
+        let ut = basic_unit_type();
+        assert!(game.recruit_unit("city_0", &ut, "player_0").is_some());
+        assert!(game.recruit_unit("city_1", &ut, "player_1").is_some());
+
+        // Both active ⇒ winner is one of the two active players.
+        let w = game.determine_winner().expect("two active players ⇒ Some");
+        assert!(
+            w == "player_0" || w == "player_1",
+            "winner must be an active player, got {w:?}"
+        );
+
+        // Eliminate player_1's unit — player_0 is now the SOLE active
+        // player, so the winner must be exactly player_0 (the pid the
+        // server's count-map active check would single out).
+        let victim = game
+            .world
+            .query::<(hecs::Entity, &UnitOwner)>()
+            .iter()
+            .find(|(_, o)| o.player_id == "player_1")
+            .map(|(e, _)| e)
+            .expect("player_1 has a unit");
+        game.world.despawn(victim).unwrap();
+        assert_eq!(
+            game.determine_winner().as_deref(),
+            Some("player_0"),
+            "sole active player must be the winner"
+        );
+
+        // Eliminate the last unit and release every city ⇒ all eliminated
+        // ⇒ None (the server's Draw branch).
+        let survivor = game
+            .world
+            .query::<(hecs::Entity, &UnitOwner)>()
+            .iter()
+            .find(|(_, o)| o.player_id == "player_0")
+            .map(|(e, _)| e)
+            .expect("player_0 has a unit");
+        game.world.despawn(survivor).unwrap();
+        assert!(game.assign_city_owner("city_0", ""));
+        assert!(game.assign_city_owner("city_1", ""));
+        assert_eq!(game.determine_winner(), None, "all eliminated ⇒ Draw");
+    }
+
     // ---------------------------------------------------------------------------
     // recruit_unit — circle occupancy gate (MIN_UNIT_DISTANCE)
     // ---------------------------------------------------------------------------

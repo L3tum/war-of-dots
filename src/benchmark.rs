@@ -23,7 +23,9 @@ use crate::game::game::{Game, GameSettings, InfluenceSettings};
 use crate::map::map::{Map, MapConfig};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
-use crate::server::delta::{build_delta_inner, run_network_phase, NetworkBaselines};
+use crate::server::delta::{
+    build_delta_inner, count_units_by_owner, run_network_phase, NetworkBaselines,
+};
 use crate::server::protocol::{
     encode_message_with_hint, estimate_delta_size, CityState, ServerMessage,
 };
@@ -699,6 +701,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // redundant full Vec<City> clone).
             let current_cities: Vec<CityState> =
                 game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
+            // I5: per-owner count map — shared with (moved into) the network
+            // phase, exactly as the live tick loop does it.
+            let units_by_owner =
+                count_units_by_owner(current_units.iter().map(|u| u.owner.as_str()));
             let phase = run_network_phase(
                 &game,
                 &mut net_baselines,
@@ -706,6 +712,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 current_units,
                 current_cities,
                 config.bench_splice,
+                units_by_owner,
             );
             if config.bench_spectator {
                 bench_spectator_delta(
@@ -776,6 +783,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     let snapshot_ms = snapshot_start.elapsed().as_secs_f64() * 1000.0;
                     #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
                     let snapshot_ms = 0.0f64;
+                    // I5: per-owner count map — part of the tick's work (the
+                    // live loop builds it too; pre-I5 the network phase built
+                    // an identical map internally, so timing is unchanged).
+                    let units_by_owner =
+                        count_units_by_owner(current_units.iter().map(|u| u.owner.as_str()));
                     (
                         run_network_phase(
                             &game,
@@ -784,6 +796,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                             current_units,
                             current_cities,
                             config.bench_splice,
+                            units_by_owner,
                         ),
                         snapshot_ms,
                     )

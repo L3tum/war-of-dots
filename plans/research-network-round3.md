@@ -95,3 +95,99 @@ unaffected — quantization is digest-only, the wire carries exact values). The 
 
 Reports: `reports/stress_base_r3.html` (B0 pair baseline), `reports/stress_i2a.html` (I2a; embeds the
 baseline as prev-delta section). `--bench-prev` is passed by the harness, so the i2a report shows both.
+
+## G. Results — I2b: hot/cold field split (COLD_EVERY=10 + per-field threshold gates)
+
+**Mechanism**: `compute_shared_deltas` now takes the game tick. Every 10th tick is *cold* and emits
+cold-drift fields exactly as before (unit men, 5-item equipment bins, path, both supply percents,
+owner_count_maps, grid diff). On *hot* ticks those fields only emit when a semantic threshold trips:
+men ≥ max(5, recruitment_rate) (the runtime step from I2a), equipment net count Δ ≥ 10,
+path zero↔non-zero transition or length Δ > max(3, 10%), supply 10-point band crossing. The digest
+invariant is preserved: cold fields can only be omitted on a hot tick when a cold tick will carry
+them, and any digest difference still maps to an emitted field.
+
+**A/B** (paired runs, same quiet environment — load ≤0.5, splice on, seed 42, 10k units /
+1000×1000 / 100 cities / 1500 ticks; each side run back-to-back at comparable load):
+
+| metric | I2a | I2b | Δ |
+|---|---:|---:|---:|
+| net avg ms | 13.324 | 12.395 | **−7.0%** |
+| net p50 / p90 / p99 ms | 10.000 / 46.416 / 64.277 | 10.000 / 46.416 / 46.416 | p90 flat, p99 improved |
+| wall avg ms | 16.010 | 14.893 | **−7.0%** |
+| avg system ms | 15.590 | 14.549 | −6.7% |
+| delta subphase ms | 2.729 | 2.552 | −6.5% |
+| encode subphase ms | 5.713 | 5.069 | −11.3% |
+| idle upd/tick | 243.7 | 194.2 | **−20.3%** |
+| idle wire/tick | 84 309 B | 32 734 B | **−61.2%** |
+| move-clean upd/tick | 3401.5 | 3337.1 | −1.9% |
+| move-clean wire/tick | 1 036 199.8 B | 483 773.4 B | **−53.3%** |
+| move-dirty upd/tick | 3720.5 | 3447.4 | −7.3% |
+| move-dirty wire/tick | 9 983 137.2 B | 9 345 661.6 B | −6.4% |
+| ALL updates avg/tick | 3008 | 2888 | −4.0% |
+| ALL wire avg/tick | 3 384 091 B | 2 884 428 B | **−14.7%** |
+
+All acceptance criteria met: idle wire −61.2% (≥ 20 %), idle updates −20.3% (≥ 10 %), no net_ms
+regression (−7.0 %; cap was +20 %), p90 flat.
+
+**Timing caveats (honest record)**: the first two I2b runs happened under external machine load
+(load 1.1–1.4; wall 127 s and 237 s, p90/p99 pinned at the 100 ms clamp) and showed an apparent
+net_ms regression (16.4 / 26.2 ms) — rejected as environment noise, confirmed by the workload
+metrics being bit-identical in all three I2b runs. The clean pair (this table, wall 105 s / 108 s
+at load ≤0.5) shows I2b faster. A further labeling slip (one "I2a rerun" executed I2b code while
+the I2b diff was in the working tree) is what caught this; the final clean pair was generated with
+the tree explicitly verified on each side before running. Workload metrics are deterministic and
+bit-stable across runs; ms numbers require a quiet box (multiple concurrent sessions on this host
+keep load around 1–1.5 most of the day).
+
+Reports: `reports/stress_i2a.html` (I2a clean), `reports/stress_i2b.html` (I2b; embeds I2a as
+prev-delta section).
+
+## H. Results — I5: count-map-driven winner/active check (replaces per-tick `determine_winner`)
+
+**Mechanism**: `determine_winner()` was called every tick from the live server loop just to test
+`active_count > 1` (game-over / active-player gating). It scans all units + all cities, clones the
+full unit list, builds a per-player map, then discards the winner string. I5 adds the exported
+`server::delta::count_units_by_owner(&[&str]) -> BTreeMap<String, usize>` (one O(N) pass) plus
+`Game::last_mover_count()` / `last_engaged_pairs()` (plain counters set by the combat system). The
+active check is now `active_count == players_with_power(&game.unit_owner_counts,
+&game.city_owner_counts)`, and the winner name is resolved lazily via
+`determine_winner(..., Some(unit_owner_counts), Some(city_owner_counts))` — `determine_winner`
+accepts pre-built count maps (predicate-identical: it only pushes players with
+`unit_count > 0 || city_count > 0`; funds only affect the sort key, so `active_count == 1` means
+the sole active player *is* the winner). The benchmark harness builds the same map once per tick
+and threads it into both the active check and `run_network_phase` (which forwards it to
+`compute_shared_deltas`, so the current owner-count map is built once instead of twice).
+
+**Correctness**: predicate identity proved by inspection (see above). New tests:
+`test_count_map_matches_unit_city_counts` (delta.rs — exported helper == direct counts, incl. the
+`&[]` empty case) and `test_winner_matches_count_map_active_check` (game.rs — winner iff
+count-map active == 1; loser/alive/draw/empty cases, plus a `Some("")`-owner city to verify the
+frees-city path). Both pass; full suite green (259 + 253).
+
+**A/B** (I5 vs I2b baseline `reports/stress_i2b.html`, splice on, seed 42, same workload):
+
+| metric | I2b | I5 | Δ |
+|---|---:|---:|---:|
+| net avg ms | 12.395 | 13.232 | +6.8% |
+| net p50 / p90 / p99 ms | 10.000 / 46.416 / 46.416 | 10.000 / 46.416 / 46.416 | flat |
+| wall avg ms | 14.893 | 15.766 | +5.9% |
+| avg system ms | 14.549 | 15.417 | +6.0% |
+| delta subphase ms | 2.552 | 2.434 | **−4.6%** |
+| encode subphase ms | 5.069 | 5.699 | +12.4% |
+| ALL updates avg/tick | 2888 | 2888 | **bit-identical** |
+| ALL wire avg/tick | 2 884 428 B | 2 884 423 B | **bit-identical** (0.0002%) |
+| per-regime updates/wire | (see §G) | (same) | bit-identical |
+
+**Timing caveats (honest record)**: the net +6.8% is **not attributable to the I5 change**.
+Evidence: (1) the workload — updates, wire bytes, allocs — is bit-identical, so the encoded byte
+stream is byte-for-byte the same; (2) `encode` (pure CPU-bound CBOR serialization, code untouched
+by I5) is the dominant riser (+12.4%), and identical work taking 12% longer is the signature of
+CPU load/frequency, not a code regression; (3) `delta` dropped −4.6%, exactly the expected effect
+of the owner-count map build moving out of that window (it now sits inside the `net`
+tick_system! window, which is still measured as `net`, so no work was added); (4) the I2b
+baseline (12.395) was captured on a quiet box (load ≤0.5), while both I5 runs (12.965 / 13.232,
+each a 3-run average) ran at load ~1.1–1.5 with five concurrent sessions and no quiet dip.
+**Net: no measurable regression; clean A/B to re-run when the box is idle** (I2b report backed up
+at `/tmp/stress_i2b_quiet.html`; I5 working files at `/tmp/i5_wip/`).
+
+Reports: `reports/stress_i5.html` (I5; embeds I2b as prev-delta section).
