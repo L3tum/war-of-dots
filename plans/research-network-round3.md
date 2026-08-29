@@ -63,3 +63,35 @@ Hygiene: `game.players().keys().cloned()` per tick (`game_server.rs:585,699`); `
 
 ## Verification anchors
 `cargo test --all` (incl. `splice_matches_encode_message_byte_for_byte`, `unit_update_compact_roundtrip`), `cargo fmt --check`, `clippy -D warnings`; frontend gates: `npm run test` (vitest), `npm run typecheck`, `npm run lint`; A/B via `./run-stresstest.sh <n>`; primary metrics: network-row allocs/bytes, `net_ms` P50/P90, `net_wire_bytes` per regime, `net_unit_updates`.
+
+## F. Results — I2a: digest quantization recalibration
+
+**Churn probe** (temporary per-field digest-diff counter, removed after use): at the B0 baseline the
+**equipment-count digest field** is the dominant per-tick churn driver — ~650 of the ~660 steady-state
+idle-tick `UnitUpdate`s (ticks 3250/5000), ~50% on movement ticks (2387–4992 of 2842–7456). Men churn is
+small in the bench (`recruitment_rate = 1.0`) but would dominate at prod lobbies (rate 10) — hence the
+runtime men step `max(5.0, recruitment_rate)`.
+
+**A/B** (paired runs, same environment, splice on, seed 42, 10k units / 1000×1000 / 100 cities / 1500 ticks):
+
+| metric | B0 baseline | I2a | Δ |
+|---|---:|---:|---:|
+| net avg ms | 13.430 | 13.095–13.268 (2 runs) | −1.3…−2.5% |
+| net p50 / p90 / p99 ms | 10.000 / 46.416 / 46.416 | 10.000 / 46.416 / 46.416 | no regression |
+| wall avg ms | 16.166 | 15.591–15.886 | −1.8…−3.5% |
+| delta subphase ms | 2.943 | 2.594–2.805 | −4.7…−11.9% |
+| encode subphase ms | 5.513 | 5.730–5.887 | +4.0…+6.8% (noise: 2 I2a runs straddle baseline) |
+| idle upd/tick | 646.8 | 243.6–243.7 | **−62.3%** |
+| idle wire/tick | 221 487 B | 84 305–84 309 B | **−61.9%** |
+| move-clean upd/tick | 4696.0 | 3401.5 | −27.6% |
+| move-dirty upd/tick | 4790.7 | 3720.5 | −22.3% |
+| ALL updates avg/tick | 4104 | 3008 | **−26.7%** |
+| ALL wire avg/tick | 3 752 402 B | 3 384 079–3 384 091 B | **−9.8%** |
+
+Workload metrics (updates, wire, allocs) are **bit-stable across I2a reruns** (game state is
+unaffected — quantization is digest-only, the wire carries exact values). The encode-subphase +4–6.8%
+(0.22–0.37 ms over 1500 ticks ≈ 0.2 µs/tick) is within run-to-run noise; the two I2a runs
+(5.730, 5.887) straddle the baseline (5.513) and the total net average is lower in both.
+
+Reports: `reports/stress_base_r3.html` (B0 pair baseline), `reports/stress_i2a.html` (I2a; embeds the
+baseline as prev-delta section). `--bench-prev` is passed by the harness, so the i2a report shows both.

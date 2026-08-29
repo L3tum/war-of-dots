@@ -1345,6 +1345,8 @@ pub(crate) async fn handle_replay_ws(
                     &current_unit_ids,
                     prev_border_grid.as_ref(),
                     &current_border,
+                    // I2a: same runtime men step as the live path.
+                    replay_player.game.settings().recruitment_rate.max(5.0),
                 );
                 if let Some(delta) = build_delta_inner(
                     &prev_funds,

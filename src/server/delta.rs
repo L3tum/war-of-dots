@@ -34,15 +34,15 @@ use crate::server::protocol::{
     PlayerState, ServerMessage, UnitState, UnitUpdate,
 };
 
-/// Quantization step for the `men` field in the unit digest.
-///
-/// The per-tick men drain is `1/600 ≈ 0.0017` (up to `10/600 ≈ 0.017` under
-/// severe supply stress), far below 1.0. Quantizing to whole soldiers keeps a
-/// healthy unit's digest stable across ~60–600 ticks, so sub-threshold
-/// oscillation no longer emits a `UnitUpdate` every tick. When an update IS
-/// emitted, the wire carries the exact `u.men`, not the quantized value, so no
-/// visible information is lost.
-const QUANT_MEN: f32 = 1.0;
+// I2a: the `men` digest quantization step is resolved at RUNTIME as
+// `max(5.0, settings.recruitment_rate)` (see `run_network_phase` and the
+// replay path): men refill at `recruitment_rate` per tick (`supply.rs`), so
+// the step must absorb the lobby's refill rate — a fixed 1.0 step let every
+// refilling unit cross a bin (and emit a `UnitUpdate`) every tick at
+// rate-10 lobbies. The floor of 5 keeps the drain (1/600 ≈ 0.0017, up to
+// 10/600 ≈ 0.017 under supply stress) invisible. When an update IS emitted,
+// the wire carries the exact `u.men`, so no visible information is lost
+// (UI men-bar granularity = the step: ≤ 0.5% of a 1000-man unit).
 
 /// Quantization step for the `organisation` field in the unit digest (same
 /// rationale as `QUANT_MEN`: organisation recovers slowly, so whole-point
@@ -56,6 +56,23 @@ const QUANT_ORG: f32 = 1.0;
 /// are below the UI supply-bar granularity; when an update IS emitted the
 /// wire carries the exact value, so nothing visible is lost.
 const QUANT_SUPPLY: f32 = 1.0;
+
+/// I2a: quantization step for the `equipment_count` / `max_equipment_count`
+/// digest fields. Equipment wears 1 item/tick per stocked slot and refills
+/// toward max when funds allow (`supply.rs`), so a raw-count digest turned
+/// the wear/refill oscillation into a per-tick `UnitUpdate` for every unit
+/// with active equipment churn — the top idle-tick churn driver at the B0
+/// baseline (~650 of the ~660 steady-state updates/tick, measured). Floor-
+/// quantizing to 5-item bins absorbs up to 4 ticks of net change; when an
+/// update IS emitted the wire carries the exact per-slot counts, so nothing
+/// visible is lost.
+const QUANT_EQUIP: u64 = 5;
+
+/// I2a: floor-quantize an equipment total to `QUANT_EQUIP` bins
+/// (100→100, 104→100, 105→105).
+fn quantize_equip(count: u64) -> u64 {
+    (count / QUANT_EQUIP) * QUANT_EQUIP
+}
 
 /// Lightweight digest of a UnitState used for change detection.
 /// Comparing two digests is O(1) with no heap allocation, whereas comparing
@@ -84,14 +101,16 @@ struct UnitStateDigest {
 }
 
 impl UnitStateDigest {
-    fn from_unit(u: &UnitState) -> Self {
+    fn from_unit(u: &UnitState, men_step: f32) -> Self {
         Self {
             position: u.position,
-            men: (u.men / QUANT_MEN).round() * QUANT_MEN,
+            men: (u.men / men_step).round() * men_step,
             max_men: u.max_men,
             organisation: (u.organisation / QUANT_ORG).round() * QUANT_ORG,
-            equipment_count: u.equipment.iter().map(|e| e.count as u64).sum(),
-            max_equipment_count: u.max_equipment.iter().map(|e| e.count as u64).sum(),
+            equipment_count: quantize_equip(u.equipment.iter().map(|e| e.count as u64).sum()),
+            max_equipment_count: quantize_equip(
+                u.max_equipment.iter().map(|e| e.count as u64).sum(),
+            ),
             path_len: u.path.len(),
             healing: u.healing,
             resupply_enabled: u.resupply_enabled,
@@ -135,6 +154,7 @@ fn count_by_owner<'a>(owners: impl Iterator<Item = &'a str> + 'a) -> HashMap<Str
 
 /// Compute the player-independent portions of the per-player delta.
 /// Called once per tick, not once per player.
+#[allow(clippy::too_many_arguments)] // I2a: men_step added; kept flat (not a struct) — it is the only runtime knob
 pub(crate) fn compute_shared_deltas(
     prev_units: &HashMap<String, UnitState>,
     prev_cities: &HashMap<String, CityState>,
@@ -143,6 +163,8 @@ pub(crate) fn compute_shared_deltas(
     current_unit_ids: &HashSet<&str>,
     prev_border_grid: Option<&Arc<Vec<u8>>>,
     current_border_grid: &Option<Arc<Vec<u8>>>,
+    // I2a: runtime men digest step = `max(5.0, settings.recruitment_rate)`.
+    men_step: f32,
 ) -> SharedDeltas {
     // Border grid diff (shared across all players).
     // W3: share the published Arc instead of copying the 40 KB grid — the
@@ -188,8 +210,8 @@ pub(crate) fn compute_shared_deltas(
     let mut unit_updates: Vec<UnitUpdate> = Vec::new();
     for u in current_units.iter() {
         if let Some(prev) = prev_units.get(&u.id) {
-            let curr_digest = UnitStateDigest::from_unit(u);
-            let prev_digest = UnitStateDigest::from_unit(prev);
+            let curr_digest = UnitStateDigest::from_unit(u, men_step);
+            let prev_digest = UnitStateDigest::from_unit(prev, men_step);
             if curr_digest == prev_digest {
                 continue;
             }
@@ -489,6 +511,9 @@ pub(crate) fn run_network_phase(
     // W-2: compute player-independent deltas once per tick, not once per player.
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     let shared_start = std::time::Instant::now();
+    // I2a: the men digest step must absorb the lobby's per-tick refill rate
+    // (men refill at `recruitment_rate` each tick); floor of 5 for visibility.
+    let men_step = game.settings().recruitment_rate.max(5.0);
     let shared = compute_shared_deltas(
         &baselines.prev_units,
         &baselines.prev_cities,
@@ -497,6 +522,7 @@ pub(crate) fn run_network_phase(
         &current_unit_ids,
         baselines.prev_border.as_ref(),
         &border_grid,
+        men_step,
     );
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     {
@@ -779,6 +805,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
         build_delta_inner(prev_funds, None, all_funds, &None, 0, player_id, &shared)
     }
@@ -940,7 +967,7 @@ mod tests {
 
         let current_unit_ids: HashSet<&str> = HashSet::new();
 
-        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None);
+        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None, 5.0);
         let msg = build_delta_inner(
             &pf,
             None,
@@ -982,6 +1009,7 @@ mod tests {
             &current_unit_ids,
             Some(&prev_border),
             &Some(Arc::clone(&curr_border)),
+            5.0,
         );
         assert!(
             Arc::ptr_eq(shared.border_grid_diff.as_ref().unwrap(), &curr_border),
@@ -1072,7 +1100,7 @@ mod tests {
         // Flat vision: 2x2 grid, row-major: [1, 0, 0, 1]
         let vision_a = Arc::new(vec![1u8, 0, 0, 1]);
 
-        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None);
+        let shared = compute_shared_deltas(&pu, &pc, &[], &[], &current_unit_ids, None, &None, 5.0);
 
         // Player A: vision changed from None to Some(vision_a) -> diff present
         let msg_a = build_delta_inner(
@@ -1123,6 +1151,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         // Brute-force counts for the CURRENT set.
@@ -1152,12 +1181,14 @@ mod tests {
 
     #[test]
     fn digest_quantized_men_equal_within_step() {
-        // men differs by 0.3, which is less than QUANT_MEN (1.0)
-        // so the quantized digests should be equal → no update emitted.
+        // I2a: the men step is now runtime (max(5.0, recruitment_rate)); the
+        // tests pass 5.0 explicitly. men differs by 2.0 (< step 5.0) and both
+        // values land in the 50.0 bin ((50/5).round()*5 == (52/5).round()*5 ==
+        // 50.0) → no update emitted.
         let mut prev = unit("u1", "a", 1.0, 2.0);
         prev.men = 50.0;
         let mut curr = unit("u1", "a", 1.0, 2.0);
-        curr.men = 50.3; // only 0.3 difference — within one quantization step
+        curr.men = 52.0; // 2.0 difference — within one 5.0 quantization step
 
         let pu = units_map(&[prev.clone()]);
         let pu_ref = &pu;
@@ -1172,6 +1203,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         // Since the quantized digests are equal, no unit_updates should be produced
@@ -1180,11 +1212,12 @@ mod tests {
 
     #[test]
     fn digest_quantized_men_differs_across_step() {
-        // men differs by 1.0, which equals QUANT_MEN → digests differ → update emitted.
+        // I2a: men differs by 5.0, which equals the step → digests differ
+        // (50.0 bin vs 55.0 bin) → update emitted.
         let mut prev = unit("u1", "a", 1.0, 2.0);
         prev.men = 50.0;
         let mut curr = unit("u1", "a", 1.0, 2.0);
-        curr.men = 51.0; // exactly 1.0 difference
+        curr.men = 55.0; // exactly one 5.0 step difference
 
         let pu = units_map(&[prev.clone()]);
         let pu_ref = &pu;
@@ -1199,13 +1232,94 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         // Digests differ → one unit update should be produced
         assert_eq!(shared.unit_updates.len(), 1);
         assert_eq!(shared.unit_updates[0].id, "u1");
         // The update carries the exact (unquantized) value
-        assert_eq!(shared.unit_updates[0].men, Some(51.0));
+        assert_eq!(shared.unit_updates[0].men, Some(55.0));
+    }
+
+    #[test]
+    fn digest_quantized_equip_equal_within_step() {
+        // I2a: equipment total 100 → 104 stays in the same 5-item floor bin
+        // (104 / 5 * 5 == 100) → no update emitted.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.equipment = vec![crate::server::protocol::EquipmentState {
+            name: "sword".to_string(),
+            count: 100,
+            cost_per_item: 1.0,
+        }];
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.equipment = vec![crate::server::protocol::EquipmentState {
+            name: "sword".to_string(),
+            count: 104,
+            cost_per_item: 1.0,
+        }];
+
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+            5.0,
+        );
+
+        // Same 5-item bin → no unit_updates should be produced
+        assert!(shared.unit_updates.is_empty());
+    }
+
+    #[test]
+    fn digest_quantized_equip_differs_across_step() {
+        // I2a: equipment total 100 → 105 crosses into the next 5-item bin →
+        // update emitted, carrying the exact (unquantized) equipment Vec.
+        let mut prev = unit("u1", "a", 1.0, 2.0);
+        prev.equipment = vec![crate::server::protocol::EquipmentState {
+            name: "sword".to_string(),
+            count: 100,
+            cost_per_item: 1.0,
+        }];
+        let mut curr = unit("u1", "a", 1.0, 2.0);
+        curr.equipment = vec![crate::server::protocol::EquipmentState {
+            name: "sword".to_string(),
+            count: 105,
+            cost_per_item: 1.0,
+        }];
+
+        let pu = units_map(&[prev.clone()]);
+        let pu_ref = &pu;
+        let cu = vec![curr];
+
+        let current_unit_ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            pu_ref,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &current_unit_ids,
+            None,
+            &None,
+            5.0,
+        );
+
+        assert_eq!(shared.unit_updates.len(), 1);
+        assert_eq!(shared.unit_updates[0].id, "u1");
+        // The update carries the exact (unquantized) equipment
+        let eq = shared.unit_updates[0]
+            .equipment
+            .as_ref()
+            .expect("equipment present");
+        assert_eq!(eq[0].count, 105);
     }
 
     #[test]
@@ -1229,6 +1343,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -1255,6 +1370,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -1283,6 +1399,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -1309,6 +1426,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -1339,6 +1457,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -1367,6 +1486,7 @@ mod tests {
             &current_unit_ids,
             None,
             &None,
+            5.0,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
