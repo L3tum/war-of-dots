@@ -191,3 +191,9 @@ each a 3-run average) ran at load ~1.1–1.5 with five concurrent sessions and n
 at `/tmp/stress_i2b_quiet.html`; I5 working files at `/tmp/i5_wip/`).
 
 Reports: `reports/stress_i5.html` (I5; embeds I2b as prev-delta section).
+
+**PS (commit labeling)**: `902f2dd` is labeled "I5" but actually contains **both I2b and I5**
+— I2b was never committed on its own (I2a is `HEAD~1` = `5e76cdb`; the I2b diff was still in the
+working tree when the I5 commit was made). There is no pure-I2b commit to A/B against from git
+history; the I2b code is reconstructable as `5e76cdb + /tmp/i2b.patch` (patch kept, verified
+against this diff today). Left as-is per the "no history rewriting" preference.
