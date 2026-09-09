@@ -451,6 +451,48 @@ fn encode_entry(key: &'static str, field: &impl serde::Serialize) -> Vec<u8> {
     buf
 }
 
+/// W9 (I6): append a CBOR map entry `key` -> `value` to `buf` in place (no
+/// intermediate allocation). `value` is a grid `&[u8]`; the wire format is a
+/// CBOR **array** of u8s (ciborium serializes `Vec<u8>` via `serialize_seq`),
+/// so the bytes written are byte-for-byte identical to `encode_entry(key, value)`:
+///
+/// - key: text string `0x60 | key.len()`, then raw key bytes
+/// - value: definite-length array header, then one item per u8
+///   - len <= 23:    header `0x80 | len` (1 byte)
+///   - len <= 255:   header `0x98, len` (2 bytes)
+///   - len <= 65535: header `0x99, len16be` (3 bytes)
+///   - else:         header `0x9A, len32be` (5 bytes)
+///   - each u8 item: `v` for v <= 23, else `0x18, v`
+fn splice_grid_entry(buf: &mut Vec<u8>, key: &'static str, value: &[u8]) {
+    assert!(
+        key.len() <= 23 && key.is_ascii(),
+        "splice key must be a short ASCII string"
+    );
+    buf.push(0x60 | key.len() as u8);
+    buf.extend_from_slice(key.as_bytes());
+    let n = value.len();
+    if n <= 23 {
+        buf.push(0x80 | n as u8);
+    } else if n <= 255 {
+        buf.push(0x98);
+        buf.push(n as u8);
+    } else if n <= 65535 {
+        buf.push(0x99);
+        buf.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        buf.push(0x9A);
+        buf.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+    for &v in value {
+        if v <= 23 {
+            buf.push(v);
+        } else {
+            buf.push(0x18);
+            buf.push(v);
+        }
+    }
+}
+
 /// W9: the shared `GameDeltaMessage` segments, each pre-encoded ONCE per tick
 /// as raw map-entry bytes (key + value) in `GameDeltaMessage` declaration
 /// order.
@@ -482,7 +524,12 @@ impl SpliceShared {
         city_updates: &Vec<CityUpdate>,
     ) -> SpliceShared {
         let border_grid = match border_grid_diff {
-            Some(b) => encode_entry("border_grid_diff", b),
+            Some(b) => {
+                // I6: splice in place — no intermediate `encode_entry` buffer.
+                let mut out = Vec::with_capacity(b.len() + 16);
+                splice_grid_entry(&mut out, "border_grid_diff", b);
+                out
+            }
             None => Vec::new(),
         };
         let mut units_and_cities = Vec::new();
@@ -522,7 +569,9 @@ pub fn encode_delta_spliced(delta: &GameDeltaMessage, shared: &SpliceShared) -> 
     debug_assert!((5..=8).contains(&count));
     buf.push(0xa0 + count as u8);
     if let Some(vision) = &delta.vision_grid_diff {
-        buf.extend(encode_entry("vision_grid_diff", vision));
+        // I6: splice the ~1 MB vision grid in place instead of encoding it
+        // into a fresh temporary `Vec` per player per grid-dirty tick.
+        splice_grid_entry(&mut buf, "vision_grid_diff", vision);
     }
     if shared.has_border {
         buf.extend_from_slice(&shared.border_grid);
@@ -742,6 +791,42 @@ mod tests {
         }
     }
 
+    /// W9: assert `delta` splices byte-for-byte to `encode_message` and
+    /// decodes back to the same logical message.
+    fn assert_splice_byte_for_byte(delta: &GameDeltaMessage, label: &str) {
+        let shared = SpliceShared::build(
+            delta.border_grid_diff.as_ref(),
+            &delta.units_added,
+            &delta.units_removed,
+            &delta.unit_updates,
+            &delta.city_updates,
+        );
+        let spliced = encode_delta_spliced(delta, &shared);
+
+        // Full frame = 12-byte variant wrapper (1-entry map keyed "DeltaState")
+        // + the spliced delta map (the wrapper's single value).
+        let mut full = Vec::with_capacity(DELTA_STATE_VARIANT_WRAPPER.len() + spliced.len());
+        full.extend_from_slice(&DELTA_STATE_VARIANT_WRAPPER);
+        full.extend_from_slice(&spliced);
+
+        // Byte-for-byte against the standard encoder.
+        let reference = encode_message(&ServerMessage::DeltaState(delta.clone()));
+        assert_eq!(
+            full.as_slice(),
+            reference.as_slice(),
+            "{label}: spliced bytes must equal encode_message byte-for-byte"
+        );
+
+        // Decode equality: re-encode the decoded message and compare.
+        let decoded: ServerMessage =
+            ciborium::from_reader(full.as_slice()).expect("spliced decode failed");
+        assert_eq!(
+            encode_message(&decoded),
+            reference,
+            "{label}: spliced decode must round-trip to the same message"
+        );
+    }
+
     /// W9: the spliced encoder must be byte-for-byte identical to
     /// `encode_message(&ServerMessage::DeltaState(delta))` and must decode
     /// back to the same logical message. Exercises both the border-present and
@@ -755,37 +840,26 @@ mod tests {
         let msg_b = full_delta("player_b", None);
 
         for (delta, label) in [(&msg_a, "player_a"), (&msg_b, "player_b")] {
-            let shared = SpliceShared::build(
-                delta.border_grid_diff.as_ref(),
-                &delta.units_added,
-                &delta.units_removed,
-                &delta.unit_updates,
-                &delta.city_updates,
-            );
-            let spliced = encode_delta_spliced(delta, &shared);
+            assert_splice_byte_for_byte(delta, label);
+        }
+    }
 
-            // Full frame = 12-byte variant wrapper (1-entry map keyed "DeltaState")
-            // + the spliced delta map (the wrapper's single value).
-            let mut full = Vec::with_capacity(DELTA_STATE_VARIANT_WRAPPER.len() + spliced.len());
-            full.extend_from_slice(&DELTA_STATE_VARIANT_WRAPPER);
-            full.extend_from_slice(&spliced);
-
-            // Byte-for-byte against the standard encoder.
-            let reference = encode_message(&ServerMessage::DeltaState(delta.clone()));
-            assert_eq!(
-                full.as_slice(),
-                reference.as_slice(),
-                "{label}: spliced bytes must equal encode_message byte-for-byte"
-            );
-
-            // Decode equality: re-encode the decoded message and compare.
-            let decoded: ServerMessage =
-                ciborium::from_reader(full.as_slice()).expect("spliced decode failed");
-            assert_eq!(
-                encode_message(&decoded),
-                reference,
-                "{label}: spliced decode must round-trip to the same message"
-            );
+    /// W9 (I6): `splice_grid_entry` must pin every definite-length array
+    /// header form. Small (<=23), 0x98, 0x99, and 0x9A (>65,535 cells — the
+    /// 1000×1000 stress grid is 1,000,000 cells) grids must splice
+    /// byte-for-byte against the standard encoder, for both the per-player
+    /// vision entry and the shared border entry. Pseudo-random content covers
+    /// both the 1-byte (`v <= 23`) and 2-byte (`0x18, v`) item forms.
+    #[test]
+    fn splice_grid_entry_all_length_forms() {
+        for (size, label) in [(300usize, "0x58"), (70_000, "0x59"), (1_000_000, "0x5a")] {
+            // Pseudo-random content so header/content corruption is caught.
+            let grid: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+            let mut delta = full_delta("player_grid", Some(grid.clone()));
+            // Same large grid as the SHARED border entry: pins the once-per-tick
+            // SpliceShared::build path through the helper too.
+            delta.border_grid_diff = Some(Arc::new(grid.clone()));
+            assert_splice_byte_for_byte(&delta, label);
         }
     }
 

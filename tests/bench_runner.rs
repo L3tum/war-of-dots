@@ -392,3 +392,142 @@ fn stress_benchmark_i5() {
     println!("BENCH NET split={}", s["network"]["split"]);
     println!("BENCH DONE");
 }
+
+// ---------------------------------------------------------------------------
+// Round-4 A/B harnesses (deep plan: I6, I8, I1, I4, I3)
+//
+// Each test runs the standard 10k-unit stress config, writes
+// reports/stress_<suffix>.html with prev-deltas against its predecessor, and
+// prints the network row + wire/update splits for the commit message.
+// ---------------------------------------------------------------------------
+
+fn round4_config(bench_spectator: bool) -> BenchmarkConfig {
+    BenchmarkConfig {
+        units_per_city: 20,
+        ticks: 1500,
+        seed: 42,
+        detailed_systems: vec![],
+        bench_prev: None,
+        initial_units: Some(10_000),
+        map_size: 1000,
+        cities: 100,
+        max_recruits_per_event: 2000,
+        bench_spectator,
+        bench_splice: true,
+    }
+}
+
+fn round4_report(results: &war_of_dots::benchmark::BenchmarkResults, out: &str, prev: &str) {
+    if let Ok(()) = std::fs::create_dir_all("reports") {
+        let prev = std::fs::read(format!("reports/{prev}")).ok();
+        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
+        let html = war_of_dots::benchmark::generate_html_report(results, prev_html.as_deref());
+        let _ = std::fs::write(format!("reports/{out}"), html);
+        // JSON sidecar: the authoritative source for A/B numbers (the HTML
+        // embeds the whole report-history chain, making the current section
+        // ambiguous to parse).
+        let out_json = format!("reports/{}.json", out.strip_suffix(".html").unwrap_or(out));
+        let _ = std::fs::write(
+            out_json,
+            serde_json::to_string_pretty(&results.summary).unwrap_or_default(),
+        );
+    }
+}
+
+fn round4_print(s: &serde_json::Value) {
+    println!(
+        "BENCH WALL avg={} p50={} p99={} (ms)",
+        s["results"]["avg_tick_wall_ms"], s["latency"]["p50_ms"], s["latency"]["p99_ms"]
+    );
+    println!(
+        "BENCH SANITY units_remaining={} avg_combats={} avg_system_ms={}",
+        s["results"]["units_remaining"],
+        s["results"]["avg_combats_per_tick"],
+        s["results"]["avg_system_ms"]
+    );
+    if let Some(arr) = s["system_timings"].as_array() {
+        for row in arr {
+            if row["name"] == "network" {
+                println!(
+                    "BENCH NETWORK avg_ms={} p50={} p90={} p99={} calls={}",
+                    row["avg_ms"].as_f64().unwrap_or(0.0),
+                    row["p50_ms"].as_f64().unwrap_or(0.0),
+                    row["p90_ms"].as_f64().unwrap_or(0.0),
+                    row["p99_ms"].as_f64().unwrap_or(0.0),
+                    row["call_count"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    println!("BENCH NET subphase_ms={}", s["network"]["subphase_ms"]);
+    println!("BENCH NET split={}", s["network"]["split"]);
+    println!("BENCH DONE");
+}
+
+/// I6 A/B: zero-temp grid splice. Same config as I5; no wire change. Expect
+/// network allocs/bytes down, workload bit-stable vs `stress_i5.html`.
+#[test]
+#[ignore]
+fn stress_benchmark_i6() {
+    let results = run_benchmark(round4_config(false));
+    round4_report(&results, "stress_i6.html", "stress_i5.html");
+    round4_print(&results.summary);
+}
+
+/// I8 secondary sanity: same config as I6 with a connected spectator so the
+/// lazy union-vision cache is exercised. I8 is invisible to the headline
+/// numbers by design (no-spectator path is free); this guards the
+/// spectator path. Gated against `stress_i6.html`.
+///
+/// `stress_benchmark_i6_ctrl` runs the SAME config as `stress_benchmark_i6`
+/// but is meant to run against the PRE-I6 tree (git stash) for a same-machine
+/// control when the historical `stress_i5.html` baseline was recorded on a
+/// differently-loaded box. Writes `stress_i6_ctrl.html`.
+#[test]
+#[ignore]
+fn stress_benchmark_i8_spect() {
+    let results = run_benchmark(round4_config(true));
+    round4_report(&results, "stress_i8_spect.html", "stress_i6.html");
+    round4_print(&results.summary);
+}
+
+/// I1 A/B: incremental baseline-keyed snapshot. Same config as I6; wire must
+/// stay bit-stable while network allocs drop −50–70% vs `stress_i6.html`.
+#[test]
+#[ignore]
+fn stress_benchmark_i1() {
+    let results = run_benchmark(round4_config(false));
+    round4_report(&results, "stress_i1.html", "stress_i6.html");
+    round4_print(&results.summary);
+}
+
+/// I4 A/B: sparse grid diffs (wire change). Target: movement·grid-dirty wire
+/// well under 9.86 MB/tick; idle wire unchanged. Gated vs `stress_i1.html`.
+#[test]
+#[ignore]
+fn stress_benchmark_i4() {
+    let results = run_benchmark(round4_config(false));
+    round4_report(&results, "stress_i4.html", "stress_i1.html");
+    round4_print(&results.summary);
+}
+
+/// I3 A/B: compact unit updates (wire change). Expect unit_updates wire bytes
+/// down. Gated vs `stress_i4.html`.
+#[test]
+#[ignore]
+fn stress_benchmark_i3() {
+    let results = run_benchmark(round4_config(false));
+    round4_report(&results, "stress_i3.html", "stress_i4.html");
+    round4_print(&results.summary);
+}
+
+/// Same-machine control for the I6 A/B: identical config to
+/// `stress_benchmark_i6`, run against the pre-I6 tree. Writes
+/// `stress_i6_ctrl.html` (no prev-deltas against anything).
+#[test]
+#[ignore]
+fn stress_benchmark_i6_ctrl() {
+    let results = run_benchmark(round4_config(false));
+    round4_report(&results, "stress_i6_ctrl.html", "stress_i5.html");
+    round4_print(&results.summary);
+}
