@@ -24,7 +24,7 @@ use crate::map::map::{Map, MapConfig};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
 use crate::server::delta::{
-    build_delta_inner, count_units_by_owner, run_network_phase, NetworkBaselines,
+    build_delta_inner, run_network_phase, NetworkBaselines, UnitBaselineStore,
 };
 use crate::server::protocol::{
     encode_message_with_hint, estimate_delta_size, CityState, ServerMessage,
@@ -661,11 +661,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         // W4: run_network_phase takes &[&str] — borrowed pid list, no clones.
         let player_id_strs: Vec<&str> = player_ids.iter().map(|s| s.as_str()).collect();
         let mut net_baselines: NetworkBaselines = NetworkBaselines {
-            prev_units: game
-                .unit_states()
-                .into_iter()
-                .map(|u| (u.id.clone(), u))
-                .collect(),
+            prev_units: UnitBaselineStore::default(),
             prev_cities: game
                 .query_cities()
                 .iter()
@@ -683,6 +679,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 m
             },
         };
+        // I1: seed the entity-indexed unit baseline store ONCE (the live tick
+        // loop does the same) — the per-tick `prev_units` HashMap rebuild is
+        // gone; the in-place pass commits it instead.
+        game.init_unit_baselines(&mut net_baselines.prev_units);
 
         // W5: synthetic spectator baseline (pid ""), seeded from the union
         // vision grid so warmup reaches steady state like game_server does.
@@ -696,23 +696,18 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         for _ in 0..BENCH_WARMUP_TICKS {
             sim.tick(&mut game, &config);
             game.tick_game();
-            let current_units = game.unit_states_direct();
+            let unit_diff = game.update_states_in_place(&mut net_baselines.prev_units);
             // W7: convert City → CityState while the world guard is alive (no
             // redundant full Vec<City> clone).
             let current_cities: Vec<CityState> =
                 game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
-            // I5: per-owner count map — shared with (moved into) the network
-            // phase, exactly as the live tick loop does it.
-            let units_by_owner =
-                count_units_by_owner(current_units.iter().map(|u| u.owner.as_str()));
             let phase = run_network_phase(
                 &game,
                 &mut net_baselines,
                 &player_id_strs,
-                current_units,
+                unit_diff,
                 current_cities,
                 config.bench_splice,
-                units_by_owner,
             );
             if config.bench_spectator {
                 bench_spectator_delta(
@@ -764,17 +759,18 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // Network phase (W1): snapshot + build + encode per-player deltas,
             // measured as a system via tick_system! so it appears in the
             // per-system P90/P99 breakdown and alloc table alongside ECS systems.
-            // The unit_states_direct() + query_cities() snapshot is inside the
-            // timing block so its allocs are attributed to "network" (matching
-            // the pre-W1 behaviour where run_network_phase called them internally).
+            // The in-place unit diff (update_states_in_place) + cities
+            // read-back snapshot is inside the timing block so its allocs
+            // are attributed to "network" (matching the pre-W1 behaviour
+            // where run_network_phase called them internally).
             let (net_phase, net_snapshot_ms) =
                 crate::tick_system!("network", &mut game.world, game.world_entity, {
-                    // B0: snapshot sub-phase (unit_states_direct + cities
+                    // B0: snapshot sub-phase (I1 in-place unit diff + cities
                     // read-back), feature-gated so production builds pay zero
                     // timing cost.
                     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
                     let snapshot_start = std::time::Instant::now();
-                    let current_units = game.unit_states_direct();
+                    let unit_diff = game.update_states_in_place(&mut net_baselines.prev_units);
                     // W7: convert City → CityState while the world guard is alive
                     // (no per-tick Vec<City> clone).
                     let current_cities: Vec<CityState> =
@@ -783,20 +779,14 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     let snapshot_ms = snapshot_start.elapsed().as_secs_f64() * 1000.0;
                     #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
                     let snapshot_ms = 0.0f64;
-                    // I5: per-owner count map — part of the tick's work (the
-                    // live loop builds it too; pre-I5 the network phase built
-                    // an identical map internally, so timing is unchanged).
-                    let units_by_owner =
-                        count_units_by_owner(current_units.iter().map(|u| u.owner.as_str()));
                     (
                         run_network_phase(
                             &game,
                             &mut net_baselines,
                             &player_id_strs,
-                            current_units,
+                            unit_diff,
                             current_cities,
                             config.bench_splice,
-                            units_by_owner,
                         ),
                         snapshot_ms,
                     )

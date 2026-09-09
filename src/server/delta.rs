@@ -28,6 +28,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use hecs::Entity;
+
 use crate::game::game::Game;
 use crate::server::protocol::{
     encode_message_with_hint, estimate_delta_size, CityState, CityUpdate, GameDeltaMessage,
@@ -84,7 +86,7 @@ const COLD_EVERY: u64 = 10;
 
 /// I2b: is this a cold tick (full digest, cold fields compared and emitted
 /// exactly as pre-I2b)?
-fn cold_due(tick: u64) -> bool {
+pub(crate) fn cold_due(tick: u64) -> bool {
     tick.is_multiple_of(COLD_EVERY)
 }
 
@@ -116,8 +118,12 @@ fn band_crossed(prev: f32, curr: f32, band: f32) -> bool {
 ///
 /// If any field that affects gameplay rendering changes, the corresponding
 /// digest field also changes, ensuring we never miss a real update.
+///
+/// I1: `from_ecs` is the single source of truth for the digest arithmetic —
+/// the live in-place pass (`Game::update_states_in_place`) feeds it raw ECS
+/// values, while `from_unit` (HashMap reference path) delegates to it.
 #[derive(Debug, Clone, PartialEq)]
-struct UnitStateDigest {
+pub(crate) struct UnitStateDigest {
     position: (f32, f32),
     men: f32,
     max_men: f32,
@@ -137,41 +143,86 @@ struct UnitStateDigest {
 }
 
 impl UnitStateDigest {
-    /// Build a digest; on a HOT tick (`is_cold == false`) the cold supply
-    /// fields are zeroed so they cannot drive an update on their own — a
-    /// cold field is compared only on cold ticks (full digest) or via its
-    /// threshold gate in the update loop. men_step is I2a (see above).
-    fn from_unit(u: &UnitState, men_step: f32, is_cold: bool) -> Self {
+    /// Build a digest from raw (ECS or materialized) unit values; on a HOT
+    /// tick (`is_cold == false`) the cold supply fields are zeroed so they
+    /// cannot drive an update on their own — a cold field is compared only
+    /// on cold ticks (full digest) or via its threshold gate in the update
+    /// loop. men_step is I2a (see above).
+    #[allow(clippy::too_many_arguments)] // one arg per digest field — the query tuple as-is
+    pub(crate) fn from_ecs(
+        position: (f32, f32),
+        men: f32,
+        max_men: f32,
+        organisation: f32,
+        equipment_count: u64,
+        max_equipment_count: u64,
+        path_len: usize,
+        healing: bool,
+        resupply_enabled: bool,
+        supply_percent: f32,
+        encircled: bool,
+        attacking: bool,
+        on_water: bool,
+        boat_supply_percent: f32,
+        embarking: bool,
+        disembarking: bool,
+        men_step: f32,
+        is_cold: bool,
+    ) -> Self {
         Self {
-            position: u.position,
-            men: (u.men / men_step).round() * men_step,
-            max_men: u.max_men,
-            organisation: (u.organisation / QUANT_ORG).round() * QUANT_ORG,
-            equipment_count: quantize_equip(u.equipment.iter().map(|e| e.count as u64).sum()),
-            max_equipment_count: quantize_equip(
-                u.max_equipment.iter().map(|e| e.count as u64).sum(),
-            ),
-            path_len: u.path.len(),
-            healing: u.healing,
-            resupply_enabled: u.resupply_enabled,
+            position,
+            men: (men / men_step).round() * men_step,
+            max_men,
+            organisation: (organisation / QUANT_ORG).round() * QUANT_ORG,
+            equipment_count: quantize_equip(equipment_count),
+            max_equipment_count: quantize_equip(max_equipment_count),
+            path_len,
+            healing,
+            resupply_enabled,
             // I2b: cold — excluded from hot-tick equality.
             supply_percent: if is_cold {
-                (u.supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY
+                (supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY
             } else {
                 0.0
             },
-            encircled: u.encircled,
-            attacking: u.attacking,
-            on_water: u.on_water,
+            encircled,
+            attacking,
+            on_water,
             // I2b: cold — excluded from hot-tick equality.
             boat_supply_percent: if is_cold {
-                (u.boat_supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY
+                (boat_supply_percent / QUANT_SUPPLY).round() * QUANT_SUPPLY
             } else {
                 0.0
             },
-            embarking: u.embarking,
-            disembarking: u.disembarking,
+            embarking,
+            disembarking,
         }
+    }
+
+    /// Build a digest from a materialized `UnitState`. Delegates to `from_ecs`
+    /// so the reference path (replay endpoint, tests) and the live in-place
+    /// pass can never drift.
+    pub(crate) fn from_unit(u: &UnitState, men_step: f32, is_cold: bool) -> Self {
+        Self::from_ecs(
+            u.position,
+            u.men,
+            u.max_men,
+            u.organisation,
+            u.equipment.iter().map(|e| e.count as u64).sum(),
+            u.max_equipment.iter().map(|e| e.count as u64).sum(),
+            u.path.len(),
+            u.healing,
+            u.resupply_enabled,
+            u.supply_percent,
+            u.encircled,
+            u.attacking,
+            u.on_water,
+            u.boat_supply_percent,
+            u.embarking,
+            u.disembarking,
+            men_step,
+            is_cold,
+        )
     }
 }
 
@@ -207,8 +258,160 @@ pub(crate) fn count_units_by_owner<'a>(
     tmp.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+/// I1: field-level `UnitUpdate` for a unit whose digest already changed
+/// (the digest check happens at the call site). Shared by the live in-place
+/// pass (`Game::update_states_in_place`) and the HashMap reference path
+/// (`compute_shared_deltas` — replay endpoint + tests) so the two can never
+/// drift in what fields an update carries.
+pub(crate) fn build_unit_update(prev: &UnitState, u: &UnitState, is_cold: bool) -> UnitUpdate {
+    let new_pos = if u.position != prev.position {
+        Some(u.position)
+    } else {
+        None
+    };
+
+    let new_men = if u.men != prev.men { Some(u.men) } else { None };
+
+    let new_org = if u.organisation != prev.organisation {
+        Some(u.organisation)
+    } else {
+        None
+    };
+
+    // I2b: cold — on a hot tick only its threshold gate decides.
+    let new_equipment = if is_cold
+        || equip_threshold(
+            prev.equipment.iter().map(|e| e.count as u64).sum(),
+            u.equipment.iter().map(|e| e.count as u64).sum(),
+        ) {
+        if u.equipment != prev.equipment {
+            Some(u.equipment.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let new_healing = if u.healing != prev.healing {
+        Some(u.healing)
+    } else {
+        None
+    };
+
+    let new_resupply = if u.resupply_enabled != prev.resupply_enabled {
+        Some(u.resupply_enabled)
+    } else {
+        None
+    };
+
+    // I2b: cold — on a hot tick only its threshold gate decides.
+    let new_supply = if u.supply_percent != prev.supply_percent
+        && (is_cold || band_crossed(prev.supply_percent, u.supply_percent, 10.0))
+    {
+        Some(u.supply_percent)
+    } else {
+        None
+    };
+
+    let new_encircled = if u.encircled != prev.encircled {
+        Some(u.encircled)
+    } else {
+        None
+    };
+
+    // I2b: cold — on a hot tick only its threshold gate decides.
+    let new_path = if is_cold || path_threshold(prev.path.len(), u.path.len()) {
+        if u.path != prev.path {
+            Some(u.path.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    UnitUpdate {
+        id: u.id.clone(),
+        position: new_pos,
+        men: new_men,
+        organisation: new_org,
+        equipment: new_equipment,
+        path: new_path,
+        healing: new_healing,
+        resupply_enabled: new_resupply,
+        supply_percent: new_supply,
+        encircled: new_encircled,
+        attacking: if u.attacking != prev.attacking {
+            Some(u.attacking)
+        } else {
+            None
+        },
+        on_water: if u.on_water != prev.on_water {
+            Some(u.on_water)
+        } else {
+            None
+        },
+        // I2b: cold — on a hot tick only its threshold gate decides.
+        boat_supply_percent: if u.boat_supply_percent != prev.boat_supply_percent
+            && (is_cold || band_crossed(prev.boat_supply_percent, u.boat_supply_percent, 10.0))
+        {
+            Some(u.boat_supply_percent)
+        } else {
+            None
+        },
+        embarking: if u.embarking != prev.embarking {
+            Some(u.embarking)
+        } else {
+            None
+        },
+        disembarking: if u.disembarking != prev.disembarking {
+            Some(u.disembarking)
+        } else {
+            None
+        },
+    }
+}
+
+/// City owner/level diff (shared by the live and HashMap reference paths).
+fn city_updates_diff(
+    prev_cities: &HashMap<String, CityState>,
+    current_cities: &[CityState],
+) -> Vec<CityUpdate> {
+    let mut city_updates: Vec<CityUpdate> = Vec::new();
+    for city in current_cities.iter() {
+        if let Some(prev) = prev_cities.get(&city.id) {
+            let owner_changed = city.owner != prev.owner;
+            let level_changed = city.level != prev.level;
+
+            if owner_changed || level_changed {
+                city_updates.push(CityUpdate {
+                    id: city.id.clone(),
+                    owner: if owner_changed {
+                        city.owner.clone()
+                    } else {
+                        None
+                    },
+                    level: if level_changed {
+                        Some(city.level)
+                    } else {
+                        None
+                    },
+                    manpower: None,
+                });
+            }
+        }
+    }
+    city_updates
+}
+
 /// Compute the player-independent portions of the per-player delta.
 /// Called once per tick, not once per player.
+///
+/// I1: this is the HashMap-based REFERENCE path — the replay endpoint and
+/// the unit tests keep using it (no perf requirement there). The live tick
+/// loop instead runs `Game::update_states_in_place` and builds the shared
+/// deltas from its `UnitDiff` via `compute_shared_deltas_from_diff`.
 #[allow(clippy::too_many_arguments)] // I2a: men_step added; kept flat (not a struct) — it is the only runtime knob
 pub(crate) fn compute_shared_deltas(
     prev_units: &HashMap<String, UnitState>,
@@ -279,146 +482,14 @@ pub(crate) fn compute_shared_deltas(
         if let Some(prev) = prev_units.get(&u.id) {
             let curr_digest = UnitStateDigest::from_unit(u, men_step, is_cold);
             let prev_digest = UnitStateDigest::from_unit(prev, men_step, is_cold);
-            if curr_digest == prev_digest {
-                continue;
+            if curr_digest != prev_digest {
+                unit_updates.push(build_unit_update(prev, u, is_cold));
             }
-
-            let new_pos = if u.position != prev.position {
-                Some(u.position)
-            } else {
-                None
-            };
-
-            let new_men = if u.men != prev.men { Some(u.men) } else { None };
-
-            let new_org = if u.organisation != prev.organisation {
-                Some(u.organisation)
-            } else {
-                None
-            };
-
-            // I2b: cold — on a hot tick only its threshold gate decides.
-            let new_equipment = if is_cold
-                || equip_threshold(
-                    prev.equipment.iter().map(|e| e.count as u64).sum(),
-                    u.equipment.iter().map(|e| e.count as u64).sum(),
-                ) {
-                if u.equipment != prev.equipment {
-                    Some(u.equipment.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let new_healing = if u.healing != prev.healing {
-                Some(u.healing)
-            } else {
-                None
-            };
-
-            let new_resupply = if u.resupply_enabled != prev.resupply_enabled {
-                Some(u.resupply_enabled)
-            } else {
-                None
-            };
-
-            // I2b: cold — on a hot tick only its threshold gate decides.
-            let new_supply = if u.supply_percent != prev.supply_percent
-                && (is_cold || band_crossed(prev.supply_percent, u.supply_percent, 10.0))
-            {
-                Some(u.supply_percent)
-            } else {
-                None
-            };
-
-            let new_encircled = if u.encircled != prev.encircled {
-                Some(u.encircled)
-            } else {
-                None
-            };
-
-            // I2b: cold — on a hot tick only its threshold gate decides.
-            let new_path = if is_cold || path_threshold(prev.path.len(), u.path.len()) {
-                if u.path != prev.path {
-                    Some(u.path.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            unit_updates.push(UnitUpdate {
-                id: u.id.clone(),
-                position: new_pos,
-                men: new_men,
-                organisation: new_org,
-                equipment: new_equipment,
-                path: new_path,
-                healing: new_healing,
-                resupply_enabled: new_resupply,
-                supply_percent: new_supply,
-                encircled: new_encircled,
-                attacking: if u.attacking != prev.attacking {
-                    Some(u.attacking)
-                } else {
-                    None
-                },
-                on_water: if u.on_water != prev.on_water {
-                    Some(u.on_water)
-                } else {
-                    None
-                },
-                // I2b: cold — on a hot tick only its threshold gate decides.
-                boat_supply_percent: if u.boat_supply_percent != prev.boat_supply_percent
-                    && (is_cold
-                        || band_crossed(prev.boat_supply_percent, u.boat_supply_percent, 10.0))
-                {
-                    Some(u.boat_supply_percent)
-                } else {
-                    None
-                },
-                embarking: if u.embarking != prev.embarking {
-                    Some(u.embarking)
-                } else {
-                    None
-                },
-                disembarking: if u.disembarking != prev.disembarking {
-                    Some(u.disembarking)
-                } else {
-                    None
-                },
-            });
         }
     }
 
     // City updates
-    let mut city_updates: Vec<CityUpdate> = Vec::new();
-    for city in current_cities.iter() {
-        if let Some(prev) = prev_cities.get(&city.id) {
-            let owner_changed = city.owner != prev.owner;
-            let level_changed = city.level != prev.level;
-
-            if owner_changed || level_changed {
-                city_updates.push(CityUpdate {
-                    id: city.id.clone(),
-                    owner: if owner_changed {
-                        city.owner.clone()
-                    } else {
-                        None
-                    },
-                    level: if level_changed {
-                        Some(city.level)
-                    } else {
-                        None
-                    },
-                    manpower: None,
-                });
-            }
-        }
-    }
+    let city_updates = city_updates_diff(prev_cities, current_cities);
 
     SharedDeltas {
         border_grid_diff,
@@ -428,6 +499,60 @@ pub(crate) fn compute_shared_deltas(
         city_updates: Arc::new(city_updates),
         prev_units_by_owner,
         current_units_by_owner,
+    }
+}
+
+/// I1: the LIVE path's unit diff, produced by `Game::update_states_in_place`
+/// (single in-place ECS pass, no per-tick `Vec<UnitState>` materialization).
+/// Wire-relevant content only: added units (full state), removed unit ids,
+/// and field-level updates — plus the per-owner count maps the tick loop's
+/// active-player check and `SharedDeltas` need.
+pub(crate) struct UnitDiff {
+    pub added: Vec<UnitState>,
+    pub removed: Vec<String>,
+    pub updates: Vec<UnitUpdate>,
+    /// Per-owner unit counts for this tick's snapshot (replaces the caller's
+    /// `count_units_by_owner` over the materialized snapshot; feeds the
+    /// active-player check and `SharedDeltas::current_units_by_owner`).
+    pub current_owner_counts: HashMap<String, u32>,
+    /// Per-owner unit counts on the PRE-COMMIT baseline — what the old path
+    /// computed from `prev_units` inside `compute_shared_deltas`.
+    pub prev_owner_counts: HashMap<String, u32>,
+}
+
+/// I1: build the shared (player-independent) deltas from the live in-place
+/// unit diff. Mirrors `compute_shared_deltas` minus the unit work, which the
+/// diff already carries — so the live path no longer touches any
+/// `HashMap<String, UnitState>` baseline at all.
+pub(crate) fn compute_shared_deltas_from_diff(
+    diff: UnitDiff,
+    prev_cities: &HashMap<String, CityState>,
+    current_cities: &[CityState],
+    prev_border_grid: Option<&Arc<Vec<u8>>>,
+    current_border_grid: &Option<Arc<Vec<u8>>>,
+) -> SharedDeltas {
+    // Border grid diff (shared across all players) — identical to the
+    // reference path: share the published Arc instead of copying the grid.
+    let border_grid_diff: Option<Arc<Vec<u8>>> = match (prev_border_grid, current_border_grid) {
+        (Some(prev), Some(curr)) => {
+            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
+                None
+            } else {
+                Some(Arc::clone(curr))
+            }
+        }
+        (None, Some(curr)) => Some(Arc::clone(curr)),
+        _ => None,
+    };
+
+    SharedDeltas {
+        border_grid_diff,
+        units_added: Arc::new(diff.added),
+        units_removed: Arc::new(diff.removed),
+        unit_updates: Arc::new(diff.updates),
+        city_updates: Arc::new(city_updates_diff(prev_cities, current_cities)),
+        prev_units_by_owner: diff.prev_owner_counts,
+        current_units_by_owner: diff.current_owner_counts,
     }
 }
 
@@ -530,13 +655,188 @@ pub(crate) fn build_delta_inner(
 /// Per-tick baseline state for the network phase (W0 fix: shared read-only
 /// baseline with per-player vision).
 /// N1: grids are stored as flat `Arc` slices for O(1) change detection.
+/// I1: the unit baseline is the entity-indexed `UnitBaselineStore` (see
+/// below) instead of a `HashMap<String, UnitState>` rebuilt from a full
+/// snapshot every tick.
 #[derive(Default)]
 pub(crate) struct NetworkBaselines {
-    pub prev_units: HashMap<String, UnitState>,
+    pub prev_units: UnitBaselineStore,
     pub prev_cities: HashMap<String, CityState>,
     pub prev_funds: HashMap<String, u32>,
     pub prev_vision: HashMap<String, Arc<Vec<u8>>>,
     pub prev_border: Option<Arc<Vec<u8>>>,
+}
+
+/// I1: entity-indexed unit baseline store — the replacement for the old
+/// `HashMap<String, UnitState>` that `run_network_phase` rebuilt from a full
+/// `unit_states_direct()` snapshot every tick.
+///
+/// Dense `Vec<Option<UnitState>>` indexed by the hecs entity id (low 32 bits
+/// of `Entity::to_bits()`), with a per-slot `u32` generation stamp (upper 32
+/// bits) guarding id reuse — the exact mechanism of
+/// `TickContext.owner_at`/`owner_gen` (`game.rs:318–323`; hecs bumps the
+/// generation on id reuse, so a stale slot never matches). The `alive` list
+/// holds the entities with a live baseline; `touched` is a scratch set (bucket
+/// capacity reused across ticks) marking entity ids seen by the current pass.
+///
+/// Slot reuse ⇒ same `unit_N` id, new incarnation ⇒ the gen check misses, so
+/// the pass emits `removed` (tombstone) + `added` (fresh baseline) for it.
+/// Strings (id/owner/unit_type/symbol, equipment names) are allocated once at
+/// recruit and kept in the baseline; the common per-tick commit mutates
+/// numeric fields in place (`update_states_in_place`).
+#[derive(Default)]
+pub(crate) struct UnitBaselineStore {
+    slots: Vec<Option<UnitState>>,
+    gens: Vec<u32>,
+    alive: Vec<Entity>,
+    /// Full (id, gen) entities seen by the current pass — id+gen, not id
+    /// only, so a same-tick death→respawn on the same slot can't keep the
+    /// stale incarnation alive.
+    touched: HashSet<Entity>,
+    /// Fresh incarnations `insert`ed during the current pass (scratch;
+    /// appended to `alive` at `commit`).
+    new: Vec<Entity>,
+}
+
+/// Cap on the baseline store's entity-id span. Live hecs ids are bounded by
+/// total spawns; the cap keeps a pathological id (e.g. `Entity::DANGLING` =
+/// u32::MAX) from triggering a multi-GB `Vec` resize (mirrors
+/// `OWNER_MAX_ID` in `TickContext`). Entities beyond the cap read as "no
+/// baseline" (treated as new every pass — loudly wrong, but the input
+/// can't arise from real hecs query results).
+const UNIT_STORE_MAX_ID: usize = 1 << 18;
+
+impl UnitBaselineStore {
+    /// Pre-commit per-owner unit counts (what the old path derived from the
+    /// `prev_units` HashMap) — one key clone per DISTINCT owner.
+    pub fn prev_owner_counts(&self) -> HashMap<String, u32> {
+        let mut tmp: HashMap<&str, u32> = HashMap::new();
+        for e in &self.alive {
+            if let Some(u) = self.resolve(*e) {
+                *tmp.entry(u.owner.as_str()).or_insert(0) += 1;
+            }
+        }
+        tmp.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// Resolve the live baseline for entity `e` (generation-checked).
+    pub fn resolve(&self, e: Entity) -> Option<&UnitState> {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        if id >= UNIT_STORE_MAX_ID {
+            return None;
+        }
+        self.slots
+            .get(id)
+            .and_then(|s| s.as_ref())
+            .filter(|_| self.gens.get(id).copied() == Some((bits >> 32) as u32))
+    }
+
+    pub fn resolve_mut(&mut self, e: Entity) -> Option<&mut UnitState> {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        if id >= UNIT_STORE_MAX_ID {
+            return None;
+        }
+        let gen_ok = self.gens.get(id).copied() == Some((bits >> 32) as u32);
+        if gen_ok {
+            self.slots.get_mut(id).and_then(|s| s.as_mut())
+        } else {
+            None
+        }
+    }
+
+    /// Mark entity `e` as seen by the current pass (`commit` keeps exactly
+    /// the touched alive entries); grows the dense tables on first sight of
+    /// a new id.
+    pub fn touch(&mut self, e: Entity) {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        if id >= UNIT_STORE_MAX_ID {
+            return;
+        }
+        self.touched.insert(e);
+        if self.slots.len() <= id {
+            self.slots.resize(id + 1, None);
+            self.gens.resize(id + 1, 0);
+        }
+    }
+
+    /// Take a STALE baseline out of `e`'s slot: the slot holds a different
+    /// incarnation of the same id (death→respawn within a single pass; hecs
+    /// reuses the id with a bumped generation). Returns the old state so the
+    /// pass can emit `old.id` in `removed` before `insert`ing the fresh one
+    /// (the removed+added pair for the same wire id). `None` when the slot
+    /// is empty or already holds `e` itself.
+    pub fn take_stale(&mut self, e: Entity) -> Option<UnitState> {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        if id >= UNIT_STORE_MAX_ID {
+            return None;
+        }
+        if self.gens.get(id).copied() == Some((bits >> 32) as u32) {
+            return None; // slot is live for `e` — not stale
+        }
+        self.slots.get_mut(id).and_then(|s| s.take())
+    }
+
+    /// Insert a FRESH baseline (new incarnation). The slot must not currently
+    /// resolve to a live baseline for `e` — callers gate this on `resolve`
+    /// (after any `take_stale`).
+    pub fn insert(&mut self, e: Entity, state: UnitState) {
+        let bits = e.to_bits().get();
+        let id = (bits & 0xFFFF_FFFF) as usize;
+        debug_assert!(
+            id < UNIT_STORE_MAX_ID && self.resolve(e).is_none(),
+            "insert into a live baseline slot"
+        );
+        if id >= UNIT_STORE_MAX_ID {
+            return;
+        }
+        if self.slots.len() <= id {
+            self.slots.resize(id + 1, None);
+            self.gens.resize(id + 1, 0);
+        }
+        self.slots[id] = Some(state);
+        self.gens[id] = (bits >> 32) as u32;
+        self.new.push(e);
+    }
+
+    /// End of pass: prune the alive list to the touched entities and append
+    /// the fresh incarnations inserted this pass. A dead unit's id is moved
+    /// out of its baseline slot into `removed` — for an alive entry not
+    /// touched this pass, ONLY when the slot still holds that incarnation
+    /// (a same-tick respawn overwrote the slot with a NEW incarnation, and
+    /// its `take_stale` already emitted the old id). Runs against the
+    /// PRE-COMMIT state — the pass collected every live entity first, so
+    /// dead units are still visible as `prev` when the diff was built.
+    pub fn commit(&mut self, removed: &mut Vec<String>) {
+        let mut n = self.alive.len();
+        let mut keep = 0usize;
+        while keep < n {
+            let e = self.alive[keep];
+            let bits = e.to_bits().get();
+            let id = (bits & 0xFFFF_FFFF) as usize;
+            let gen = (bits >> 32) as u32;
+            if self.touched.contains(&e) {
+                keep += 1;
+                continue;
+            }
+            // Not seen this pass. Emit its id only if the slot still holds
+            // THIS incarnation (gen matches); a bumped gen means a new
+            // incarnation was inserted over it this same pass and
+            // `take_stale` already emitted the old id.
+            if self.gens.get(id).copied() == Some(gen) {
+                if let Some(u) = self.slots.get_mut(id).and_then(|s| s.take()) {
+                    removed.push(u.id);
+                }
+            }
+            self.alive.swap_remove(keep);
+            n -= 1; // swapped-in tail entry is unprocessed; `keep` stays put
+        }
+        self.alive.append(&mut self.new);
+        self.touched.clear();
+    }
 }
 
 /// Result of a single network-phase invocation.
@@ -573,22 +873,22 @@ pub(crate) struct NetworkPhaseResult {
     pub grid_dirty: bool,
 }
 
-/// Run the full per-tick network phase: snapshot, per-player delta build,
-/// encode, and baseline commit. The caller is responsible for actually
-/// sending the encoded bytes over the wire.
+/// Run the full per-tick network phase: per-player delta build, encode, and
+/// baseline commit. The caller is responsible for actually sending the
+/// encoded bytes over the wire.
+///
+/// I1: the `current_units: Vec<UnitState>` materialization param and the tail
+/// `prev_units` HashMap rebuild are gone — the caller runs
+/// `Game::update_states_in_place` first (single in-place ECS pass, baseline
+/// committed there) and hands over its `UnitDiff`.
 pub(crate) fn run_network_phase(
     game: &Game,
     baselines: &mut NetworkBaselines,
     player_ids: &[&str],
-    current_units: Vec<UnitState>,
+    unit_diff: UnitDiff,
     current_cities: Vec<CityState>,
     spliced: bool,
-    // I5: per-owner unit counts for this tick, built by the caller — shared
-    // with the active-player check instead of a second O(N) pass here.
-    current_units_by_owner: HashMap<String, u32>,
 ) -> NetworkPhaseResult {
-    // N2: borrowed ID set for removed-units check (no deep clones)
-    let current_unit_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
     let all_funds = game.all_player_funds();
     // N1: flat Arc grids (no 2-D allocation)
     let border_grid: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
@@ -602,21 +902,15 @@ pub(crate) fn run_network_phase(
     // W-2: compute player-independent deltas once per tick, not once per player.
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     let shared_start = std::time::Instant::now();
-    // I2a: the men digest step must absorb the lobby's per-tick refill rate
-    // (men refill at `recruitment_rate` each tick); floor of 5 for visibility.
-    let men_step = game.settings().recruitment_rate.max(5.0);
-    let shared = compute_shared_deltas(
-        &baselines.prev_units,
+    // I1: the unit work (added/removed/updates + both per-owner count maps)
+    // already happened in `Game::update_states_in_place` against the
+    // pre-commit baseline; this only adds the border grid diff + city diff.
+    let shared = compute_shared_deltas_from_diff(
+        unit_diff,
         &baselines.prev_cities,
-        &current_units,
         &current_cities,
-        &current_unit_ids,
         baselines.prev_border.as_ref(),
         &border_grid,
-        men_step,
-        // I2b: cold-field gate driven by the game tick.
-        game.tick_number(),
-        current_units_by_owner,
     );
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     {
@@ -742,15 +1036,11 @@ pub(crate) fn run_network_phase(
         result.grid_dirty = grid_dirty;
     }
 
-    // Commit shared baselines by move. The caller hands us the tick's snapshot
-    // (W-1: built once upstream and shared with the active-player check), so
-    // the baseline maps are built by moving each element in — only the key
-    // String is cloned. This replaces the per-element deep clone of every
-    // UnitState (4 Strings + 3 Vecs) / CityState that happened here every tick.
-    baselines.prev_units = current_units
-        .into_iter()
-        .map(|u| (u.id.clone(), u))
-        .collect();
+    // Commit shared baselines by move.
+    // I1: `baselines.prev_units` is no longer rebuilt here — the in-place
+    // pass (`Game::update_states_in_place`) already committed the unit store
+    // before this call (the UnitDiff was computed against its pre-commit
+    // state). Only the city/funds/grid baselines move in.
     baselines.prev_cities = current_cities
         .into_iter()
         .map(|c| (c.id.clone(), c))

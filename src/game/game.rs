@@ -1879,90 +1879,351 @@ impl Game {
             .collect()
     }
 
-    /// Get all unit data as UnitState for serialization (direct single-pass,
-    /// no intermediate `UnitQueryData`). Used by the network phase.
-    pub fn unit_states_direct(&self) -> Vec<crate::server::protocol::UnitState> {
+    /// I1: materialize one live unit entity as a protocol `UnitState`. This
+    /// is the old `unit_states_direct` per-unit work, now run only for units
+    /// that actually changed (or joined) this tick — the unchanged majority
+    /// commits in place against the baseline instead.
+    #[allow(clippy::too_many_arguments)] // one arg per ECS component — the query tuple as-is
+    fn unit_state_from_entity(
+        entity: Entity,
+        owner: &UnitOwner,
+        utype: &UnitTypeId,
+        display: &UnitDisplay,
+        pos: &UnitPosition,
+        path: &UnitPath,
+        stats: &UnitStats,
+        equipment: &UnitEquipment,
+        flags: &UnitFlags,
+        wt: &UnitWaterTransition,
+    ) -> crate::server::protocol::UnitState {
         use crate::server::protocol::{EquipmentState, UnitState};
-        self.world
-            .query::<(
-                Entity,
-                &UnitOwner,
-                &UnitTypeId,
-                &UnitDisplay,
-                &UnitPosition,
-                &UnitPath,
-                &UnitStats,
-                &UnitEquipment,
-                &UnitFlags,
-                &UnitWaterTransition,
-            )>()
+        let eid = entity.id();
+        // supply_percent: same formula as UnitQueryData::supply_percent
+        let total_needed: f32 = equipment
+            .max_equipment
             .iter()
-            .map(
-                |(entity, owner, utype, display, pos, path, stats, equipment, flags, wt)| {
-                    let eid = entity.id();
-                    // supply_percent: same formula as UnitQueryData::supply_percent
-                    let total_needed: f32 = equipment
-                        .max_equipment
-                        .iter()
-                        .map(|me| (me.max_count as f32) * 0.9)
-                        .sum();
-                    let total_carried: f32 =
-                        equipment.equipment.iter().map(|e| e.count as f32).sum();
-                    let supply_percent = if total_needed <= 0.0 {
-                        100.0
-                    } else {
-                        (total_carried / total_needed * 100.0).clamp(0.0, 100.0)
-                    };
-                    // boat_supply_percent
-                    let total_boat_max: f32 =
-                        wt.max_boat_supply.iter().map(|e| e.max_count as f32).sum();
-                    let total_boat_cur: f32 = wt.boat_supply.iter().map(|e| e.count as f32).sum();
-                    let boat_supply_percent = if total_boat_max <= 0.0 {
-                        0.0
-                    } else {
-                        (total_boat_cur / total_boat_max * 100.0).clamp(0.0, 100.0)
-                    };
-                    UnitState {
-                        id: format!("unit_{eid}"),
-                        owner: owner.player_id.clone(),
-                        position: pos.as_tuple(),
-                        unit_type: utype.name.clone(),
-                        symbol: display.symbol.clone(),
-                        men: stats.men,
-                        max_men: stats.max_men,
-                        organisation: stats.organisation,
-                        equipment: equipment
-                            .equipment
-                            .iter()
-                            .map(|e| EquipmentState {
-                                name: e.name.clone(),
-                                count: e.count,
-                                cost_per_item: e.cost_per_item,
-                            })
-                            .collect(),
-                        max_equipment: equipment
-                            .max_equipment
-                            .iter()
-                            .map(|e| EquipmentState {
-                                name: e.name.clone(),
-                                count: e.count,
-                                cost_per_item: e.cost_per_item,
-                            })
-                            .collect(),
-                        path: path.path.to_vec(),
-                        healing: flags.healing,
-                        resupply_enabled: flags.resupply_enabled,
+            .map(|me| (me.max_count as f32) * 0.9)
+            .sum();
+        let total_carried: f32 = equipment.equipment.iter().map(|e| e.count as f32).sum();
+        let supply_percent = if total_needed <= 0.0 {
+            100.0
+        } else {
+            (total_carried / total_needed * 100.0).clamp(0.0, 100.0)
+        };
+        // boat_supply_percent: same formula as UnitQueryData::boat_supply_percent
+        let total_boat_max: f32 = wt.max_boat_supply.iter().map(|e| e.max_count as f32).sum();
+        let total_boat_cur: f32 = wt.boat_supply.iter().map(|e| e.count as f32).sum();
+        let boat_supply_percent = if total_boat_max <= 0.0 {
+            0.0
+        } else {
+            (total_boat_cur / total_boat_max * 100.0).clamp(0.0, 100.0)
+        };
+        UnitState {
+            id: format!("unit_{eid}"),
+            owner: owner.player_id.clone(),
+            position: pos.as_tuple(),
+            unit_type: utype.name.clone(),
+            symbol: display.symbol.clone(),
+            men: stats.men,
+            max_men: stats.max_men,
+            organisation: stats.organisation,
+            equipment: equipment
+                .equipment
+                .iter()
+                .map(|e| EquipmentState {
+                    name: e.name.clone(),
+                    count: e.count,
+                    cost_per_item: e.cost_per_item,
+                })
+                .collect(),
+            max_equipment: equipment
+                .max_equipment
+                .iter()
+                .map(|e| EquipmentState {
+                    name: e.name.clone(),
+                    count: e.count,
+                    cost_per_item: e.cost_per_item,
+                })
+                .collect(),
+            path: path.path.to_vec(),
+            healing: flags.healing,
+            resupply_enabled: flags.resupply_enabled,
+            supply_percent,
+            encircled: flags.encircled,
+            attacking: flags.fighting,
+            on_water: flags.on_water,
+            boat_supply_percent,
+            embarking: wt.embarking,
+            disembarking: wt.disembarking,
+        }
+    }
+
+    /// I1: seed the entity-indexed unit baseline store from the current world
+    /// (replaces the old `NetworkBaselines.prev_units` init from
+    /// `unit_states()`). One materialization per live unit, ONCE per game.
+    pub(crate) fn init_unit_baselines(&self, store: &mut crate::server::delta::UnitBaselineStore) {
+        let mut query = self.world.query::<(
+            Entity,
+            &UnitOwner,
+            &UnitTypeId,
+            &UnitDisplay,
+            &UnitPosition,
+            &UnitPath,
+            &UnitStats,
+            &UnitEquipment,
+            &UnitFlags,
+            &UnitWaterTransition,
+        )>();
+        for (entity, owner, utype, display, pos, path, stats, equipment, flags, wt) in query.iter()
+        {
+            store.touch(entity);
+            store.insert(
+                entity,
+                Self::unit_state_from_entity(
+                    entity, owner, utype, display, pos, path, stats, equipment, flags, wt,
+                ),
+            );
+        }
+        // Seed the alive list so the first `commit` has correct prev state.
+        // (update_states_in_place's commit rebuilds `alive` from touched +
+        // fresh inserts; do the first commit here so a world with zero units
+        // still converges.)
+        let mut init_removed = Vec::new();
+        store.commit(&mut init_removed);
+        debug_assert!(init_removed.is_empty());
+    }
+
+    /// I1: incremental snapshot — the single in-place ECS pass that replaces
+    /// `unit_states_direct()` for the live network phase. For every live
+    /// unit it diffs against the PRE-COMMIT baseline (`UnitBaselineStore`) and:
+    /// - unit absent from the baseline (new recruit, or death→respawn reusing
+    ///   the same entity id at a bumped generation) → emit the full `UnitState`
+    ///   in `added`, intern it in the store;
+    /// - digest changed → materialize ONLY this unit, emit a field-level
+    ///   `UnitUpdate` (same `build_unit_update` field logic as the reference
+    ///   path), and commit the materialized state into the slot;
+    /// - digest unchanged → commit the exact current values in place (no
+    ///   allocation: numeric fields + equipment counts + path are written
+    ///   into the baseline; strings are interned and invariant).
+    ///
+    /// The store is committed (in-place writes + tombstone of dead slots) as
+    /// the final step of this call — AFTER the diff was built against the
+    /// pre-commit state, so dead units are still visible as `prev` for
+    /// `units_removed`. `UnitStateDigest` (delta.rs) still decides what goes
+    /// on the wire; this pass only removes the per-tick full materialization.
+    pub(crate) fn update_states_in_place(
+        &self,
+        store: &mut crate::server::delta::UnitBaselineStore,
+    ) -> crate::server::delta::UnitDiff {
+        use crate::server::delta::{build_unit_update, cold_due, UnitDiff, UnitStateDigest};
+        // I2a: runtime men digest step = max(5.0, recruitment_rate); I2b: the
+        // cold-field gate is driven by the game tick — identical to the
+        // reference path's `compute_shared_deltas` arguments.
+        let men_step = self.settings().recruitment_rate.max(5.0);
+        let is_cold = cold_due(self.tick_number());
+
+        // PRE-COMMIT owner counts (what the old path derived from prev_units).
+        let prev_owner_counts = store.prev_owner_counts();
+
+        let mut added: Vec<crate::server::protocol::UnitState> = Vec::new();
+        let mut updates: Vec<crate::server::protocol::UnitUpdate> = Vec::new();
+        // Dead-unit wire ids collected as the pass runs (stale-slot
+        // respawns) and at `commit` (plain deaths) — moved out of the
+        // baseline slots, no key clones.
+        let mut removed: Vec<String> = Vec::new();
+        // Borrowed keys: one String clone per DISTINCT owner at the end, not
+        // one per unit (same semantics as `count_units_by_owner`).
+        let mut current_owner_counts: HashMap<&str, u32> = HashMap::new();
+
+        let mut query = self.world.query::<(
+            Entity,
+            &UnitOwner,
+            &UnitTypeId,
+            &UnitDisplay,
+            &UnitPosition,
+            &UnitPath,
+            &UnitStats,
+            &UnitEquipment,
+            &UnitFlags,
+            &UnitWaterTransition,
+        )>();
+        for (entity, owner, utype, display, pos, path, stats, equipment, flags, wt) in query.iter()
+        {
+            store.touch(entity);
+            *current_owner_counts
+                .entry(owner.player_id.as_str())
+                .or_insert(0) += 1;
+
+            // Digest inputs straight from the components (no materialization).
+            let total_needed: f32 = equipment
+                .max_equipment
+                .iter()
+                .map(|me| (me.max_count as f32) * 0.9)
+                .sum();
+            let total_carried: f32 = equipment.equipment.iter().map(|e| e.count as f32).sum();
+            let supply_percent = if total_needed <= 0.0 {
+                100.0
+            } else {
+                (total_carried / total_needed * 100.0).clamp(0.0, 100.0)
+            };
+            let total_boat_max: f32 = wt.max_boat_supply.iter().map(|e| e.max_count as f32).sum();
+            let total_boat_cur: f32 = wt.boat_supply.iter().map(|e| e.count as f32).sum();
+            let boat_supply_percent = if total_boat_max <= 0.0 {
+                0.0
+            } else {
+                (total_boat_cur / total_boat_max * 100.0).clamp(0.0, 100.0)
+            };
+            let digest = UnitStateDigest::from_ecs(
+                pos.as_tuple(),
+                stats.men,
+                stats.max_men,
+                stats.organisation,
+                equipment.equipment.iter().map(|e| e.count as u64).sum(),
+                equipment.max_equipment.iter().map(|e| e.count as u64).sum(),
+                path.path.len(),
+                flags.healing,
+                flags.resupply_enabled,
+                supply_percent,
+                flags.encircled,
+                flags.fighting,
+                flags.on_water,
+                boat_supply_percent,
+                wt.embarking,
+                wt.disembarking,
+                men_step,
+                is_cold,
+            );
+
+            if store.resolve(entity).is_none() {
+                // New incarnation (recruit, or id reuse after death). A
+                // non-empty stale slot means death→respawn within this one
+                // pass: emit the old incarnation's id as removed BEFORE the
+                // fresh one is inserted (removed+added pair, same wire id).
+                if let Some(stale) = store.take_stale(entity) {
+                    removed.push(stale.id);
+                }
+                // Full materialization is the one place the old per-unit
+                // alloc cost legitimately remains.
+                let u = Self::unit_state_from_entity(
+                    entity, owner, utype, display, pos, path, stats, equipment, flags, wt,
+                );
+                store.insert(entity, u.clone());
+                added.push(u);
+            } else if UnitStateDigest::from_unit(store.resolve(entity).unwrap(), men_step, is_cold)
+                != digest
+            {
+                // Digest changed: materialize ONLY this unit and build the
+                // field-level update against the pre-commit baseline.
+                let curr = Self::unit_state_from_entity(
+                    entity, owner, utype, display, pos, path, stats, equipment, flags, wt,
+                );
+                let update = store
+                    .resolve(entity)
+                    .map(|prev| build_unit_update(prev, &curr, is_cold))
+                    .expect("baseline slot resolved moments ago");
+                // Commit: move the materialized state into the slot (the
+                // update's equipment/path payloads are already cloned out).
+                *store
+                    .resolve_mut(entity)
+                    .expect("baseline slot resolved moments ago") = curr;
+                updates.push(update);
+            } else {
+                // Digest unchanged: no wire output. Commit the EXACT current
+                // values in place (the baseline must track truth — the old
+                // path re-committed the full snapshot every tick, so
+                // thresholds like `equip_threshold`/`band_crossed` see the
+                // same prev values and the wire stays bit-stable).
+                if let Some(base) = store.resolve_mut(entity) {
+                    Self::refresh_baseline_in_place(
+                        base,
+                        owner,
+                        pos,
+                        path,
+                        stats,
+                        equipment,
+                        flags,
+                        wt,
                         supply_percent,
-                        encircled: flags.encircled,
-                        attacking: flags.fighting,
-                        on_water: flags.on_water,
                         boat_supply_percent,
-                        embarking: wt.embarking,
-                        disembarking: wt.disembarking,
-                    }
-                },
-            )
-            .collect()
+                    );
+                }
+            }
+        }
+
+        // Commit: prune the alive list to the touched entities and emit the
+        // plain-death removed ids — AFTER the diff was fully built against
+        // the pre-commit state.
+        store.commit(&mut removed);
+
+        UnitDiff {
+            added,
+            removed,
+            updates,
+            current_owner_counts: current_owner_counts
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            prev_owner_counts,
+        }
+    }
+
+    /// I1: in-place baseline commit for a digest-UNCHANGED unit. Writes the
+    /// exact current values into the stored `UnitState`; allocation-free in
+    /// the common case (the path Vec only allocates on net growth, equipment
+    /// slot lists are invariant in length, and the owner String only changes
+    /// when the owner actually changes). `max_equipment`/`unit_type`/`symbol`
+    /// are recruit-time invariants and stay interned.
+    #[allow(clippy::too_many_arguments)] // one arg per ECS component — the query tuple as-is
+    fn refresh_baseline_in_place(
+        base: &mut crate::server::protocol::UnitState,
+        owner: &UnitOwner,
+        pos: &UnitPosition,
+        path: &UnitPath,
+        stats: &UnitStats,
+        equipment: &UnitEquipment,
+        flags: &UnitFlags,
+        wt: &UnitWaterTransition,
+        supply_percent: f32,
+        boat_supply_percent: f32,
+    ) {
+        base.position = pos.as_tuple();
+        base.men = stats.men;
+        base.max_men = stats.max_men;
+        base.organisation = stats.organisation;
+        base.healing = flags.healing;
+        base.resupply_enabled = flags.resupply_enabled;
+        base.supply_percent = supply_percent;
+        base.encircled = flags.encircled;
+        base.attacking = flags.fighting;
+        base.on_water = flags.on_water;
+        base.boat_supply_percent = boat_supply_percent;
+        base.embarking = wt.embarking;
+        base.disembarking = wt.disembarking;
+        // Equipment: slot names/costs are invariant; only the counts move.
+        if base.equipment.len() == equipment.equipment.len() {
+            for (b, e) in base.equipment.iter_mut().zip(equipment.equipment.iter()) {
+                b.count = e.count;
+            }
+        } else {
+            // Slot list changed (rare): rebuild (also keeps names/costs in
+            // sync with the ECS, so the baseline stays truthful).
+            base.equipment = equipment
+                .equipment
+                .iter()
+                .map(|e| crate::server::protocol::EquipmentState {
+                    name: e.name.clone(),
+                    count: e.count,
+                    cost_per_item: e.cost_per_item,
+                })
+                .collect();
+        }
+        // Path: in-place rewrite (capacity is reused on shrink/grow cycles).
+        base.path.clear();
+        base.path.extend_from_slice(&path.path);
+        // Owner: interned String, replaced only on an actual change.
+        if base.owner != owner.player_id {
+            base.owner = owner.player_id.clone();
+        }
     }
 
     /// Get all funds for all players.
@@ -2624,5 +2885,363 @@ mod tests {
             let sum: f32 = ut.equipment.iter().map(|e| e.max_count as f32).sum();
             assert_eq!(game.unit_type_total_max_equipment[i], sum);
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // I1: entity-indexed baseline store + in-place diff pass
+    // ---------------------------------------------------------------------------
+
+    /// I1 golden parity: for a fixed-seed churn run, the live in-place pass
+    /// (`update_states_in_place` + `UnitBaselineStore`) must emit exactly the
+    /// same added / removed / updates + per-owner count maps as the old
+    /// materialize-everything reference path (`unit_states()` +
+    /// `compute_shared_deltas` over a per-tick `HashMap` baseline). The
+    /// churn deliberately avoids same-tick id reuse (a death is never
+    /// followed by a recruit before the next pass) — that case is pinned
+    /// separately by `i1_lifecycle_death_respawn_same_slot_removed_added` as
+    /// the designed removed+added behavior.
+    #[test]
+    fn i1_golden_parity_in_place_vs_hashmap_reference() {
+        use crate::server::delta::{
+            compute_shared_deltas, count_units_by_owner, UnitBaselineStore,
+        };
+        use crate::server::protocol::{CityState, UnitState};
+        use std::collections::HashSet;
+
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        assert!(game.assign_city_owner("city_1", "player_1"));
+        assert!(game.assign_city_owner("city_2", "player_0"));
+        let ut = basic_unit_type();
+        let id_a = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        let id_b = game.recruit_unit("city_1", &ut, "player_1").unwrap();
+        assert_ne!(id_a, id_b);
+
+        // Seed both paths from the same world state (the live loop seeds the
+        // store once at room start; the old path seeded a HashMap the same
+        // way).
+        let mut store = UnitBaselineStore::default();
+        game.init_unit_baselines(&mut store);
+        let mut prev_units: HashMap<String, UnitState> = game
+            .unit_states()
+            .into_iter()
+            .map(|u| (u.id.clone(), u))
+            .collect();
+        let prev_cities: HashMap<String, CityState> = HashMap::new();
+        let mut id_c: Option<String> = None;
+        // The churn must actually exercise all three diff kinds — otherwise
+        // this parity check would pass vacuously on an all-empty stream.
+        let (mut total_added, mut total_updates, mut total_removed) = (0usize, 0usize, 0usize);
+
+        for step in 0..12 {
+            // NEW (live) path — the in-place pass commits the store itself.
+            let diff = game.update_states_in_place(&mut store);
+
+            // GOLD (old path) — full materialization + HashMap baseline.
+            let current_units = game.unit_states();
+            let current_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
+            let men_step = game.settings().recruitment_rate.max(5.0);
+            let shared = compute_shared_deltas(
+                &prev_units,
+                &prev_cities,
+                &current_units,
+                &[],
+                &current_ids,
+                None,
+                &None,
+                men_step,
+                game.tick_number(),
+                count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
+            );
+
+            assert_eq!(
+                *shared.units_added, diff.added,
+                "units_added diverged at step {step}"
+            );
+            assert_eq!(
+                *shared.unit_updates, diff.updates,
+                "unit_updates diverged at step {step}"
+            );
+            total_added += diff.added.len();
+            total_updates += diff.updates.len();
+            total_removed += diff.removed.len();
+            // The old path derives removed from a HashMap's iteration order —
+            // compare as a set; the new path is alive-list ordered.
+            let mut gold_removed = (*shared.units_removed).to_vec();
+            let mut new_removed = diff.removed.clone();
+            gold_removed.sort();
+            new_removed.sort();
+            assert_eq!(
+                gold_removed, new_removed,
+                "units_removed diverged at step {step}"
+            );
+            assert_eq!(
+                shared.prev_units_by_owner, diff.prev_owner_counts,
+                "prev owner counts diverged at step {step}"
+            );
+            assert_eq!(
+                shared.current_units_by_owner, diff.current_owner_counts,
+                "current owner counts diverged at step {step}"
+            );
+            // Plan gate: per-owner counts identical to count_units_by_owner
+            // on the same snapshot.
+            assert_eq!(
+                diff.current_owner_counts,
+                count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
+                "owner counts must match count_units_by_owner at step {step}"
+            );
+
+            if step == 0 {
+                assert!(
+                    diff.added.is_empty() && diff.updates.is_empty() && diff.removed.is_empty(),
+                    "freshly-seeded world must produce an empty first-pass diff"
+                );
+            }
+
+            // Commit the reference baseline (the old path's tail) — then
+            // drive the world before the next pass.
+            prev_units = current_units
+                .into_iter()
+                .map(|u| (u.id.clone(), u))
+                .collect();
+
+            match step {
+                0 => {
+                    // Order unit A to move → position/path updates over the
+                    // following ticks.
+                    game.move_troops(&id_a, "player_0", vec![(10.0, 10.0), (11.0, 11.0)]);
+                }
+                1 => {
+                    // Recruit a third unit (added) — no id was ever freed,
+                    // so no slot reuse can happen.
+                    id_c = game.recruit_unit("city_2", &ut, "player_0");
+                    assert!(id_c.is_some());
+                }
+                3 => {
+                    // Kill the third unit (removed); its freed id is never
+                    // re-recruited in this test.
+                    let entity = *game.entity_registry.get(id_c.as_deref().unwrap()).unwrap();
+                    game.world.despawn(entity).unwrap();
+                }
+                5 => {
+                    // Owner change — not a digest field: no update on either
+                    // path, but the per-owner counts move.
+                    let entity = *game.entity_registry.get(&id_a).unwrap();
+                    let (owner_c,) = game
+                        .world
+                        .query_one_mut::<(&mut UnitOwner,)>(entity)
+                        .unwrap();
+                    owner_c.player_id = "player_1".to_string();
+                }
+                6 => {
+                    // men change → digest change → a unit_updates entry,
+                    // diffed against the re-owned baseline.
+                    let entity = *game.entity_registry.get(&id_a).unwrap();
+                    let (stats_c,) = game
+                        .world
+                        .query_one_mut::<(&mut UnitStats,)>(entity)
+                        .unwrap();
+                    stats_c.men = 500.0;
+                }
+                _ => {}
+            }
+            game.tick_game();
+        }
+
+        assert!(
+            total_added >= 1 && total_updates >= 1 && total_removed >= 1,
+            "churn must exercise added/updates/removed (got {total_added}/{total_updates}/{total_removed}) — a vacuous parity pass"
+        );
+    }
+
+    /// I1 lifecycle: recruit → exactly one `added` with full state, then
+    /// quiet; the interned baseline tracks the static unit in place (no
+    /// update for a unit whose digest is unchanged).
+    #[test]
+    fn i1_lifecycle_recruit_then_quiet() {
+        use crate::server::delta::{count_units_by_owner, UnitBaselineStore};
+
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        let mut store = UnitBaselineStore::default();
+        game.init_unit_baselines(&mut store);
+
+        // Empty-world first pass: pure no-op.
+        let diff = game.update_states_in_place(&mut store);
+        assert!(diff.added.is_empty());
+        assert!(diff.updates.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.current_owner_counts.is_empty());
+        assert!(diff.prev_owner_counts.is_empty());
+
+        let ut = basic_unit_type();
+        let id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        let diff = game.update_states_in_place(&mut store);
+        assert_eq!(diff.added.len(), 1, "recruit must emit exactly one added");
+        assert_eq!(diff.added[0].id, id);
+        assert_eq!(diff.added[0].owner, "player_0");
+        assert_eq!(diff.added[0].unit_type, "infantry");
+        assert!(diff.updates.is_empty() && diff.removed.is_empty());
+        // Per-owner counts identical to count_units_by_owner on the snapshot.
+        assert_eq!(
+            diff.current_owner_counts,
+            count_units_by_owner(game.unit_states().iter().map(|u| u.owner.as_str()))
+        );
+
+        // Second pass: baseline matches the static world → no output, and
+        // the PRE counts now carry the recruit.
+        let diff = game.update_states_in_place(&mut store);
+        assert!(diff.added.is_empty() && diff.updates.is_empty() && diff.removed.is_empty());
+        assert_eq!(diff.current_owner_counts.get("player_0"), Some(&1));
+        assert_eq!(diff.prev_owner_counts.get("player_0"), Some(&1));
+    }
+
+    /// I1 lifecycle: an empty world stays a no-op across passes (the store
+    /// must not grow phantom entries or emit phantom removals).
+    #[test]
+    fn i1_lifecycle_empty_world_is_noop() {
+        use crate::server::delta::UnitBaselineStore;
+
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        let mut store = UnitBaselineStore::default();
+        game.init_unit_baselines(&mut store);
+        for i in 0..5 {
+            game.tick_game();
+            let diff = game.update_states_in_place(&mut store);
+            assert!(diff.added.is_empty(), "empty world, pass {i}");
+            assert!(diff.updates.is_empty());
+            assert!(diff.removed.is_empty());
+            assert!(diff.current_owner_counts.is_empty());
+            assert!(diff.prev_owner_counts.is_empty());
+        }
+    }
+
+    /// I1 lifecycle: an owner change is not a digest field (no unit_update —
+    /// identical to the old id-keyed path), but the per-owner counts move
+    /// immediately and the NEXT update is diffed against the re-owned
+    /// baseline (prev counts already on the new owner).
+    #[test]
+    fn i1_lifecycle_owner_change_moves_counts_not_updates() {
+        use crate::server::delta::UnitBaselineStore;
+
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        assert!(game.assign_city_owner("city_1", "player_1"));
+        let mut store = UnitBaselineStore::default();
+        game.init_unit_baselines(&mut store);
+        let ut = basic_unit_type();
+        let id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        let _ = game.update_states_in_place(&mut store); // seed the baseline
+
+        let entity = *game.entity_registry.get(&id).unwrap();
+        let (owner_c,) = game
+            .world
+            .query_one_mut::<(&mut UnitOwner,)>(entity)
+            .unwrap();
+        owner_c.player_id = "player_1".to_string();
+        let diff = game.update_states_in_place(&mut store);
+        assert!(
+            diff.updates.is_empty(),
+            "owner is not a digest field — no update"
+        );
+        assert!(diff.added.is_empty() && diff.removed.is_empty());
+        assert_eq!(diff.current_owner_counts.get("player_1"), Some(&1));
+        assert_eq!(diff.current_owner_counts.get("player_0"), None);
+
+        // Now a men change → exactly one update, diffed against the new
+        // owner's baseline.
+        let (stats_c,) = game
+            .world
+            .query_one_mut::<(&mut UnitStats,)>(entity)
+            .unwrap();
+        stats_c.men = 500.0;
+        let diff = game.update_states_in_place(&mut store);
+        assert_eq!(diff.updates.len(), 1);
+        assert_eq!(diff.updates[0].id, id);
+        assert_eq!(diff.updates[0].men, Some(500.0));
+        assert_eq!(diff.prev_owner_counts.get("player_1"), Some(&1));
+    }
+
+    /// I1 lifecycle: death removes the unit id on the very next pass
+    /// (tombstone at commit, diffed against the pre-commit baseline) and the
+    /// store converges back to empty.
+    #[test]
+    fn i1_lifecycle_death_tombstones_removed() {
+        use crate::server::delta::UnitBaselineStore;
+
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        let mut store = UnitBaselineStore::default();
+        game.init_unit_baselines(&mut store);
+        let ut = basic_unit_type();
+        let id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        let _ = game.update_states_in_place(&mut store); // added
+
+        let entity = *game.entity_registry.get(&id).unwrap();
+        game.world.despawn(entity).unwrap();
+        let diff = game.update_states_in_place(&mut store);
+        assert_eq!(
+            diff.removed,
+            vec![id.clone()],
+            "death must emit the id once"
+        );
+        assert!(diff.added.is_empty() && diff.updates.is_empty());
+
+        // Converged: the next pass is a no-op.
+        let diff = game.update_states_in_place(&mut store);
+        assert!(diff.added.is_empty() && diff.updates.is_empty() && diff.removed.is_empty());
+    }
+
+    /// I1 lifecycle: death→respawn reusing the same hecs id (bumped
+    /// generation, same dense slot) must emit the removed+added pair for the
+    /// same wire id — the per-slot generation stamp is what makes the dense
+    /// Vec safe here, and the diff is built against the PRE-COMMIT baseline
+    /// so the old incarnation is still visible as `prev`.
+    #[test]
+    fn i1_lifecycle_death_respawn_same_slot_removed_added() {
+        use crate::server::delta::UnitBaselineStore;
+
+        let mut game = Game::new(test_map(), test_settings(), 2);
+        game.start();
+        assert!(game.assign_city_owner("city_0", "player_0"));
+        assert!(game.assign_city_owner("city_1", "player_1"));
+        let mut store = UnitBaselineStore::default();
+        game.init_unit_baselines(&mut store);
+        let ut = basic_unit_type();
+        let id_a = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        let _ = game.update_states_in_place(&mut store); // added
+
+        // Kill it, then recruit at the same city: hecs reuses the just-freed
+        // id at gen+1 (the same slot, a new incarnation).
+        let entity = *game.entity_registry.get(&id_a).unwrap();
+        game.world.despawn(entity).unwrap();
+        let id_b = game.recruit_unit("city_0", &ut, "player_0").unwrap();
+        assert_eq!(id_a, id_b, "hecs must reuse the freed entity id");
+
+        let diff = game.update_states_in_place(&mut store);
+        assert_eq!(
+            diff.removed,
+            vec![id_a.clone()],
+            "old incarnation must be removed"
+        );
+        assert_eq!(diff.added.len(), 1, "new incarnation must be added");
+        assert_eq!(
+            diff.added[0].id, id_a,
+            "same wire id (unit_N) for the new incarnation"
+        );
+        assert_eq!(
+            diff.added[0].owner, "player_0",
+            "full state, not a stale-baseline update"
+        );
+
+        // Converged: the next pass is quiet and the counts follow the unit.
+        let diff = game.update_states_in_place(&mut store);
+        assert!(diff.added.is_empty() && diff.updates.is_empty() && diff.removed.is_empty());
+        assert_eq!(diff.prev_owner_counts.get("player_0"), Some(&1));
     }
 }

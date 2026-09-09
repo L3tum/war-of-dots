@@ -24,7 +24,9 @@ use crate::map::map::Map;
 use crate::map::map_config::load_default_map;
 use crate::map::map_registry;
 use crate::replay::replay::ReplayEvent;
-use crate::server::delta::{run_network_phase, NetworkBaselines, NetworkPhaseResult};
+use crate::server::delta::{
+    run_network_phase, NetworkBaselines, NetworkPhaseResult, UnitBaselineStore,
+};
 use crate::server::lobby::LobbyManager;
 use crate::server::protocol::{
     decode_client_message, encode_message, encode_message_with_hint, estimate_delta_size,
@@ -452,11 +454,7 @@ impl GameRoom {
         tokio::spawn(async move {
             let mut game = game;
             let mut baselines: NetworkBaselines = NetworkBaselines {
-                prev_units: game
-                    .unit_states()
-                    .into_iter()
-                    .map(|u| (u.id.clone(), u))
-                    .collect(),
+                prev_units: UnitBaselineStore::default(),
                 prev_cities: game
                     .query_cities()
                     .iter()
@@ -474,6 +472,9 @@ impl GameRoom {
                     m
                 },
             };
+            // I1: seed the entity-indexed unit baseline store ONCE per game
+            // (replaces the per-tick `prev_units` HashMap rebuild).
+            game.init_unit_baselines(&mut baselines.prev_units);
             let mut players = players;
             let mut advisors = advisors;
             // I8: lazy cache for the spectator union vision grid — recomputed
@@ -562,9 +563,14 @@ impl GameRoom {
                         // --- Run game systems ---
                         game.tick_game();
 
-                        // Snapshot game state once per tick, shared by the
-                        // active-player check and the per-player delta build.
-                        let current_units = game.unit_states_direct();
+                        // I1: single in-place ECS pass replacing the per-tick
+                        // full `unit_states_direct()` snapshot — diffs every
+                        // live unit against the PRE-COMMIT baseline, emits
+                        // only changed units into `unit_diff`, and commits
+                        // the baseline store. `unit_diff` feeds both the
+                        // active-player check (per-owner counts) and the
+                        // per-player delta build below.
+                        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
                         // W7: convert City → CityState while the world guard is
                         // alive (no redundant full Vec<City> clone; the CityState
                         // Vec is the allocation we actually need).
@@ -598,8 +604,12 @@ impl GameRoom {
                         // active_count == 1 the winner IS the sole active
                         // player and the per-tick determine_winner() call
                         // (P archetype + P city scans) is skipped entirely.
-                        let units_by_owner =
-                            count_units_by_owner(current_units.iter().map(|u| u.owner.as_str()));
+                        // I1: the per-owner counts come straight from the
+                        // in-place pass (`unit_diff`) instead of a second
+                        // O(N) `count_units_by_owner` scan — the map only
+                        // exists twice (this clone + the one moved into the
+                        // network phase) and has ≤ one key per player.
+                        let units_by_owner = unit_diff.current_owner_counts.clone();
                         let city_owners: HashSet<&str> = current_cities
                             .iter()
                             .filter_map(|c| c.owner.as_deref())
@@ -702,13 +712,9 @@ impl GameRoom {
                             &game,
                             &mut baselines,
                             &regular_pids,
-                            current_units,
+                            unit_diff,
                             current_cities,
                             true, // W9 splice path: on — A/B confirmed ~1.5% off the network phase (byte-for-byte verified encoder)
-                            // I5: the per-owner count map built for the
-                            // active check above — one map per tick instead
-                            // of two.
-                            units_by_owner,
                         );
 
                         // W4: outbox by move — the send loop takes ownership of each
