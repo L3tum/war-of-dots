@@ -39,7 +39,7 @@ pub struct GameDeltaMessage {
     pub player: PlayerState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct UnitState {
     pub id: String,
     pub owner: String,
@@ -74,7 +74,7 @@ pub struct EquipmentState {
     pub cost_per_item: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct UnitUpdate {
     pub id: String,
     // Absent fields are omitted on the wire (compact form); clients guard with
@@ -110,7 +110,7 @@ pub struct UnitUpdate {
     pub disembarking: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct CityState {
     pub id: String,
     pub position: (f32, f32),
