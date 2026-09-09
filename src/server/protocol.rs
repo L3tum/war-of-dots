@@ -830,7 +830,9 @@ mod tests {
     /// W9: the spliced encoder must be byte-for-byte identical to
     /// `encode_message(&ServerMessage::DeltaState(delta))` and must decode
     /// back to the same logical message. Exercises both the border-present and
-    /// vision-present/vision-absent map-count branches with 2 players.
+    /// vision-present/vision-absent map-count branches with 2 players, plus
+    /// an I6 >65,535-byte grid case that pins the 4-byte-length array header
+    /// form (`0x9A, len32be`) through the main byte-for-byte gate.
     #[test]
     fn splice_matches_encode_message_byte_for_byte() {
         let vision_a = vec![0u8, 1, 0, 1, 1, 0, 1, 1];
@@ -838,21 +840,37 @@ mod tests {
         let msg_a = full_delta("player_a", Some(vision_a));
         // Player B: NO vision diff (exercises the dynamic map count).
         let msg_b = full_delta("player_b", None);
+        // Player C (I6): a >65,535-byte vision grid — the 5-byte array header
+        // `0x9A, len32be` form. Pseudo-random content covers both the 1-byte
+        // (`v <= 23`) and 2-byte (`0x18, v`) item encodings.
+        let vision_c: Vec<u8> = (0..70_000).map(|i| (i * 31 + 7) as u8).collect();
+        let msg_c = full_delta("player_c", Some(vision_c));
 
-        for (delta, label) in [(&msg_a, "player_a"), (&msg_b, "player_b")] {
+        for (delta, label) in [
+            (&msg_a, "player_a"),
+            (&msg_b, "player_b"),
+            (&msg_c, "player_c_gt65535"),
+        ] {
             assert_splice_byte_for_byte(delta, label);
         }
     }
 
     /// W9 (I6): `splice_grid_entry` must pin every definite-length array
-    /// header form. Small (<=23), 0x98, 0x99, and 0x9A (>65,535 cells — the
-    /// 1000×1000 stress grid is 1,000,000 cells) grids must splice
+    /// header form: 0x98 (24..=255), 0x99 (256..=65,535), and 0x9A
+    /// (>65,535 cells; the 1000×1000 stress grid is 1,000,000 cells) — the
+    /// 1-byte `0x80|len` form (<=23) is pinned by the 8-byte grids in
+    /// `splice_matches_encode_message_byte_for_byte`. Each grid must splice
     /// byte-for-byte against the standard encoder, for both the per-player
     /// vision entry and the shared border entry. Pseudo-random content covers
     /// both the 1-byte (`v <= 23`) and 2-byte (`0x18, v`) item forms.
     #[test]
     fn splice_grid_entry_all_length_forms() {
-        for (size, label) in [(300usize, "0x58"), (70_000, "0x59"), (1_000_000, "0x5a")] {
+        for (size, label) in [
+            (100usize, "0x98"),
+            (300, "0x99"),
+            (70_000, "0x9a"),
+            (1_000_000, "0x9a"),
+        ] {
             // Pseudo-random content so header/content corruption is caught.
             let grid: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
             let mut delta = full_delta("player_grid", Some(grid.clone()));
