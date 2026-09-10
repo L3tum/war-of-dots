@@ -61,14 +61,14 @@ impl<'de> serde::Deserialize<'de> for LobbyPlayer {
         }
         let h = Helper::deserialize(deserializer)?;
         // Default to TCP sender (shouldn't happen in practice)
-        let (_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<super::room::EgressMessage>();
         Ok(LobbyPlayer {
             id: h.id,
             name: h.name,
             is_human: h.is_human,
             llm_provider: h.llm_provider,
             connected: h.connected,
-            connection: PlayerSender::Tcp(_tx),
+            connection: PlayerSender::Tcp(super::room::TcpEgress::new(_tx)),
         })
     }
 }
@@ -166,7 +166,7 @@ impl LobbyManager {
                 let encoded_clone = encoded.clone();
                 let sender = player.connection.clone();
                 tokio::spawn(async move {
-                    let _ = sender.send(encoded_clone).await;
+                    let _ = sender.send_reliable(encoded_clone).await;
                 });
             }
         }

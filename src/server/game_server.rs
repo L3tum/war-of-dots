@@ -36,7 +36,8 @@ use crate::server::protocol::{
 
 // Re-export types from room module for use throughout game_server
 pub use crate::server::room::{
-    Command, DebugGameStats, GameRoom, LlmPlayerConfig, PlayerConnection, PlayerSender,
+    egress_bytes, Command, DebugGameStats, DeltaRing, EgressMessage, GameRoom, LlmPlayerConfig,
+    PlayerConnection, PlayerSender, TcpEgress,
 };
 
 // Re-export delta functions
@@ -243,7 +244,7 @@ impl GameRoom {
             let initial_state = game.full_state_with_player_id(&player_id);
             let initial_msg = ServerMessage::FullState(initial_state);
             let encoded = encode_message(&initial_msg);
-            let _ = player.tx().blocking_send(encoded);
+            let _ = player.tx().blocking_send_reliable(encoded);
         }
 
         // Create LLM agents from configs
@@ -499,7 +500,7 @@ impl GameRoom {
                             let encoded = encode_message(&msg);
                             for player in &players {
                                 if player.id().is_some_and(|id| *id == pid) {
-                                    let _ = player.tx().send(encoded.clone()).await;
+                                    let _ = player.tx().send_reliable(encoded.clone()).await;
                                 }
                             }
                         }
@@ -512,7 +513,7 @@ impl GameRoom {
                                 reason,
                             });
                             for player in &players {
-                                let _ = player.tx().send(encoded.clone()).await;
+                                let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
                         }
 
@@ -548,7 +549,7 @@ impl GameRoom {
                                     let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
                                     let full_state = game.full_state_with_vision(vision_grid, border_grid);
                                     let encoded = encode_message(&ServerMessage::FullState(full_state));
-                                    let _ = sender.send(encoded).await;
+                                    let _ = sender.send_reliable(encoded).await;
                                     players.push(PlayerConnection::Spectator { tx: sender });
                                 }
                                 Command::EmbarkUnit(unit_id, pid) => {
@@ -656,7 +657,7 @@ impl GameRoom {
                             };
                             let encoded = encode_message(&msg);
                             for player in &players {
-                                let _ = player.tx().send(encoded.clone()).await;
+                                let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
                             for handle in spawned_handles {
                                 handle.abort();
@@ -687,7 +688,7 @@ impl GameRoom {
                             };
                             let encoded = encode_message(&msg);
                             for player in &players {
-                                let _ = player.tx().send(encoded.clone()).await;
+                                let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
                             for handle in spawned_handles {
                                 handle.abort();
@@ -794,7 +795,9 @@ impl GameRoom {
                             let pid = player.id().cloned().unwrap_or_default();
                             if let Some(pos) = outbox.iter().position(|(p, _)| p.as_str() == pid) {
                                 let (_, bytes) = outbox.swap_remove(pos);
-                                if player.tx().send(bytes).await.is_ok() {
+                                // I7: tick deltas go through the bounded keep-latest
+                                // ring; send failure (channel closed) still drops the player.
+                                if player.tx().send_delta(bytes).await.is_ok() {
                                     alive.push(player);
                                 }
                                 // else: connection died -> player dropped
@@ -834,7 +837,7 @@ impl GameRoom {
                             };
                             let encoded = encode_message(&msg);
                             for player in &players {
-                                let _ = player.tx().send(encoded.clone()).await;
+                                let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
                             {
                                 let server = server_state.lock().await;
@@ -903,7 +906,7 @@ impl GameRoom {
                                 let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
                                 let full_state = game.full_state_with_vision(vision_grid, border_grid);
                                 let encoded = encode_message(&ServerMessage::FullState(full_state));
-                                let _ = sender.send(encoded).await;
+                                let _ = sender.send_reliable(encoded).await;
                                 players.push(PlayerConnection::Spectator { tx: sender });
                             }
                             Some(Command::EmbarkUnit(unit_id, pid)) => {
@@ -1208,12 +1211,18 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
         }
     };
 
-    // Create a bridge channel: room sends to WS via this sender
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // I7: create the bridge channel with its keep-latest delta ring
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EgressMessage>();
+    let ring = Arc::new(DeltaRing::new(crate::server::room::DELTA_RING_DEPTH));
+    let ring_bridge = Arc::clone(&ring);
     // Spawn task to forward messages from channel to WebSocket
     tokio::spawn(async move {
         let mut ws_sink = ws_sink;
-        while let Some(data) = rx.recv().await {
+        while let Some(msg) = rx.recv().await {
+            let data = match egress_bytes(msg, &ring) {
+                Some(data) => data,
+                None => continue, // stale delta superseded by a newer ring entry
+            };
             if ws_sink.send(Message::Binary(data)).await.is_err() {
                 break;
             }
@@ -1222,7 +1231,10 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
 
     // Send the AddSpectator command via the room's command_tx
     // We need to create a PlayerSender that bridges to the channel
-    let bridge = PlayerSender::Tcp(tx.clone());
+    let bridge = PlayerSender::Tcp(TcpEgress {
+        tx,
+        ring: ring_bridge,
+    });
     // Send the command to register the spectator with the room
     room_arc
         .lock()
@@ -1466,28 +1478,64 @@ pub(crate) async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws_game(socket, server_state.0))
 }
 
+/// I7: shared drain loop for a raw-TCP egress channel — resolves each
+/// envelope against the keep-latest ring (skipping deltas a newer one
+/// superseded) and writes to the connection. One message per wake; the
+/// loop drains fully on its own when the reader catches up.
+pub(crate) async fn tcp_egress_loop(
+    mut writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    mut rx: mpsc::UnboundedReceiver<EgressMessage>,
+    ring: Arc<DeltaRing>,
+) {
+    while let Some(msg) = rx.recv().await {
+        let data = match egress_bytes(msg, &ring) {
+            Some(data) => data,
+            None => continue, // stale delta superseded by a newer ring entry
+        };
+        if writer.write_all(&data).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// I7: shared drain loop for the WebSocket egress bridge (the WS sink is
+/// shared via a mutex while the read loop stays alive).
+pub(crate) async fn ws_egress_loop<S>(
+    sink: Arc<tokio::sync::Mutex<S>>,
+    mut rx: mpsc::UnboundedReceiver<EgressMessage>,
+    ring: Arc<DeltaRing>,
+) where
+    S: futures::Sink<Message> + Unpin,
+{
+    while let Some(msg) = rx.recv().await {
+        let data = match egress_bytes(msg, &ring) {
+            Some(data) => data,
+            None => continue, // stale delta superseded by a newer ring entry
+        };
+        let mut guard = sink.lock().await;
+        if guard.send(Message::Binary(data)).await.is_err() {
+            break;
+        }
+    }
+}
+
 pub(crate) async fn handle_tcp_client(
     stream: tokio::net::TcpStream,
     server_state: Arc<Mutex<GameServer>>,
 ) {
     let conn_id = Uuid::new_v4();
     let (reader, writer) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // I7: channel carries tagged envelopes; the ring bounds delta memory
+    let (tx, rx) = mpsc::unbounded_channel::<EgressMessage>();
     let tx_clone = tx.clone();
     let server_state_clone = server_state.clone();
     // PlayerSender for this TCP connection
-    let player_sender = PlayerSender::Tcp(tx_clone.clone());
+    let egress = TcpEgress::new(tx_clone.clone());
+    let ring = Arc::clone(&egress.ring);
+    let player_sender = PlayerSender::Tcp(egress);
 
     // Spawn sender task
-    tokio::spawn(async move {
-        let mut writer = writer;
-        let mut rx = rx;
-        while let Some(data) = rx.recv().await {
-            if writer.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
+    tokio::spawn(tcp_egress_loop(writer, rx, ring));
 
     // Read loop
     let mut reader = reader;
@@ -1547,21 +1595,16 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(Mutex::new(ws_sink));
 
-    // Create a bridge channel to send data to the websocket
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let actual_player_sender = PlayerSender::Tcp(tx);
+    // I7: bridge channel carries tagged envelopes; the ring bounds delta memory
+    let (tx, rx) = mpsc::unbounded_channel::<EgressMessage>();
+    let egress = TcpEgress::new(tx);
+    let ring = Arc::clone(&egress.ring);
+    let actual_player_sender = PlayerSender::Tcp(egress);
     let server_state_clone = server_state.clone();
 
     // Spawn the websocket sender task
     let ws_sink_clone = Arc::clone(&ws_sink);
-    tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
-            let mut sink = ws_sink_clone.lock().await;
-            if sink.send(Message::Binary(data)).await.is_err() {
-                break;
-            }
-        }
-    });
+    tokio::spawn(ws_egress_loop(ws_sink_clone, rx, ring));
 
     // Read loop — receive WebSocket messages
     loop {
@@ -1591,7 +1634,7 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
                             message: "Invalid message format".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = actual_player_sender.send(encoded).await;
+                        let _ = actual_player_sender.send_reliable(encoded).await;
                     }
                 }
             }
@@ -1613,6 +1656,40 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
     }
 }
 
+/// I7: build the lobby-facing sender from a connection sender. TCP senders
+/// share the same channel + keep-latest ring; a WebSocket closure gets a
+/// bridged channel with its own ring; `None` gets a throwaway channel whose
+/// receiver is dropped (sends fail and are ignored at every call site).
+fn lobby_bridge_sender(player_sender: &PlayerSender) -> PlayerSender {
+    match player_sender {
+        PlayerSender::Tcp(e) => PlayerSender::Tcp(e.clone()),
+        PlayerSender::Websocket(_) => {
+            let (tx, mut rx) = mpsc::unbounded_channel::<EgressMessage>();
+            let ring = Arc::new(DeltaRing::new(crate::server::room::DELTA_RING_DEPTH));
+            let egress = TcpEgress {
+                tx,
+                ring: Arc::clone(&ring),
+            };
+            let original_sender = player_sender.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    let data = match egress_bytes(msg, &ring) {
+                        Some(data) => data,
+                        None => continue,
+                    };
+                    let _ = original_sender.send_reliable(data).await;
+                }
+            });
+            PlayerSender::Tcp(egress)
+        }
+        PlayerSender::None => {
+            // No connection — create a throwaway channel
+            let (tx, _rx) = mpsc::unbounded_channel::<EgressMessage>();
+            PlayerSender::Tcp(TcpEgress::new(tx))
+        }
+    }
+}
+
 pub(crate) async fn handle_client_message(
     conn_id: &Uuid,
     server_state: Arc<Mutex<GameServer>>,
@@ -1631,26 +1708,7 @@ pub(crate) async fn handle_client_message(
                     let player_name = player_name.clone().unwrap_or_else(|| "Player".to_string());
                     let code;
                     // Clone the player_sender for the lobby
-                    let lobby_sender = match player_sender {
-                        PlayerSender::Tcp(tx) => PlayerSender::Tcp(tx.clone()),
-                        PlayerSender::Websocket(_) => {
-                            // For WebSocket, create a channel to bridge
-                            let (tx, mut rx) = mpsc::unbounded_channel();
-                            let original_sender = player_sender.clone();
-                            // Spawn a task to relay messages
-                            tokio::spawn(async move {
-                                while let Some(data) = rx.recv().await {
-                                    let _ = original_sender.send(data).await;
-                                }
-                            });
-                            PlayerSender::Tcp(tx)
-                        }
-                        PlayerSender::None => {
-                            // No connection — create a throwaway channel
-                            let (tx, _rx) = mpsc::unbounded_channel();
-                            PlayerSender::Tcp(tx)
-                        }
-                    };
+                    let lobby_sender = lobby_bridge_sender(player_sender);
                     {
                         let server = server_state.lock().await;
                         let mut lobby_manager = server.lobby_manager.lock().await;
@@ -1675,7 +1733,7 @@ pub(crate) async fn handle_client_message(
                         lobby_code: code.clone(),
                     };
                     let encoded = encode_message(&resp);
-                    let _ = player_sender.send(encoded).await;
+                    let _ = player_sender.send_reliable(encoded).await;
 
                     // Broadcast LobbyUpdate so the creator sees themselves in the list
                     {
@@ -1696,7 +1754,7 @@ pub(crate) async fn handle_client_message(
                             let update = ServerMessage::LobbyUpdate { players, settings };
                             let update_encoded = encode_message(&update);
                             for p in &lobby.players {
-                                let _ = p.connection.send(update_encoded.clone()).await;
+                                let _ = p.connection.send_reliable(update_encoded.clone()).await;
                             }
                         }
                     }
@@ -1723,24 +1781,7 @@ pub(crate) async fn handle_client_message(
                         }
                     };
                     // Create a sender for the new lobby player
-                    let lobby_sender = match player_sender {
-                        PlayerSender::Tcp(tx) => PlayerSender::Tcp(tx.clone()),
-                        PlayerSender::Websocket(_) => {
-                            let (tx, mut rx) = mpsc::unbounded_channel();
-                            let original_sender = player_sender.clone();
-                            tokio::spawn(async move {
-                                while let Some(data) = rx.recv().await {
-                                    let _ = original_sender.send(data).await;
-                                }
-                            });
-                            PlayerSender::Tcp(tx)
-                        }
-                        PlayerSender::None => {
-                            // No connection — create a throwaway channel
-                            let (tx, _rx) = mpsc::unbounded_channel();
-                            PlayerSender::Tcp(tx)
-                        }
-                    };
+                    let lobby_sender = lobby_bridge_sender(player_sender);
                     // Now join the lobby — complete all lobby operations inside this lock
                     let result: Result<
                         (String, Vec<super::protocol::LobbyPlayer>, LobbySettings),
@@ -1789,7 +1830,7 @@ pub(crate) async fn handle_client_message(
                                 lobby_code: lobby_code_inner.clone(),
                             };
                             let join_encoded = encode_message(&join_resp);
-                            let _ = player_sender.send(join_encoded).await;
+                            let _ = player_sender.send_reliable(join_encoded).await;
 
                             // Broadcast LobbyUpdate to all players in the lobby
                             let server = server_state.lock().await;
@@ -1800,14 +1841,14 @@ pub(crate) async fn handle_client_message(
                                     settings: settings.clone(),
                                 });
                                 for p in &l.players {
-                                    let _ = p.connection.send(encoded.clone()).await;
+                                    let _ = p.connection.send_reliable(encoded.clone()).await;
                                 }
                             }
                         }
                         Err(e) => {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         }
                     }
                 }
@@ -1832,7 +1873,7 @@ pub(crate) async fn handle_client_message(
                                     .to_string(),
                             };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                             return;
                         }
                         let result = {
@@ -1843,7 +1884,7 @@ pub(crate) async fn handle_client_message(
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         } else {
                             let (players, settings) = {
                                 let server = server_state.lock().await;
@@ -1864,14 +1905,14 @@ pub(crate) async fn handle_client_message(
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        let _ = player_sender.send_reliable(encoded).await;
                     }
                 }
                 LobbyMessage::SetSlotLlmConfig { slot, model } => {
@@ -1895,7 +1936,7 @@ pub(crate) async fn handle_client_message(
                                     .to_string(),
                             };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                             return;
                         }
 
@@ -1934,7 +1975,7 @@ pub(crate) async fn handle_client_message(
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         } else {
                             // Also update the player's llm_provider for display (idempotent
                             // when the provider was already selected via SetSlotLlm).
@@ -1969,14 +2010,14 @@ pub(crate) async fn handle_client_message(
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        let _ = player_sender.send_reliable(encoded).await;
                     }
                 }
                 LobbyMessage::AddLlmPlayer { name, llm_provider } => {
@@ -2000,7 +2041,7 @@ pub(crate) async fn handle_client_message(
                                     .to_string(),
                             };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                             return;
                         }
                         let result = {
@@ -2015,7 +2056,7 @@ pub(crate) async fn handle_client_message(
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         } else {
                             // Broadcast LobbyUpdate
                             let (players, settings) = {
@@ -2037,14 +2078,14 @@ pub(crate) async fn handle_client_message(
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send(encoded).await;
+                            let _ = player_sender.send_reliable(encoded).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        let _ = player_sender.send_reliable(encoded).await;
                     }
                 }
                 LobbyMessage::StartGame => {
@@ -2059,7 +2100,7 @@ pub(crate) async fn handle_client_message(
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        let _ = player_sender.send_reliable(encoded).await;
                         return;
                     };
                     let is_creator = {
@@ -2079,7 +2120,7 @@ pub(crate) async fn handle_client_message(
                             message: "Only the lobby creator can start the game".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        let _ = player_sender.send_reliable(encoded).await;
                         return;
                     }
 
@@ -2103,7 +2144,7 @@ pub(crate) async fn handle_client_message(
                                     message: "Lobby not found".to_string(),
                                 };
                                 let encoded = encode_message(&resp);
-                                let _ = player_sender.send(encoded).await;
+                                let _ = player_sender.send_reliable(encoded).await;
                                 return;
                             }
                         };
@@ -2113,7 +2154,7 @@ pub(crate) async fn handle_client_message(
                                 if let Some(err) = validate_custom_settings(&lobby.settings) {
                                     let resp = ServerMessage::Error { message: err };
                                     let encoded = encode_message(&resp);
-                                    let _ = player_sender.send(encoded).await;
+                                    let _ = player_sender.send_reliable(encoded).await;
                                     return;
                                 }
                             }
@@ -2267,7 +2308,7 @@ pub(crate) async fn handle_client_message(
                             message: "A game is already running for this lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send(encoded).await;
+                        let _ = player_sender.send_reliable(encoded).await;
                         return;
                     }
                     // Spawn the game with human and LLM players
@@ -2412,8 +2453,8 @@ pub(crate) async fn handle_client_message(
                     };
                     let lobby_encoded = encode_message(&lobby_update_resp);
                     for sender in &lobby_player_senders {
-                        let _ = sender.send(clear_encoded.clone()).await;
-                        let _ = sender.send(lobby_encoded.clone()).await;
+                        let _ = sender.send_reliable(clear_encoded.clone()).await;
+                        let _ = sender.send_reliable(lobby_encoded.clone()).await;
                     }
                     // Consume the lobby so it cannot be found again by get_first_lobby()
                     // for a duplicate StartGame.
@@ -2586,7 +2627,7 @@ pub(crate) async fn handle_client_message(
                 .collect();
             let resp = ServerMessage::Leaderboard { entries };
             let encoded = encode_message(&resp);
-            let _ = player_sender.send(encoded).await;
+            let _ = player_sender.send_reliable(encoded).await;
         }
         ClientMessage::EmbarkUnit { unit_id } => {
             let server = server_state.lock().await;
@@ -3018,5 +3059,349 @@ mod spectator_union_cache_tests {
         let out = SpectatorUnionCache::update(&mut cache, &[], &[], || None);
         assert!(out.is_none());
         assert!(cache.is_none(), "recompute None must clear the cache");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I7: typed bounded keep-latest egress — unit + slow-client soak tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod i7_egress_tests {
+    use super::*;
+    use crate::server::room::{DeltaRing, DELTA_RING_DEPTH};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    const DELTA_SIZE: usize = 64 * 1024;
+    const N_DELTAS: u64 = 512;
+
+    type PendingEgress =
+        Arc<std::sync::Mutex<Option<(mpsc::UnboundedReceiver<EgressMessage>, Arc<DeltaRing>)>>>;
+
+    /// Wait for the test's hand-off of (channel, ring), then run the exact
+    /// drain loop the server spawns for the path under test.
+    async fn wait_release(
+        pending: &PendingEgress,
+    ) -> (mpsc::UnboundedReceiver<EgressMessage>, Arc<DeltaRing>) {
+        loop {
+            if let Some(v) = pending.lock().unwrap().take() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn gated_tcp_egress_loop(
+        pending: PendingEgress,
+        writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    ) {
+        let (rx, ring) = wait_release(&pending).await;
+        tcp_egress_loop(writer, rx, ring).await;
+    }
+
+    async fn gated_ws_egress_loop<S>(pending: PendingEgress, sink: Arc<tokio::sync::Mutex<S>>)
+    where
+        S: futures::Sink<Message> + Unpin,
+    {
+        let (rx, ring) = wait_release(&pending).await;
+        ws_egress_loop(sink, rx, ring).await;
+    }
+
+    /// One tick's delta payload: zeroed 64 KB with a unique marker up front
+    /// (the egress path is byte-transparent).
+    fn delta_bytes(i: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; DELTA_SIZE];
+        let marker = format!("I7DELTA-{i:05}").into_bytes();
+        buf[..marker.len()].copy_from_slice(&marker);
+        buf
+    }
+
+    fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+        bytes.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Indexes of the deltas whose markers appear in `received`, in wire order.
+    fn collect_delivered(received: &[u8]) -> Vec<u64> {
+        const PREFIX: &[u8] = b"I7DELTA-";
+        received
+            .windows(PREFIX.len() + 5)
+            .filter(|w| &w[..PREFIX.len()] == PREFIX)
+            .filter_map(|w| std::str::from_utf8(&w[PREFIX.len()..]).ok())
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect()
+    }
+
+    /// Reassemble server→client frame payloads (unmasked; continuation
+    /// frames appended, ping/pong skipped, close ends the stream).
+    fn parse_ws_frames(data: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 2 <= data.len() {
+            let opcode = data[i] & 0x0f;
+            let mut len = (data[i + 1] & 0x7f) as usize;
+            let mut off = i + 2;
+            if len == 126 {
+                if off + 2 > data.len() {
+                    return None;
+                }
+                len = u16::from_be_bytes([data[off], data[off + 1]]) as usize;
+                off += 2;
+            } else if len == 127 {
+                if off + 8 > data.len() {
+                    return None;
+                }
+                let bytes: [u8; 8] = data[off..off + 8].try_into().ok()?;
+                len = u64::from_be_bytes(bytes) as usize;
+                off += 8;
+            }
+            if data[i + 1] & 0x80 != 0 {
+                off += 4; // masking key (client→server only; tolerate it)
+            }
+            if off + len > data.len() {
+                return None;
+            }
+            match opcode {
+                0x0..=0x2 => out.extend_from_slice(&data[off..off + len]),
+                0x8 => return Some(out),
+                _ => {} // ping/pong/reserved: skip
+            }
+            i = off + len;
+        }
+        Some(out)
+    }
+
+    /// Push a stall's worth of traffic: N tick deltas, then two reliable
+    /// messages (Error, GameOver). Returns (last delta, error, game over).
+    /// The drain task must be gated (not yet started): every pushed delta
+    /// then lands in the ring and evicts the oldest past depth, so the
+    /// bounded-memory invariant is assertable deterministically.
+    async fn push_soak_traffic(
+        sender: &PlayerSender,
+        ring: &Arc<DeltaRing>,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut last_delta = Vec::new();
+        for i in 0..N_DELTAS {
+            let bytes = delta_bytes(i);
+            if i + 1 == N_DELTAS {
+                last_delta = bytes.clone();
+            }
+            sender.send_delta(bytes).await.unwrap();
+        }
+        // The drain task is gated and the client reader is stalled: the ring
+        // holds exactly its depth — N_DELTAS deltas were pushed, but only the
+        // latest DELTA_RING_DEPTH payloads remain in memory.
+        assert_eq!(ring.len(), DELTA_RING_DEPTH);
+        assert_eq!(ring.latest_seq(), Some(N_DELTAS - 1));
+        assert!(ring.byte_size() <= DELTA_RING_DEPTH * DELTA_SIZE);
+
+        let error_msg = encode_message(&ServerMessage::Error {
+            message: "i7-soak-error".to_string(),
+        });
+        let game_over = encode_message(&ServerMessage::GameOver {
+            winner: "i7".to_string(),
+            game_id: "soak".to_string(),
+            message: "i7 soak game over".to_string(),
+        });
+        // Reliable: always queued, never dropped.
+        sender.send_reliable(error_msg.clone()).await.unwrap();
+        sender.send_reliable(game_over.clone()).await.unwrap();
+        (last_delta, error_msg, game_over)
+    }
+
+    /// Read the client until the GameOver payload is in the buffer (no EOF
+    /// assumption — the drain task is what we are testing).
+    async fn read_until(client: &mut tokio::net::TcpStream, target: &[u8], into: &mut Vec<u8>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut buf = [0u8; 64 * 1024];
+        let mut last_checked = 0usize;
+        loop {
+            if find(&into[last_checked..], target).is_some() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "target not delivered in time"
+            );
+            let n = client.read(&mut buf).await.expect("client read failed");
+            assert!(n > 0, "connection closed before target delivered");
+            into.extend_from_slice(&buf[..n]);
+            last_checked = into.len().saturating_sub(target.len());
+        }
+    }
+
+    fn assert_resumed(received: &[u8], last_delta: &[u8], error_msg: &[u8], game_over: &[u8]) {
+        let delivered = collect_delivered(received);
+        // The stall outgrew the ring: stale deltas were dropped (that is what
+        // bounds memory), so strictly fewer than N_DELTAS arrived.
+        assert!(
+            delivered.len() < N_DELTAS as usize,
+            "stall must drop stale deltas (got {} of {})",
+            delivered.len(),
+            N_DELTAS
+        );
+        // The client resumes with the LATEST delta, in order.
+        assert_eq!(
+            delivered.last().copied(),
+            Some(N_DELTAS - 1),
+            "client must resume with the latest delta"
+        );
+        assert!(
+            delivered.windows(2).all(|w| w[0] < w[1]),
+            "in-order delivery"
+        );
+
+        // Reliable messages were never dropped and arrived after the stall
+        // cleared, in order, after the latest delta.
+        let err_pos = find(received, error_msg).expect("reliable Error must be delivered");
+        let over_pos = find(received, game_over).expect("reliable GameOver must be delivered");
+        assert!(over_pos > err_pos, "reliable preserves order");
+        // The reliable error starts at or after the end of the latest delta's
+        // bytes (they are adjacent in the stall-clear drain).
+        let last_end =
+            find(received, last_delta).expect("latest delta must be delivered") + last_delta.len();
+        assert!(
+            err_pos >= last_end,
+            "reliable delivered after the stall clears (after the latest delta)"
+        );
+    }
+
+    #[test]
+    fn delta_ring_keep_latest_bounded() {
+        let ring = DeltaRing::new(3);
+        assert_eq!(ring.len(), 0);
+        assert!(ring.is_empty());
+        let a = ring.push(vec![1u8; 10]);
+        let b = ring.push(vec![2u8; 10]);
+        let c = ring.push(vec![3u8; 10]);
+        let d = ring.push(vec![4u8; 10]);
+        assert_eq!((a, b, c, d), (0u64, 1, 2, 3));
+        // Keep-latest: once past depth, the oldest entry is evicted.
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.byte_size(), 30);
+        assert_eq!(ring.latest_seq(), Some(d));
+        assert!(ring.take(a).is_none(), "evicted seq must be gone");
+        assert_eq!(ring.take(b), Some(vec![2u8; 10]));
+        assert_eq!(ring.take(c), Some(vec![3u8; 10]));
+        assert_eq!(ring.take(d), Some(vec![4u8; 10]));
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn egress_bytes_skips_evicted_deltas() {
+        let ring = DeltaRing::new(DELTA_RING_DEPTH);
+        let first = ring.push(vec![9u8; 8]);
+        let last = (0..N_DELTAS).fold(first, |_, _| ring.push(vec![9u8; 8]));
+        assert!(egress_bytes(EgressMessage::Delta(first), &ring).is_none());
+        assert_eq!(
+            egress_bytes(EgressMessage::Delta(last), &ring),
+            Some(vec![9u8; 8])
+        );
+        assert_eq!(
+            egress_bytes(EgressMessage::Reliable(vec![7u8]), &ring),
+            Some(vec![7u8])
+        );
+    }
+
+    /// Slow-client soak over the TCP path: with a stalled reader, delta
+    /// memory stays bounded at the ring depth, reliable GameOver/Error
+    /// messages are delivered after the stall clears, and the client resumes
+    /// with the latest delta. The drain task (the exact `tcp_egress_loop`
+    /// `handle_tcp_client` spawns) is gated behind a hand-off so the stall is
+    /// deterministic: all 512 deltas are pushed while the drain is idle, so
+    /// ring eviction runs to completion before the invariant is checked.
+    /// Invisible to the headless stress harness (send = 0 ms there), so this
+    /// test is the acceptance gate.
+    #[tokio::test]
+    async fn tcp_slow_client_soak_bounded_and_recovers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (_stalled_reader, writer) = tokio::io::split(stream);
+
+        let (tx, rx) = mpsc::unbounded_channel::<EgressMessage>();
+        let egress = TcpEgress::new(tx);
+        let ring = Arc::clone(&egress.ring);
+        let sender = PlayerSender::Tcp(egress);
+
+        // Stalled: the client never reads, and the drain task waits for the
+        // hand-off, so the ring takes the full stall.
+        let pending: PendingEgress = Arc::new(std::sync::Mutex::new(None));
+        let pending_drain = Arc::clone(&pending);
+        tokio::spawn(async move {
+            gated_tcp_egress_loop(pending_drain, writer).await;
+        });
+
+        let (last_delta, error_msg, game_over) = push_soak_traffic(&sender, &ring).await;
+        drop(sender);
+
+        // Stall clears: hand the channel + ring to the drain, then read until
+        // the reliable GameOver arrives.
+        *pending.lock().unwrap() = Some((rx, ring.clone()));
+        let mut received = Vec::new();
+        read_until(&mut client, &game_over, &mut received).await;
+        assert_resumed(&received, &last_delta, &error_msg, &game_over);
+    }
+
+    /// Slow-client soak over the WS bridge path — the same drain loop
+    /// handle_ws_game spawns, against a real axum WebSocket upgrade. The
+    /// drain is gated behind the test's hand-off, mirroring the TCP path.
+    #[tokio::test]
+    async fn ws_slow_client_soak_bounded_and_recovers() {
+        let (tx, rx) = mpsc::unbounded_channel::<EgressMessage>();
+        let egress = TcpEgress::new(tx);
+        let ring = Arc::clone(&egress.ring);
+        let sender = PlayerSender::Tcp(egress);
+
+        // Starts empty: the gated drain waits for the test's hand-off.
+        let pending: PendingEgress = Arc::new(std::sync::Mutex::new(None));
+        let app = axum::Router::new()
+            .route("/ws", get(test_ws_upgrade))
+            .with_state(pending.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\
+                  \r\n",
+            )
+            .await
+            .unwrap();
+        // Stalled: the client never reads. Push a stall's worth of traffic.
+        let (last_delta, error_msg, game_over) = push_soak_traffic(&sender, &ring).await;
+        drop(sender);
+
+        // Stall clears: hand the channel + ring to the gated drain, then read
+        // until the reliable GameOver arrives.
+        *pending.lock().unwrap() = Some((rx, ring.clone()));
+        let mut raw = Vec::new();
+        read_until(&mut client, &game_over, &mut raw).await;
+        let header_end = find(&raw, b"\r\n\r\n").expect("101 upgrade header") + 4;
+        let payload = parse_ws_frames(&raw[header_end..]).expect("ws frames parse");
+        assert_resumed(&payload, &last_delta, &error_msg, &game_over);
+    }
+
+    async fn test_ws_upgrade(
+        ws: WebSocketUpgrade,
+        State(pending): State<PendingEgress>,
+    ) -> impl axum::response::IntoResponse {
+        ws.on_upgrade(move |socket| async move {
+            let (ws_sink, _ws_stream) = socket.split();
+            let sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
+            // Gated: waits for the test's hand-off, then runs exactly the
+            // drain task handle_ws_game spawns.
+            tokio::spawn(gated_ws_egress_loop(pending, sink));
+        })
     }
 }
