@@ -228,7 +228,20 @@ impl UnitStateDigest {
 
 /// Player-independent delta components computed once per tick.
 pub(crate) struct SharedDeltas {
+    /// Full border grid (I4 full form). Mutually exclusive with
+    /// `border_cells_changed`.
     pub border_grid_diff: Option<Arc<Vec<u8>>>,
+    /// I4: sparse border changed-cell list (packed u32, see `diff_grid`).
+    /// Mutually exclusive with `border_grid_diff`.
+    pub border_cells_changed: Option<Arc<Vec<u32>>>,
+    /// I4: number of cells that changed in the border grid this tick (==
+    /// grid length when there was no previous border to diff against; 0 when
+    /// the grid is unchanged). Feeds the A/B changed-cell-fraction metric.
+    #[cfg_attr(
+        not(any(feature = "microbenchmarks", feature = "bench-alloc")),
+        allow(dead_code)
+    )]
+    pub border_changed_cells: u64,
     pub units_added: Arc<Vec<UnitState>>,
     pub units_removed: Arc<Vec<String>>,
     pub unit_updates: Arc<Vec<UnitUpdate>>,
@@ -438,18 +451,10 @@ pub(crate) fn compute_shared_deltas(
     // Border grid diff (shared across all players).
     // W3: share the published Arc instead of copying the 40 KB grid — the
     // influence double-buffer publishes by refcount and never mutates the
-    // buffer in place during the encode window.
-    let border_grid_diff: Option<Arc<Vec<u8>>> = match (prev_border_grid, current_border_grid) {
-        (Some(prev), Some(curr)) => {
-            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
-                None
-            } else {
-                Some(Arc::clone(curr))
-            }
-        }
-        (None, Some(curr)) => Some(Arc::clone(curr)),
-        _ => None,
-    };
+    // buffer in place during the encode window. I4: when few cells changed,
+    // ship the packed changed-cell list instead of the full grid.
+    let (border_grid_diff, border_cells_changed, border_changed_cells) =
+        grid_diff(prev_border_grid, current_border_grid.as_ref());
 
     // W8: per-owner unit counts, single O(N) pass each (build_delta_inner
     // previously rescanned every unit per player for these counts).
@@ -493,12 +498,92 @@ pub(crate) fn compute_shared_deltas(
 
     SharedDeltas {
         border_grid_diff,
+        border_cells_changed: border_cells_changed.map(Arc::new),
+        border_changed_cells,
         units_added,
         units_removed,
         unit_updates: Arc::new(unit_updates),
         city_updates: Arc::new(city_updates),
         prev_units_by_owner,
         current_units_by_owner,
+    }
+}
+
+/// I4: bit width needed to pack a row-major cell index of a `cells`-cell
+/// grid: `ceil(log2(cells))` (0 for a 1-cell grid). `None` when an 8-bit
+/// value and the index cannot share a u32 (> 2^24 cells) — such grids
+/// always use the full-grid wire form.
+pub(crate) fn grid_index_bits(cells: usize) -> Option<u32> {
+    let bits = (cells.max(1) as u64).next_power_of_two().trailing_zeros();
+    (bits <= 24).then_some(bits)
+}
+
+/// I4: diff two flat grids of equal length into a packed changed-cell list.
+///
+/// Each list entry packs the NEW value and the row-major cell index into one
+/// u32: `(new_value << bits) | cell_index`, `bits = ceil(log2(cells))`. The
+/// value is mandatory for both grid kinds: the border value carries 255
+/// (no owner) and vision flips include 1→0, so a set-bit-only encoding
+/// would be lossy.
+///
+/// Returns `(sparse, changed)` where `sparse` is `Some(list)` when the
+/// change is at or below the ~5% threshold (grid ships sparse) and `None`
+/// otherwise (grid ships in full), and `changed` is always the exact number
+/// of differing cells.
+fn diff_grid(prev: &[u8], curr: &[u8]) -> (Option<Vec<u32>>, u64) {
+    debug_assert_eq!(prev.len(), curr.len());
+    let bits = match grid_index_bits(curr.len()) {
+        Some(b) => b,
+        None => return (None, curr.len() as u64),
+    };
+    // I4: the sparse form ships only while ≤ ~5% of the grid changed
+    // (`changed <= len / 20`); above that the full grid is smaller on the
+    // wire. This threshold is the one to tune if the I4 A/B shows the win
+    // is poor (changed-cell fraction is reported in the bench grid_diag).
+    let max_sparse = curr.len() / 20;
+    let mut cells = Vec::new();
+    let mut changed: u64 = 0;
+    for (i, (&p, &c)) in prev.iter().zip(curr.iter()).enumerate() {
+        if p != c {
+            changed += 1;
+            if cells.len() <= max_sparse {
+                cells.push(((c as u32) << bits) | i as u32);
+            }
+        }
+    }
+    if changed as usize <= max_sparse {
+        (Some(cells), changed)
+    } else {
+        (None, changed)
+    }
+}
+
+/// I4: classify a grid diff into `(full_grid, sparse_cells, changed)`.
+///
+/// `full_grid` is the shared published Arc when the full grid must ship
+/// (first delivery, >~5% change, or a map too large to pack); `sparse_cells`
+/// is the packed list when the sparse form was chosen; the two are mutually
+/// exclusive. `changed` is the number of differing cells (== grid length
+/// when there was no previous grid to diff against; 0 when unchanged).
+#[allow(clippy::type_complexity)]
+pub(crate) fn grid_diff(
+    prev: Option<&Arc<Vec<u8>>>,
+    curr: Option<&Arc<Vec<u8>>>,
+) -> (Option<Arc<Vec<u8>>>, Option<Vec<u32>>, u64) {
+    match (prev, curr) {
+        (Some(p), Some(c)) if !Arc::ptr_eq(p, c) => {
+            let (sparse, changed) = diff_grid(p, c);
+            if changed == 0 {
+                (None, None, 0)
+            } else {
+                match sparse {
+                    Some(list) => (None, Some(list), changed),
+                    None => (Some(Arc::clone(c)), None, changed),
+                }
+            }
+        }
+        (None, Some(c)) => (Some(Arc::clone(c)), None, c.len() as u64),
+        _ => (None, None, 0),
     }
 }
 
@@ -532,21 +617,15 @@ pub(crate) fn compute_shared_deltas_from_diff(
     current_border_grid: &Option<Arc<Vec<u8>>>,
 ) -> SharedDeltas {
     // Border grid diff (shared across all players) — identical to the
-    // reference path: share the published Arc instead of copying the grid.
-    let border_grid_diff: Option<Arc<Vec<u8>>> = match (prev_border_grid, current_border_grid) {
-        (Some(prev), Some(curr)) => {
-            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
-                None
-            } else {
-                Some(Arc::clone(curr))
-            }
-        }
-        (None, Some(curr)) => Some(Arc::clone(curr)),
-        _ => None,
-    };
+    // reference path: share the published Arc (full form) or the packed
+    // changed-cell list (I4 sparse form) instead of copying the grid.
+    let (border_grid_diff, border_cells_changed, border_changed_cells) =
+        grid_diff(prev_border_grid, current_border_grid.as_ref());
 
     SharedDeltas {
         border_grid_diff,
+        border_cells_changed: border_cells_changed.map(Arc::new),
+        border_changed_cells,
         units_added: Arc::new(diff.added),
         units_removed: Arc::new(diff.removed),
         unit_updates: Arc::new(diff.updates),
@@ -573,23 +652,20 @@ pub(crate) fn build_delta_inner(
     grid_width: u32,
     player_id: &str,
     shared: &SharedDeltas,
-) -> Option<ServerMessage> {
+) -> Option<(ServerMessage, u64)> {
     // Per-player vision grid diff.
     // W3: share the published Arc instead of copying the 40 KB grid (see the
-    // border diff above for the lifetime invariant).
-    let vision_grid_diff: Option<Arc<Vec<u8>>> = match (prev_vision_grid, current_vision_grid) {
-        (Some(prev), Some(curr)) => {
-            if Arc::ptr_eq(prev, curr) || prev.as_slice() == curr.as_slice() {
-                None
-            } else {
-                Some(Arc::clone(curr))
-            }
-        }
-        (None, Some(curr)) => Some(Arc::clone(curr)),
-        _ => None,
-    };
+    // border diff above for the lifetime invariant). I4: when few cells
+    // changed, ship the packed changed-cell list instead of the full grid.
+    let (vision_grid_diff, vision_cells_changed, vision_changed) =
+        grid_diff(prev_vision_grid, current_vision_grid.as_ref());
+    let vision_cells_changed = vision_cells_changed.map(Arc::new);
 
-    let grid_width_out = if vision_grid_diff.is_some() || shared.border_grid_diff.is_some() {
+    let grid_width_out = if vision_grid_diff.is_some()
+        || vision_cells_changed.is_some()
+        || shared.border_grid_diff.is_some()
+        || shared.border_cells_changed.is_some()
+    {
         Some(grid_width)
     } else {
         None
@@ -623,7 +699,9 @@ pub(crate) fn build_delta_inner(
         && shared.unit_updates.is_empty()
         && shared.city_updates.is_empty()
         && shared.border_grid_diff.is_none()
+        && shared.border_cells_changed.is_none()
         && vision_grid_diff.is_none()
+        && vision_cells_changed.is_none()
         && !funds_changed
         && prev_owned == units_owned
     {
@@ -640,7 +718,9 @@ pub(crate) fn build_delta_inner(
 
     let delta = GameDeltaMessage {
         vision_grid_diff,
+        vision_cells_changed,
         border_grid_diff: shared.border_grid_diff.clone(),
+        border_cells_changed: shared.border_cells_changed.clone(),
         grid_width: grid_width_out,
         units_added: shared.units_added.clone(),
         units_removed: shared.units_removed.clone(),
@@ -649,7 +729,9 @@ pub(crate) fn build_delta_inner(
         player: player_state,
     };
 
-    Some(ServerMessage::DeltaState(delta))
+    // I4: second return value — this player's vision changed-cell count for
+    // the A/B changed-cell-fraction metric (0 when no vision diff shipped).
+    Some((ServerMessage::DeltaState(delta), vision_changed))
 }
 
 /// Per-tick baseline state for the network phase (W0 fix: shared read-only
@@ -871,6 +953,13 @@ pub(crate) struct NetworkPhaseResult {
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     #[allow(dead_code)]
     pub grid_dirty: bool,
+    /// I4: total grid cells changed this tick (border once + each player's
+    /// vision; the synthetic spectator is not part of the network phase).
+    /// Feeds the A/B changed-cell-fraction metric used to tune the ~5%
+    /// sparse threshold.
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    #[allow(dead_code)]
+    pub grid_changed_cells: u64,
 }
 
 /// Run the full per-tick network phase: per-player delta build, encode, and
@@ -917,9 +1006,14 @@ pub(crate) fn run_network_phase(
         delta_ms += shared_start.elapsed().as_secs_f64() * 1000.0;
     }
     // B0: border diff is player-independent; per-player vision diffs are
-    // detected in the loop below.
+    // detected in the loop below. I4: the sparse changed-cell form counts
+    // as grid-dirty too.
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
-    let mut grid_dirty = shared.border_grid_diff.is_some();
+    let mut grid_dirty = shared.border_grid_diff.is_some() || shared.border_cells_changed.is_some();
+    // I4: changed-cell counts (border once + per-player vision) for the
+    // A/B changed-cell-fraction metric.
+    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+    let mut grid_changed_cells = shared.border_changed_cells;
 
     // W9 (stretch, opt-in): pre-encode the shared delta segments ONCE per
     // tick so the per-player encode splices them in instead of re-serializing
@@ -932,6 +1026,7 @@ pub(crate) fn run_network_phase(
     let splice_shared = spliced.then(|| {
         crate::server::protocol::SpliceShared::build(
             shared.border_grid_diff.as_ref(),
+            shared.border_cells_changed.as_ref(),
             &shared.units_added,
             &shared.units_removed,
             &shared.unit_updates,
@@ -960,6 +1055,8 @@ pub(crate) fn run_network_phase(
         encode_ms,
         #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
         grid_dirty,
+        #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+        grid_changed_cells,
     };
 
     for pid in player_ids {
@@ -985,14 +1082,22 @@ pub(crate) fn run_network_phase(
             delta_ms += player_delta_start.elapsed().as_secs_f64() * 1000.0;
         }
 
-        if let Some(delta) = built {
+        if let Some((delta, vision_changed)) = built {
+            // I4: the vision changed-cell count only feeds the bench
+            // changed-cell-fraction metric — drop it explicitly so
+            // feature-off builds don't warn about the unused binding.
+            #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+            let _ = vision_changed;
             let delta_ref = match &delta {
                 ServerMessage::DeltaState(d) => d,
                 _ => unreachable!(),
             };
             #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
-            if delta_ref.vision_grid_diff.is_some() {
-                grid_dirty = true;
+            {
+                if delta_ref.vision_grid_shipped() {
+                    grid_dirty = true;
+                }
+                grid_changed_cells += vision_changed;
             }
             // B0: encode sub-phase window (per-player serialize call only).
             #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
@@ -1034,6 +1139,7 @@ pub(crate) fn run_network_phase(
         result.delta_ms = delta_ms;
         result.encode_ms = encode_ms;
         result.grid_dirty = grid_dirty;
+        result.grid_changed_cells = grid_changed_cells;
     }
 
     // Commit shared baselines by move.
@@ -1193,7 +1299,7 @@ mod tests {
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
         );
-        build_delta_inner(prev_funds, None, all_funds, &None, 0, player_id, &shared)
+        build_delta_inner(prev_funds, None, all_funds, &None, 0, player_id, &shared).map(|(m, _)| m)
     }
 
     fn as_delta(msg: Option<ServerMessage>) -> GameDeltaMessage {
@@ -1373,7 +1479,8 @@ mod tests {
             2,
             "a",
             &shared,
-        );
+        )
+        .map(|(m, _)| m);
         let d = as_delta(msg);
         // Wire format is flat u8; W3: the Arc is shared, not copied.
         assert_eq!(
@@ -1425,7 +1532,8 @@ mod tests {
             2,
             "a",
             &shared,
-        );
+        )
+        .map(|(m, _)| m);
         let d = as_delta(msg);
         assert!(
             Arc::ptr_eq(d.vision_grid_diff.as_ref().unwrap(), &vision),
@@ -1521,7 +1629,8 @@ mod tests {
             2,
             "a",
             &shared,
-        );
+        )
+        .map(|(m, _)| m);
         let d_a = as_delta(msg_a);
         assert_eq!(
             d_a.vision_grid_diff.as_ref().map(|v| v.as_slice()),
@@ -2099,5 +2208,224 @@ mod tests {
         assert_eq!(shared.unit_updates.len(), 1);
         assert_eq!(shared.unit_updates[0].id, "u1");
         assert_eq!(shared.unit_updates[0].boat_supply_percent, Some(55.9));
+    }
+
+    // ---------------------------------------------------------------------------
+    // I4: sparse grid diffs (packed changed-cell lists)
+    // ---------------------------------------------------------------------------
+
+    /// Apply a packed changed-cell list to a copy of `prev` (the client-side
+    /// inverse of `diff_grid`) and return the resulting grid.
+    fn apply_cells(prev: &[u8], cells: &[u32]) -> Vec<u8> {
+        let n = prev.len();
+        let bits = grid_index_bits(n).unwrap();
+        let mask = if bits == 0 { 0 } else { (1u32 << bits) - 1 };
+        let mut out = prev.to_vec();
+        for &p in cells {
+            out[(p & mask) as usize] = (p >> bits) as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn grid_index_bits_forms() {
+        assert_eq!(grid_index_bits(0), Some(0));
+        assert_eq!(grid_index_bits(1), Some(0));
+        assert_eq!(grid_index_bits(2), Some(1));
+        assert_eq!(grid_index_bits(1024), Some(10));
+        assert_eq!(grid_index_bits(1000 * 1000), Some(20));
+        assert_eq!(grid_index_bits(1usize << 24), Some(24));
+        // > 2^24 cells: an 8-bit value and the index cannot share a u32 —
+        // such grids always use the full-grid wire form.
+        assert_eq!(grid_index_bits((1usize << 24) + 1), None);
+    }
+
+    #[test]
+    fn sparse_vs_full_threshold_boundary() {
+        // 10×10 grid: max_sparse = 100 / 20 = 5, bits = ceil(log2(100)) = 7.
+        let pu = HashMap::new();
+        let pc = HashMap::new();
+        let current_unit_ids: HashSet<&str> = HashSet::new();
+        let prev_border = Arc::new(vec![0u8; 100]);
+        let make_border = |changes: usize| {
+            let mut g = vec![0u8; 100];
+            for (i, cell) in g.iter_mut().enumerate().take(changes) {
+                *cell = (i + 1) as u8;
+            }
+            Arc::new(g)
+        };
+
+        // Exactly 5% (5/100) changed -> sparse form with the packed list.
+        let at = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            Some(&prev_border),
+            &Some(make_border(5)),
+            5.0,
+            1000,
+            count_units_by_owner(std::iter::empty::<&str>()),
+        );
+        assert!(at.border_grid_diff.is_none(), "5% must ship sparse");
+        let cells = at.border_cells_changed.as_ref().unwrap();
+        // Packed `(value << 7) | index` entries for values 1..=5 at indices 0..=4.
+        let expected: Vec<u32> = (0..5u32).map(|i| ((i + 1) << 7) | i).collect();
+        assert_eq!(cells.as_slice(), &expected);
+        assert_eq!(at.border_changed_cells, 5);
+
+        // 6/100 > 5% changed -> full-grid form (the shared published Arc).
+        let over = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            Some(&prev_border),
+            &Some(make_border(6)),
+            5.0,
+            1000,
+            count_units_by_owner(std::iter::empty::<&str>()),
+        );
+        assert!(over.border_cells_changed.is_none(), ">5% must ship full");
+        assert!(over.border_grid_diff.is_some());
+        assert_eq!(over.border_changed_cells, 6);
+
+        // No change at all -> neither form ships.
+        let none = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            Some(&prev_border),
+            &Some(Arc::new(vec![0u8; 100])),
+            5.0,
+            1000,
+            count_units_by_owner(std::iter::empty::<&str>()),
+        );
+        assert!(none.border_grid_diff.is_none());
+        assert!(none.border_cells_changed.is_none());
+        assert_eq!(none.border_changed_cells, 0);
+    }
+
+    #[test]
+    fn sparse_roundtrip_includes_clears_and_255() {
+        // 20×20 grid (400 cells; max_sparse = 20, bits = ceil(log2(400)) = 9).
+        // Vision must carry 1→0 flips (cells becoming invisible) and the
+        // border must carry 255 (no owner) values — both are mandatory in the
+        // packed (value << bits) | index form.
+        let all_funds = funds("a", 0);
+        let pu = HashMap::new();
+        let pc = HashMap::new();
+        let pf = all_funds.clone();
+        let current_unit_ids: HashSet<&str> = HashSet::new();
+
+        let prev_vision = vec![1u8; 400];
+        let mut curr_vision = prev_vision.clone();
+        curr_vision[7] = 0; // 1 → 0 flip — must be on the wire
+        curr_vision[399] = 0;
+        let prev_vision_arc = Arc::new(prev_vision.clone());
+        let vision = Arc::new(curr_vision.clone());
+
+        let prev_border = Arc::new(vec![0u8; 400]);
+        let mut curr_border = vec![0u8; 400];
+        curr_border[11] = 255; // ownerless cell — the 255 value is mandatory
+        curr_border[22] = 2;
+        let border = Arc::new(curr_border.clone());
+
+        let shared = compute_shared_deltas(
+            &pu,
+            &pc,
+            &[],
+            &[],
+            &current_unit_ids,
+            Some(&prev_border),
+            &Some(Arc::clone(&border)),
+            5.0,
+            1000,
+            count_units_by_owner(std::iter::empty::<&str>()),
+        );
+        assert_eq!(
+            shared.border_cells_changed.as_ref().map(|c| c.len()),
+            Some(2)
+        );
+
+        let (msg, vision_changed) = build_delta_inner(
+            &pf,
+            Some(&prev_vision_arc),
+            &all_funds,
+            &Some(Arc::clone(&vision)),
+            20,
+            "a",
+            &shared,
+        )
+        .unwrap();
+        assert_eq!(vision_changed, 2);
+        let d = match &msg {
+            ServerMessage::DeltaState(d) => d,
+            _ => unreachable!(),
+        };
+        assert!(d.vision_grid_diff.is_none());
+        assert!(d.vision_cells_changed.is_some());
+        assert!(d.border_grid_diff.is_none());
+        assert!(d.border_cells_changed.is_some());
+        assert_eq!(d.grid_width, Some(20));
+
+        // Wire roundtrip: encode + decode, then apply the packed lists to the
+        // PREV grids — the result must equal the CURRENT grids exactly.
+        let encoded = crate::server::protocol::encode_message(&msg);
+        let decoded: ServerMessage = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let d = match decoded {
+            ServerMessage::DeltaState(d) => d,
+            _ => unreachable!(),
+        };
+        assert!(d.vision_grid_diff.is_none());
+        assert!(d.border_grid_diff.is_none());
+        assert_eq!(
+            apply_cells(&prev_vision, d.vision_cells_changed.as_ref().unwrap()),
+            curr_vision
+        );
+        assert_eq!(
+            apply_cells(&prev_border, d.border_cells_changed.as_ref().unwrap()),
+            curr_border
+        );
+    }
+
+    #[test]
+    fn sparse_diff_1000x1000_perf() {
+        // 1000×1000 grid, ~1% change: diff construction (O(cells) memcmp +
+        // list build) must stay comfortably below 1 ms per grid per tick.
+        // The < 1 ms bound only applies in release (debug builds are
+        // unoptimized and take tens of ms for a plain 1 MB pass).
+        let n = 1_000_000usize;
+        let prev = vec![0u8; n];
+        let mut curr = prev.clone();
+        for i in (0..n).step_by(100) {
+            curr[i] = 7;
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let (sparse, changed) = diff_grid(&prev, &curr);
+            best = best.min(start.elapsed().as_secs_f64());
+            assert!(sparse.is_some());
+            assert_eq!(changed, 10_000);
+        }
+        let limit = if cfg!(debug_assertions) { 0.25 } else { 0.001 };
+        assert!(
+            best < limit,
+            "1000×1000 sparse diff took {best:.6}s (>= {limit}s)"
+        );
+
+        // And the >5% path: 6.25% change -> full-grid form, exact count.
+        let mut big = prev.clone();
+        for i in (0..n).step_by(16) {
+            big[i] = 3;
+        }
+        let (sparse, changed) = diff_grid(&prev, &big);
+        assert!(sparse.is_none());
+        assert_eq!(changed, 62_500);
     }
 }

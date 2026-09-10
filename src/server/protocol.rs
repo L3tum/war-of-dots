@@ -22,10 +22,24 @@ pub struct GameDeltaMessage {
     /// copying 40 KB (W3); CBOR-serializes as a plain byte array.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub vision_grid_diff: Option<Arc<Vec<u8>>>,
+    /// I4: sparse changed-cell list for the VISION grid. Present *instead of*
+    /// `vision_grid_diff` when fewer than ~5% of cells changed. Each entry
+    /// packs the new value and the row-major cell index into one u32:
+    /// `(new_value << bits) | cell_index`, `bits = ceil(log2(w*h))`. The value
+    /// is always present — vision flips include 1→0 (cells becoming
+    /// invisible), so a set-bit-only encoding would lose them.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vision_cells_changed: Option<Arc<Vec<u32>>>,
     /// Flat border/territory grid (1 byte per cell: player index 0..N or 255).
     /// Row-major, width = terrain width. `None` when unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub border_grid_diff: Option<Arc<Vec<u8>>>,
+    /// I4: sparse changed-cell list for the BORDER grid — same packed-u32
+    /// format as `vision_cells_changed` (the 8-bit value is the new player
+    /// index, including 255 = no owner). Present instead of
+    /// `border_grid_diff` when the change is below the ~5% threshold.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub border_cells_changed: Option<Arc<Vec<u32>>>,
     /// Grid width in cells (sent whenever either grid diff is present so the
     /// client can index the flat arrays). Omitted when no grid changed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -37,6 +51,21 @@ pub struct GameDeltaMessage {
     pub unit_updates: Arc<Vec<UnitUpdate>>,
     pub city_updates: Arc<Vec<CityUpdate>>,
     pub player: PlayerState,
+}
+
+impl GameDeltaMessage {
+    /// I4: true when this delta ships a vision grid in either form (full
+    /// `vision_grid_diff` or sparse `vision_cells_changed`). The benchmark's
+    /// grid-clean vs grid-dirty regime split must treat both as dirty.
+    /// (The binary's own module tree has no bench call sites, so allow
+    /// dead code there on feature-off builds.)
+    #[cfg_attr(
+        not(any(feature = "microbenchmarks", feature = "bench-alloc")),
+        allow(dead_code)
+    )]
+    pub fn vision_grid_shipped(&self) -> bool {
+        self.vision_grid_diff.is_some() || self.vision_cells_changed.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -414,8 +443,16 @@ pub fn estimate_delta_size(delta: &GameDeltaMessage) -> usize {
     if let Some(v) = &delta.vision_grid_diff {
         cap += v.len() + 16;
     }
+    // I4: sparse cell lists pack to at most ~5 bytes/entry (4-byte item +
+    // amortized header).
+    if let Some(c) = &delta.vision_cells_changed {
+        cap += c.len() * 5 + 16;
+    }
     if let Some(b) = &delta.border_grid_diff {
         cap += b.len() + 16;
+    }
+    if let Some(c) = &delta.border_cells_changed {
+        cap += c.len() * 5 + 16;
     }
     cap += delta.units_added.len() * 400;
     cap += delta.unit_updates.len() * 200;
@@ -493,6 +530,52 @@ fn splice_grid_entry(buf: &mut Vec<u8>, key: &'static str, value: &[u8]) {
     }
 }
 
+/// I4: append a CBOR map entry `key` -> u32 array to `buf` in place — the
+/// sparse changed-cell form (`vision_cells_changed` / `border_cells_changed`).
+/// Byte-for-byte identical to `encode_entry(key, value)`: the array header
+/// uses the same four definite-length forms as `splice_grid_entry`, and each
+/// u32 item uses the minimal integer form ciborium emits:
+///
+/// - v <= 23:       1 byte (`v`)
+/// - v <= 0xFF:     2 bytes (`0x18, v`)
+/// - v <= 0xFFFF:   3 bytes (`0x19, v16be`)
+/// - else:          4 bytes (`0x1A, v32be`)
+fn splice_u32_array_entry(buf: &mut Vec<u8>, key: &'static str, value: &[u32]) {
+    assert!(
+        key.len() <= 23 && key.is_ascii(),
+        "splice key must be a short ASCII string"
+    );
+    buf.push(0x60 | key.len() as u8);
+    buf.extend_from_slice(key.as_bytes());
+    let n = value.len();
+    if n <= 23 {
+        buf.push(0x80 | n as u8);
+    } else if n <= 255 {
+        buf.push(0x98);
+        buf.push(n as u8);
+    } else if n <= 65535 {
+        buf.push(0x99);
+        buf.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        buf.push(0x9A);
+        buf.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+    for &v in value {
+        if v <= 23 {
+            buf.push(v as u8);
+        } else if v <= 0xFF {
+            buf.push(0x18);
+            buf.push(v as u8);
+        } else if v <= 0xFFFF {
+            buf.push(0x19);
+            buf.extend_from_slice(&(v as u16).to_be_bytes());
+        } else {
+            buf.push(0x1A);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+}
+
 /// W9: the shared `GameDeltaMessage` segments, each pre-encoded ONCE per tick
 /// as raw map-entry bytes (key + value) in `GameDeltaMessage` declaration
 /// order.
@@ -506,40 +589,55 @@ fn splice_grid_entry(buf: &mut Vec<u8>, key: &'static str, value: &[u8]) {
 /// shared pieces are `border_grid_diff` (first shared entry) and the
 /// `units_added..city_updates` block.
 pub struct SpliceShared {
+    /// Pre-encoded `border_grid_diff` map entry (full-grid form); empty when
+    /// the border did not change or shipped sparse.
     pub border_grid: Vec<u8>,
+    /// Pre-encoded `border_cells_changed` map entry (I4 sparse form); empty
+    /// when the border shipped full-grid or did not change.
+    pub border_cells: Vec<u8>,
     pub units_and_cities: Vec<u8>,
-    /// 1 when `border_grid` is non-empty (border changed this tick), else 0.
-    pub has_border: bool,
+    /// Number of border map entries present (0 = unchanged, 1 = one of
+    /// full/sparse form). Used for the per-player map header count.
+    pub border_entry_count: u8,
 }
 
 impl SpliceShared {
     /// Pre-encode the shared segments of one tick's deltas. The segments are
     /// identical for every player, so this runs ONCE per tick regardless of
-    /// player count.
+    /// player count. I4: `border_grid_diff` and `border_cells_changed` are
+    /// mutually exclusive (full vs sparse form); at most one is `Some`.
     pub fn build(
         border_grid_diff: Option<&Arc<Vec<u8>>>,
+        border_cells_changed: Option<&Arc<Vec<u32>>>,
         units_added: &Vec<UnitState>,
         units_removed: &Vec<String>,
         unit_updates: &Vec<UnitUpdate>,
         city_updates: &Vec<CityUpdate>,
     ) -> SpliceShared {
-        let border_grid = match border_grid_diff {
-            Some(b) => {
-                // I6: splice in place — no intermediate `encode_entry` buffer.
-                let mut out = Vec::with_capacity(b.len() + 16);
-                splice_grid_entry(&mut out, "border_grid_diff", b);
-                out
-            }
-            None => Vec::new(),
-        };
+        let (border_grid, border_cells, border_entry_count) =
+            match (border_grid_diff, border_cells_changed) {
+                (Some(b), None) => {
+                    // I6: splice in place — no intermediate `encode_entry` buffer.
+                    let mut out = Vec::with_capacity(b.len() + 16);
+                    splice_grid_entry(&mut out, "border_grid_diff", b);
+                    (out, Vec::new(), 1)
+                }
+                (None, Some(c)) => {
+                    let mut out = Vec::with_capacity(c.len() * 5 + 16);
+                    splice_u32_array_entry(&mut out, "border_cells_changed", c);
+                    (Vec::new(), out, 1)
+                }
+                _ => (Vec::new(), Vec::new(), 0),
+            };
         let mut units_and_cities = Vec::new();
         units_and_cities.extend(encode_entry("units_added", units_added));
         units_and_cities.extend(encode_entry("units_removed", units_removed));
         units_and_cities.extend(encode_entry("unit_updates", unit_updates));
         units_and_cities.extend(encode_entry("city_updates", city_updates));
         SpliceShared {
-            has_border: !border_grid.is_empty(),
+            border_entry_count,
             border_grid,
+            border_cells,
             units_and_cities,
         }
     }
@@ -554,27 +652,44 @@ impl SpliceShared {
 /// test in the test module pins this invariant.
 pub fn encode_delta_spliced(delta: &GameDeltaMessage, shared: &SpliceShared) -> Vec<u8> {
     let vision_entries = usize::from(delta.vision_grid_diff.is_some());
+    let vision_cells_entries = usize::from(delta.vision_cells_changed.is_some());
     let grid_entries = usize::from(delta.grid_width.is_some());
-    // vision(?) + border(0|1) + width(0|1) + units&cities(4) + player(1)
-    let count = vision_entries + usize::from(shared.has_border) + grid_entries + 5;
+    // vision(0|1) + vision-cells(0|1) + border(0|1) + width(0|1) + units&cities(4) + player(1)
+    let count = vision_entries
+        + vision_cells_entries
+        + shared.border_entry_count as usize
+        + grid_entries
+        + 5;
     // Base overhead + shared bytes + per-player grid estimate.
     let cap = shared
         .border_grid
         .len()
+        .saturating_add(shared.border_cells.len())
         .saturating_add(shared.units_and_cities.len())
         .saturating_add(delta.vision_grid_diff.as_ref().map_or(16, |v| v.len() + 16))
+        .saturating_add(
+            delta
+                .vision_cells_changed
+                .as_ref()
+                .map_or(16, |c| c.len() * 5 + 16),
+        )
         .saturating_add(256);
     let mut buf = Vec::with_capacity(cap);
-    // Map header: 0xa0..0xb7 for counts 0..=23 (count is 5..=8 here).
-    debug_assert!((5..=8).contains(&count));
+    // Map header: 0xa0..0xb7 for counts 0..=23 (count is 5..=9 here).
+    debug_assert!((5..=9).contains(&count));
     buf.push(0xa0 + count as u8);
     if let Some(vision) = &delta.vision_grid_diff {
         // I6: splice the ~1 MB vision grid in place instead of encoding it
         // into a fresh temporary `Vec` per player per grid-dirty tick.
         splice_grid_entry(&mut buf, "vision_grid_diff", vision);
     }
-    if shared.has_border {
+    if let Some(cells) = &delta.vision_cells_changed {
+        // I4: sparse vision changed-cell list (packed u32 array).
+        splice_u32_array_entry(&mut buf, "vision_cells_changed", cells);
+    }
+    if shared.border_entry_count > 0 {
         buf.extend_from_slice(&shared.border_grid);
+        buf.extend_from_slice(&shared.border_cells);
     }
     if let Some(width) = delta.grid_width {
         buf.extend(encode_entry("grid_width", &width));
@@ -678,7 +793,9 @@ mod tests {
     fn encode_decode_delta_state() {
         let msg = ServerMessage::DeltaState(GameDeltaMessage {
             vision_grid_diff: None,
+            vision_cells_changed: None,
             border_grid_diff: None,
+            border_cells_changed: None,
             grid_width: None,
             units_added: Arc::new(vec![]),
             units_removed: Arc::new(vec!["unit_old".to_string()]),
@@ -731,7 +848,9 @@ mod tests {
     fn full_delta(player_id: &str, vision: Option<Vec<u8>>) -> GameDeltaMessage {
         GameDeltaMessage {
             vision_grid_diff: vision.map(Arc::new),
+            vision_cells_changed: None,
             border_grid_diff: Some(Arc::new(vec![0u8, 1, 2, 255, 0, 1, 2, 3])),
+            border_cells_changed: None,
             grid_width: Some(4),
             units_added: Arc::new(vec![UnitState {
                 id: "unit_1".to_string(),
@@ -796,6 +915,7 @@ mod tests {
     fn assert_splice_byte_for_byte(delta: &GameDeltaMessage, label: &str) {
         let shared = SpliceShared::build(
             delta.border_grid_diff.as_ref(),
+            delta.border_cells_changed.as_ref(),
             &delta.units_added,
             &delta.units_removed,
             &delta.unit_updates,
@@ -837,7 +957,7 @@ mod tests {
     fn splice_matches_encode_message_byte_for_byte() {
         let vision_a = vec![0u8, 1, 0, 1, 1, 0, 1, 1];
         // Player A: WITH a per-player vision diff (max map entries).
-        let msg_a = full_delta("player_a", Some(vision_a));
+        let msg_a = full_delta("player_a", Some(vision_a.clone()));
         // Player B: NO vision diff (exercises the dynamic map count).
         let msg_b = full_delta("player_b", None);
         // Player C (I6): a >65,535-byte vision grid — the 5-byte array header
@@ -845,13 +965,69 @@ mod tests {
         // (`v <= 23`) and 2-byte (`0x18, v`) item encodings.
         let vision_c: Vec<u8> = (0..70_000).map(|i| (i * 31 + 7) as u8).collect();
         let msg_c = full_delta("player_c", Some(vision_c));
+        // Player D (I4): sparse vision changed-cell list instead of the full
+        // vision grid (border still full). The list exercises all four u32
+        // item forms (1/2/3/4 bytes); values are packed (value<<bits)|index
+        // shapes for a 4×4 grid (bits=4): 1B `5`, 2B `0x1F4`, 3B `0x21F4`,
+        // 4B `0xFFFFFFFF`.
+        let msg_d = {
+            let mut d = full_delta("player_d", None);
+            d.vision_cells_changed = Some(Arc::new(vec![5u32, 0x1F4, 0x21F4, 0xFFFFFFFF]));
+            d
+        };
+        // Player E (I4): sparse border list instead of the full border grid
+        // (vision full) — exercises the sparse SHARED segment.
+        let msg_e = {
+            let mut d = full_delta("player_e", Some(vision_a.clone()));
+            d.border_grid_diff = None;
+            d.border_cells_changed = Some(Arc::new(vec![0u32, 0xFF, 0x1A01, 0x0F0F0F0F]));
+            d
+        };
+        // Player F (I4): BOTH grids sparse, nothing else grid-shaped —
+        // exercises the minimal map count with sparse entries present.
+        let msg_f = {
+            let mut d = full_delta("player_f", None);
+            d.border_grid_diff = None;
+            d.vision_cells_changed = Some(Arc::new(vec![0x3F, 0x1234]));
+            d.border_cells_changed = Some(Arc::new(vec![255u32 << 4 | 3]));
+            d
+        };
 
         for (delta, label) in [
             (&msg_a, "player_a"),
             (&msg_b, "player_b"),
             (&msg_c, "player_c_gt65535"),
+            (&msg_d, "player_d_vision_sparse"),
+            (&msg_e, "player_e_border_sparse"),
+            (&msg_f, "player_f_both_sparse"),
         ] {
             assert_splice_byte_for_byte(delta, label);
+        }
+    }
+
+    /// I4: `splice_u32_array_entry` must pin every definite-length array
+    /// header form (0x98 / 0x99 / 0x9A — the 1-byte `0x80|len` form is
+    /// pinned by the small lists in
+    /// `splice_matches_encode_message_byte_for_byte`) and all four u32 item
+    /// forms (1/2/3/4 bytes), splicing byte-for-byte against the standard
+    /// encoder for both the per-player vision entry and the shared border
+    /// entry.
+    #[test]
+    fn splice_u32_array_entry_all_length_forms() {
+        // Item values pin every integer form: 1B (5), 2B (0xFF), 3B (0x1FF),
+        // 4B (0xFFFFFFFF).
+        let items = [5u32, 0xFF, 0x1FF, 0xFFFFFFFF];
+        for (size, label) in [(100usize, "0x98"), (300, "0x99"), (70_000, "0x9a")] {
+            let cells: Vec<u32> = (0..size)
+                .map(|i| items[i % items.len()] ^ (i as u32))
+                .collect();
+            let mut delta = full_delta("player_cells", None);
+            delta.vision_cells_changed = Some(Arc::new(cells.clone()));
+            // Same list as the SHARED border entry: pins the once-per-tick
+            // SpliceShared::build path through the helper too.
+            delta.border_grid_diff = None;
+            delta.border_cells_changed = Some(Arc::new(cells));
+            assert_splice_byte_for_byte(&delta, label);
         }
     }
 
@@ -887,7 +1063,9 @@ mod tests {
         // and the compact form decodes back with `default` to all-None.
         let msg = ServerMessage::DeltaState(GameDeltaMessage {
             vision_grid_diff: None,
+            vision_cells_changed: None,
             border_grid_diff: None,
+            border_cells_changed: None,
             grid_width: None,
             units_added: Arc::new(vec![]),
             units_removed: Arc::new(vec![]),

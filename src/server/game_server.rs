@@ -761,7 +761,7 @@ impl GameRoom {
                             let spec_pid = String::new();
                             let prev_spec_vision: Option<&Arc<Vec<u8>>> =
                                 baselines.prev_vision.get(&spec_pid);
-                            if let Some(delta) = build_delta_inner(
+                            if let Some((delta, _)) = build_delta_inner(
                                 &baselines.prev_funds,
                                 prev_spec_vision,
                                 &baselines.prev_funds,
@@ -1412,7 +1412,7 @@ pub(crate) async fn handle_replay_ws(
                     // the map the same way the live path does.
                     count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
                 );
-                if let Some(delta) = build_delta_inner(
+                if let Some((delta, _)) = build_delta_inner(
                     &prev_funds,
                     prev_vision_grid.as_ref(),
                     &all_funds,

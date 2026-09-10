@@ -53,6 +53,51 @@ function flatTo2DBools(flat: number[], width: number): boolean[][] {
   return grid;
 }
 
+/**
+ * I4: number of index bits needed to pack a row-major cell index for a grid
+ * of `cells` cells — must match the server's `grid_index_bits`
+ * (`ceil(log2(cells))`). Returns `null` when the grid is too large to pack
+ * (an 8-bit value and the index must share a u32, i.e. at most 2^24 cells;
+ * such grids always ship in the full-grid form).
+ */
+function gridIndexBits(cells: number): number | null {
+  if (cells <= 1) return 0;
+  let bits = 1;
+  while ((1 << bits) < cells) bits += 1;
+  return bits <= 24 ? bits : null;
+}
+
+/**
+ * I4: apply a packed changed-cell list (sparse grid diff) to an existing 2-D
+ * grid in place. Each entry packs the NEW value and the row-major cell index
+ * into one u32: `(value << bits) | index`, with `bits` derived from the grid
+ * dimensions — the client-side inverse of the server's `diff_grid`. Mutates
+ * `grid`; returns false (with no mutation) when there is no usable baseline
+ * grid — the sparse form always requires the previous grid, which the client
+ * holds from the last full state/diff.
+ */
+export function applyCells(
+  grid: number[][] | boolean[][],
+  cells: number[],
+  width: number,
+  toBool: boolean,
+): boolean {
+  if (width === 0 || grid.length === 0 || grid[0] === undefined) return false;
+  const bits = gridIndexBits(grid.length * width);
+  if (bits === null) return false;
+  const mask = bits === 0 ? 0 : (1 << bits) - 1;
+  for (const packed of cells) {
+    const index = bits === 0 ? 0 : packed & mask;
+    const value = (bits === 0 ? packed : packed >> bits) & 0xff;
+    const row = grid[Math.floor(index / width)];
+    const col = index % width;
+    if (row === undefined || col >= row.length) continue;
+    if (toBool) (row as boolean[])[col] = value !== 0;
+    else (row as number[])[col] = value;
+  }
+  return true;
+}
+
 /** Re-export for replay player. */
 export { flatTo2D, flatTo2DBools };
 
@@ -405,10 +450,20 @@ export class Connection {
       if (delta.vision_grid_diff && delta.grid_width) {
         this.gameState.visionGrid = flatTo2DBools(delta.vision_grid_diff, delta.grid_width);
         this.renderer.markFogDirty();
+      } else if (delta.vision_cells_changed && delta.grid_width) {
+        // I4: sparse changed-cell list (packed u32) — patch the current grid.
+        if (applyCells(this.gameState.visionGrid, delta.vision_cells_changed, delta.grid_width, true)) {
+          this.renderer.markFogDirty();
+        }
       }
       if (delta.border_grid_diff && delta.grid_width) {
         this.gameState.borderGrid = flatTo2D(delta.border_grid_diff, delta.grid_width);
         this.renderer.markBorderDirty();
+      } else if (delta.border_cells_changed && delta.grid_width) {
+        // I4: sparse changed-cell list (packed u32) — patch the current grid.
+        if (applyCells(this.gameState.borderGrid, delta.border_cells_changed, delta.grid_width, false)) {
+          this.renderer.markBorderDirty();
+        }
       }
       for (const unit of delta.units_added || []) {
         const newUnit = new Unit(unit);

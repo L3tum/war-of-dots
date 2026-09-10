@@ -81,7 +81,7 @@ describe('marchingSquares', () => {
 
   it('overlaps adjacent cells by half a pixel so 4-way corners are covered', () => {
     const grid = makeGrid(2, 2);
-    const result = marchingSquares(grid, 10, { x: 0, y: 0 }, 1, 500, 300);
+    marchingSquares(grid, 10, { x: 0, y: 0 }, 1, 500, 300);
     // With zoom=1, hp = 0.5. Cell (0,0) right edge = 0 + 10 + 0.5 = 10.5
     // Cell (1,0) left edge = 10 - 0.5 = 9.5
     // They overlap by 1.0 world units (= 2 screen px)

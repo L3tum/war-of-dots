@@ -4,7 +4,7 @@ import { GameState } from '../game/game_state';
 import { Renderer } from '../game/renderer';
 import { Unit } from '../game/units';
 import type { TerrainType } from '../game/terrain';
-import { flatTo2D, flatTo2DBools } from '../net/connection';
+import { applyCells, flatTo2D, flatTo2DBools } from '../net/connection';
 
 export class ReplayPlayer {
   private canvas: HTMLCanvasElement;
@@ -124,9 +124,15 @@ export class ReplayPlayer {
       const delta = event.delta;
       if (delta.vision_grid_diff && delta.grid_width) {
         this.gameState.visionGrid = flatTo2DBools(delta.vision_grid_diff, delta.grid_width);
+      } else if (delta.vision_cells_changed && delta.grid_width) {
+        // I4: sparse changed-cell list (packed u32) — patch the current grid.
+        applyCells(this.gameState.visionGrid, delta.vision_cells_changed, delta.grid_width, true);
       }
       if (delta.border_grid_diff && delta.grid_width) {
         this.gameState.borderGrid = flatTo2D(delta.border_grid_diff, delta.grid_width);
+      } else if (delta.border_cells_changed && delta.grid_width) {
+        // I4: sparse changed-cell list (packed u32) — patch the current grid.
+        applyCells(this.gameState.borderGrid, delta.border_cells_changed, delta.grid_width, false);
       }
       // Units added
       for (const unit of delta.units_added || []) {
@@ -222,7 +228,9 @@ interface DeltaEvent {
   full_state?: never;
   delta: {
     vision_grid_diff?: number[];
+    vision_cells_changed?: number[];
     border_grid_diff?: number[];
+    border_cells_changed?: number[];
     grid_width?: number;
     units_added?: unknown[];
     units_removed?: string[];

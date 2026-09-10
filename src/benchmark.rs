@@ -82,6 +82,10 @@ pub struct TickData {
     /// player, or the synthetic spectator under --bench-spectator). Drives the
     /// grid-clean vs grid-dirty sub-split of the idle/movement regimes.
     pub net_grid_dirty: bool,
+    /// I4: grid cells changed this tick (border once + per-player vision;
+    /// 0 when the timing features are off). Backs the `grid_diag` changed-cell
+    /// fraction used to tune the ~5% sparse threshold.
+    pub net_grid_changed_cells: u64,
 }
 
 /// Benchmark configuration
@@ -309,7 +313,7 @@ fn bench_spectator_delta(
     // B0: second return value — did the emitted spectator delta carry the
     // union vision grid diff (i.e. did this tick ship a grid diff to a viewer)?
     let mut spec_grid_dirty = false;
-    let emitted = if let Some(delta) = build_delta_inner(
+    let emitted = if let Some((delta, _)) = build_delta_inner(
         &net_baselines.prev_funds,
         prev_spec_vision,
         &net_baselines.prev_funds,
@@ -322,10 +326,12 @@ fn bench_spectator_delta(
             ServerMessage::DeltaState(d) => d,
             _ => unreachable!(),
         };
-        spec_grid_dirty = dref.vision_grid_diff.is_some();
+        // I4: sparse changed-cell form counts as grid-dirty too.
+        spec_grid_dirty = dref.vision_grid_shipped();
         if spliced {
             let ss = crate::server::protocol::SpliceShared::build(
                 phase.shared.border_grid_diff.as_ref(),
+                phase.shared.border_cells_changed.as_ref(),
                 &phase.shared.units_added,
                 &phase.shared.units_removed,
                 &phase.shared.unit_updates,
@@ -900,6 +906,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     net_encode_ms,
                     net_send_ms: 0.0,
                     net_grid_dirty,
+                    // I4: changed-cell fraction metric (timing features only).
+                    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+                    net_grid_changed_cells: net_phase.grid_changed_cells,
+                    #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+                    net_grid_changed_cells: 0,
                 }
             } else {
                 TickData {
@@ -921,6 +932,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     net_encode_ms,
                     net_send_ms: 0.0,
                     net_grid_dirty,
+                    // I4: changed-cell fraction metric (timing features only).
+                    #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+                    net_grid_changed_cells: net_phase.grid_changed_cells,
+                    #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+                    net_grid_changed_cells: 0,
                 }
             };
 
@@ -944,6 +960,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 net_encode_ms,
                 net_send_ms: 0.0,
                 net_grid_dirty,
+                // I4: changed-cell fraction metric (timing features only).
+                #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
+                net_grid_changed_cells: net_phase.grid_changed_cells,
+                #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
+                net_grid_changed_cells: 0,
             };
 
             run_tick_data.push(td);
@@ -1117,6 +1138,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     .sum::<f64>();
                 let sum_net_send = runs_tick_data.iter().map(|r| r[i].net_send_ms).sum::<f64>();
                 let grid_dirty = runs_tick_data.iter().any(|r| r[i].net_grid_dirty);
+                // I4: changed-cell counts are deterministic across runs (same
+                // seed) — average like the other per-tick network metrics.
+                let sum_net_grid_cells = runs_tick_data
+                    .iter()
+                    .map(|r| r[i].net_grid_changed_cells as f64)
+                    .sum::<f64>();
                 TickData {
                     total_ms: sum_total / n,
                     entity_count: (sum_entity / n).round() as u32,
@@ -1135,6 +1162,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     net_encode_ms: sum_net_encode / n,
                     net_send_ms: sum_net_send / n,
                     net_grid_dirty: grid_dirty,
+                    net_grid_changed_cells: (sum_net_grid_cells / n).round() as u64,
                 }
             })
             .collect()
@@ -1464,6 +1492,41 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         "send": tick_data.iter().map(|t| t.net_send_ms).sum::<f64>() / net_n,
     });
 
+    // I4: changed-cell density on grid-dirty ticks — the number that
+    // decides the ~5% sparse-vs-full threshold (sparse is chosen while
+    // per-grid changed fraction <= ~5%). `avg_changed_fraction` is the
+    // per-GRID average over the (1 border + BENCH_PLAYERS vision) grids
+    // shipped on grid-dirty ticks; 0.0 when the timing features are off.
+    // (Computed here, outside the summary `json!` below: a value starting
+    // with `{` would be parsed as a nested object literal by the macro.)
+    let grid_cells = config.map_size as u64 * config.map_size as u64;
+    let grid_dirty_ticks = tick_data.iter().filter(|t| t.net_grid_dirty).count() as f64;
+    let sum_grid_changed: f64 = tick_data
+        .iter()
+        .filter(|t| t.net_grid_dirty)
+        .map(|t| t.net_grid_changed_cells as f64)
+        .sum();
+    let grids_per_dirty_tick = (BENCH_PLAYERS + 1) as f64;
+    let grid_diag = {
+        let avg_changed_cells = if grid_dirty_ticks > 0.0 {
+            sum_grid_changed / grid_dirty_ticks
+        } else {
+            0.0
+        };
+        let avg_changed_fraction = if grid_dirty_ticks > 0.0 && grid_cells > 0 {
+            sum_grid_changed / grid_dirty_ticks / grids_per_dirty_tick / grid_cells as f64
+        } else {
+            0.0
+        };
+        serde_json::json!({
+            "grid_cells": grid_cells,
+            "grids_per_dirty_tick": grids_per_dirty_tick,
+            "grid_dirty_ticks": grid_dirty_ticks,
+            "avg_changed_cells_per_dirty_tick": avg_changed_cells,
+            "avg_changed_fraction": avg_changed_fraction,
+        })
+    };
+
     let summary = serde_json::json!({
         "config": {
             "cities": total_cities, "units_per_city": config.units_per_city,
@@ -1580,6 +1643,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             "avg_cooldown_skipped_per_tick": mdiag_cooldown as f64 / tick_data.len() as f64,
             "avg_noop_skipped_per_tick": mdiag_noop as f64 / tick_data.len() as f64,
         },
+        "grid_diag": grid_diag,
         "supply_diag": {
             "avg_funds_blocked_per_tick": sdiag_blocked_funds as f64 / tick_data.len() as f64,
             "avg_mp_blocked_per_tick": sdiag_blocked_mp as f64 / tick_data.len() as f64,

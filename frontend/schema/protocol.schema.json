@@ -467,6 +467,17 @@
         "units_removed"
       ],
       "properties": {
+        "border_cells_changed": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        },
         "border_grid_diff": {
           "type": [
             "array",
@@ -518,6 +529,17 @@
             "items": {
               "type": "boolean"
             }
+          }
+        },
+        "vision_cells_changed": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
           }
         }
       }

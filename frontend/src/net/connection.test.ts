@@ -2,6 +2,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { decode, encode } from 'cbor-x';
+import { applyCells } from './connection';
 
 /** Recursively remove `undefined` values from plain objects and arrays. */
 function stripUndefined(value: unknown): unknown {
@@ -15,6 +16,65 @@ function stripUndefined(value: unknown): unknown {
   }
   return result;
 }
+
+describe('I4 sparse changed-cell apply (applyCells)', () => {
+  it('applies packed (value<<bits)|index entries to a vision grid, incl. 1→0 flips', () => {
+    // 4×4 grid: 16 cells → bits = ceil(log2(16)) = 4.
+    const vision: boolean[][] = Array.from({ length: 4 }, () => Array(4).fill(true));
+    // idx 2 → 1 (already 1), idx 7 and 15 → 0 (1→0 flips must be applied).
+    const cells = [(1 << 4) | 2, 0 << 4, 0 << 4 | 7, 0 << 4 | 15];
+    expect(applyCells(vision, cells, 4, true)).toBe(true);
+    expect(vision[0][2]).toBe(true);
+    expect(vision[1][3]).toBe(false);
+    expect(vision[3][3]).toBe(false);
+    expect(vision[2][0]).toBe(true);
+  });
+
+  it('applies border values including 255 (ownerless) at arbitrary indices', () => {
+    // 3×5 grid: 15 cells → bits = ceil(log2(15)) = 4 (not a power of two).
+    const border: number[][] = Array.from({ length: 3 }, () => Array(5).fill(0));
+    expect(applyCells(border, [255 << 4 | 4, 2 << 4 | 9], 5, false)).toBe(true);
+    expect(border[0][4]).toBe(255);
+    expect(border[1][4]).toBe(2);
+    expect(border[2][2]).toBe(0);
+  });
+
+  it('handles the 1-cell grid (bits = 0) form', () => {
+    const vision: boolean[][] = [[false]];
+    expect(applyCells(vision, [1], 1, true)).toBe(true);
+    expect(vision[0][0]).toBe(true);
+    expect(applyCells(vision, [0], 1, true)).toBe(true);
+    expect(vision[0][0]).toBe(false);
+  });
+
+  it('roundtrips a random sparse change against the flat-grid replace path', () => {
+    // Same invariant the server relies on: patching `prev` with the packed
+    // list of `prev → curr` differences must reproduce `curr` exactly.
+    const w = 37;
+    const h = 23;
+    const bits = Math.ceil(Math.log2(w * h));
+    const prev: number[][] = Array.from({ length: h }, () => Array(w).fill(0));
+    const curr = prev.map((row) => row.slice());
+    let seed = 12345;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const changed: number[] = [];
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (rnd() < 0.03) {
+          const v = Math.floor(rnd() * 256);
+          curr[y][x] = v;
+          changed.push((v << bits) | (y * w + x));
+        }
+      }
+    }
+    expect(applyCells(prev, changed, w, false)).toBe(true);
+    expect(prev).toEqual(curr);
+  });
+
+  it('refuses to apply without a baseline grid', () => {
+    expect(applyCells([], [1], 4, true)).toBe(false);
+  });
+});
 
 describe('CBOR encoding strips undefined values', () => {
   it('removes top-level undefined values', () => {
