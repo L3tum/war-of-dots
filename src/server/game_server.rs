@@ -1411,6 +1411,12 @@ pub(crate) async fn handle_replay_ws(
                     // I5: replay path has no active-check consumer — build
                     // the map the same way the live path does.
                     count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
+                    // I3: same packed-position quantization scale as the live
+                    // path — the replayed game's map dimensions.
+                    (
+                        replay_player.game.terrain_width(),
+                        replay_player.game.terrain_height(),
+                    ),
                 );
                 if let Some((delta, _)) = build_delta_inner(
                     &prev_funds,

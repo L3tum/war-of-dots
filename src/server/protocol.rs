@@ -103,20 +103,66 @@ pub struct EquipmentState {
     pub cost_per_item: f32,
 }
 
+/// I3: quantization steps per map axis for packed unit positions — each axis
+/// is a `u16` quantized to 65,536 steps ACROSS THE FULL MAP (sub-pixel
+/// precision at any zoom; `CELL_SIZE` = 32 px means the step is far below a
+/// pixel for maps up to ~2,048 cells).
+pub const UNIT_POSITION_STEPS: f64 = 65_536.0;
+
+/// I3: pack a cell-space unit position into one u32: `(x_q << 16) | y_q`,
+/// with `x_q = round(x * 65536 / width)`, `y_q = round(y * 65536 / height)`
+/// (each axis quantized to `u16` over the full map, clamped to the u16
+/// range). Replaces the old `(f32, f32)` wire form (2 × 5-byte CBOR floats
+/// + array header) with a single 1–4-byte integer.
+///
+/// Frontend inverse: `unpackPosition` (same `map_size` — the client's terrain
+/// dimensions).
+#[allow(clippy::cast_possible_truncation)] // clamping below bounds the range
+pub fn pack_unit_position(pos: (f32, f32), map_size: (u32, u32)) -> u32 {
+    let (w, h) = (map_size.0.max(1) as f64, map_size.1.max(1) as f64);
+    let qx = (pos.0 as f64 * UNIT_POSITION_STEPS / w)
+        .round()
+        .clamp(0.0, 65_535.0) as u16;
+    let qy = (pos.1 as f64 * UNIT_POSITION_STEPS / h)
+        .round()
+        .clamp(0.0, 65_535.0) as u16;
+    ((qx as u32) << 16) | qy as u32
+}
+
+/// I3: unpack a packed unit position (inverse of `pack_unit_position` up to
+/// the quantization step). `map_size` must be the map the position was
+/// packed with (the client's terrain dimensions). Test-only in the binary
+/// (the live client-side inverse is the frontend's `unpackPosition`).
+#[allow(clippy::cast_possible_truncation)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn unpack_unit_position(packed: u32, map_size: (u32, u32)) -> (f32, f32) {
+    let (w, h) = (map_size.0.max(1) as f64, map_size.1.max(1) as f64);
+    (
+        ((packed >> 16) as f64 * w / UNIT_POSITION_STEPS) as f32,
+        ((packed & 0xFFFF) as f64 * h / UNIT_POSITION_STEPS) as f32,
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct UnitUpdate {
     pub id: String,
     // Absent fields are omitted on the wire (compact form); clients guard with
     // null/undefined checks, and `default` keeps Deserialize happy for the
     // full (null-bearing) form recorded by older clients/replays.
+    /// I3: packed quantized position `(x_q << 16) | y_q` — see
+    /// `pack_unit_position`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub position: Option<(f32, f32)>,
+    pub position: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub men: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub organisation: Option<f32>,
+    /// I3: per-slot equipment COUNTS, in `UnitState.equipment` slot order.
+    /// Slot names/costs stay in the once-per-lifetime full state
+    /// (`units_added`/`FullState`), so an equipment change ships only the
+    /// counts instead of repeating every name + `cost_per_item`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub equipment: Option<Vec<EquipmentState>>,
+    pub equipment: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub path: Option<Vec<(f32, f32)>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -801,7 +847,7 @@ mod tests {
             units_removed: Arc::new(vec!["unit_old".to_string()]),
             unit_updates: Arc::new(vec![UnitUpdate {
                 id: "unit_1".to_string(),
-                position: Some((11.0, 20.0)),
+                position: Some(pack_unit_position((11.0, 20.0), (32, 32))),
                 men: Some(950.0),
                 organisation: Some(90.0),
                 equipment: None,
@@ -836,7 +882,15 @@ mod tests {
             assert_eq!(delta.units_removed[0], "unit_old");
             assert_eq!(delta.unit_updates.len(), 1);
             assert_eq!(delta.unit_updates[0].id, "unit_1");
-            assert_eq!(delta.unit_updates[0].position, Some((11.0, 20.0)));
+            assert_eq!(
+                delta.unit_updates[0].position,
+                Some(pack_unit_position((11.0, 20.0), (32, 32)))
+            );
+            // I3: the packed position unpacks back to the original cell coords.
+            if let Some(p) = delta.unit_updates[0].position {
+                let (x, y) = unpack_unit_position(p, (32, 32));
+                assert!((x - 11.0).abs() < 1e-4 && (y - 20.0).abs() < 1e-4);
+            }
             assert_eq!(delta.player.funds, 1100);
         } else {
             panic!("Expected DeltaState");
@@ -881,7 +935,7 @@ mod tests {
             units_removed: Arc::new(vec!["unit_gone".to_string()]),
             unit_updates: Arc::new(vec![UnitUpdate {
                 id: "unit_1".to_string(),
-                position: Some((3.0, 4.0)),
+                position: Some(pack_unit_position((3.0, 4.0), (32, 32))),
                 men: Some(999.0),
                 organisation: Some(97.0),
                 equipment: None,
@@ -1071,7 +1125,7 @@ mod tests {
             units_removed: Arc::new(vec![]),
             unit_updates: Arc::new(vec![UnitUpdate {
                 id: "unit_1".to_string(),
-                position: Some((3.0, 2.0)),
+                position: Some(pack_unit_position((3.0, 2.0), (32, 32))),
                 men: None,
                 organisation: None,
                 equipment: None,
@@ -1112,7 +1166,7 @@ mod tests {
             assert_eq!(delta.unit_updates.len(), 1);
             let u = &delta.unit_updates[0];
             assert_eq!(u.id, "unit_1");
-            assert_eq!(u.position, Some((3.0, 2.0)));
+            assert_eq!(u.position, Some(pack_unit_position((3.0, 2.0), (32, 32))));
             assert!(u.men.is_none());
             assert!(u.organisation.is_none());
             assert!(u.equipment.is_none());
@@ -1135,6 +1189,141 @@ mod tests {
             assert!(delta.vision_grid_diff.is_none());
             assert!(delta.border_grid_diff.is_none());
             assert!(delta.grid_width.is_none());
+        } else {
+            panic!("Expected DeltaState");
+        }
+    }
+
+    /// I3: equipment updates ship per-slot COUNTS only (in `UnitState.equipment`
+    /// slot order) — names/costs stay in the once-per-lifetime full state.
+    /// Roundtrip through CBOR must preserve the counts, and no slot name may
+    /// reach the wire.
+    #[test]
+    fn unit_update_equipment_counts_roundtrip() {
+        // Slot names chosen so any accidental full-state shipping would be
+        // visible in the raw frame bytes.
+        let slot_names = ["rifle_x77", "cannon_q31", "medkit_v09"];
+        let msg = ServerMessage::DeltaState(GameDeltaMessage {
+            vision_grid_diff: None,
+            vision_cells_changed: None,
+            border_grid_diff: None,
+            border_cells_changed: None,
+            grid_width: None,
+            units_added: Arc::new(vec![]),
+            units_removed: Arc::new(vec![]),
+            unit_updates: Arc::new(vec![UnitUpdate {
+                id: "unit_eq1".to_string(),
+                position: None,
+                men: None,
+                organisation: None,
+                equipment: Some(vec![105, 0, 7]),
+                path: None,
+                healing: None,
+                resupply_enabled: None,
+                supply_percent: None,
+                encircled: None,
+                attacking: None,
+                on_water: None,
+                boat_supply_percent: None,
+                embarking: None,
+                disembarking: None,
+            }]),
+            city_updates: Arc::new(vec![]),
+            player: PlayerState {
+                funds: 0,
+                units_owned: 0,
+                player_id: "p1".to_string(),
+            },
+        });
+
+        let encoded = encode_message(&msg);
+        // No slot name (ASCII) may appear anywhere in the frame.
+        for name in slot_names {
+            assert!(
+                !encoded.windows(name.len()).any(|w| w == name.as_bytes()),
+                "equipment slot name '{name}' must not be on the wire"
+            );
+        }
+
+        let decoded: ServerMessage = ciborium::from_reader(encoded.as_slice()).unwrap();
+        if let ServerMessage::DeltaState(delta) = decoded {
+            assert_eq!(delta.unit_updates.len(), 1);
+            assert_eq!(
+                delta.unit_updates[0].equipment.as_deref(),
+                Some([105u32, 0, 7].as_slice())
+            );
+        } else {
+            panic!("Expected DeltaState");
+        }
+    }
+
+    /// I3: packed quantized position — pack/unpack roundtrips within one
+    /// quantization step (65,536 steps per map axis) and clamps to the u16
+    /// range; the packed u32 survives the CBOR wire exactly.
+    #[test]
+    fn unit_update_position_quantized_roundtrip() {
+        // 1000×1000 map (the stress size); (x, y) matrix: zero, sub-cell
+        // fractions, mid-map, boundary-adjacent.
+        let map = (1000, 1000);
+        let half_step = 0.5 * 1000.0f32 / UNIT_POSITION_STEPS as f32;
+        for (x, y) in [
+            (0.0f32, 0.0f32),
+            (3.5, 4.25),
+            (999.123, 500.5),
+            (0.00001, 0.99999),
+        ] {
+            let packed = pack_unit_position((x, y), map);
+            let (dx, dy) = unpack_unit_position(packed, map);
+            assert!((dx - x).abs() <= half_step, "x {x} -> {dx}");
+            assert!((dy - y).abs() <= half_step, "y {y} -> {dy}");
+        }
+        // Out-of-range coordinates clamp to the map bounds instead of
+        // overflowing or going negative.
+        let (cx, cy) = unpack_unit_position(pack_unit_position((7_000.0, -5.0), map), map);
+        assert!((cx - 999.984).abs() < 0.01, "x clamped to map edge: {cx}");
+        assert_eq!(cy, 0.0);
+        // On a power-of-two map the packing is exact for whole-cell coords.
+        let packed = pack_unit_position((11.0, 20.0), (32, 32));
+        assert_eq!(unpack_unit_position(packed, (32, 32)), (11.0, 20.0));
+
+        // Wire roundtrip: the u32 is bit-exact through CBOR.
+        let packed = pack_unit_position((12.75, 43.5), map);
+        let msg = ServerMessage::DeltaState(GameDeltaMessage {
+            vision_grid_diff: None,
+            vision_cells_changed: None,
+            border_grid_diff: None,
+            border_cells_changed: None,
+            grid_width: None,
+            units_added: Arc::new(vec![]),
+            units_removed: Arc::new(vec![]),
+            unit_updates: Arc::new(vec![UnitUpdate {
+                id: "unit_pos1".to_string(),
+                position: Some(packed),
+                men: None,
+                organisation: None,
+                equipment: None,
+                path: None,
+                healing: None,
+                resupply_enabled: None,
+                supply_percent: None,
+                encircled: None,
+                attacking: None,
+                on_water: None,
+                boat_supply_percent: None,
+                embarking: None,
+                disembarking: None,
+            }]),
+            city_updates: Arc::new(vec![]),
+            player: PlayerState {
+                funds: 0,
+                units_owned: 0,
+                player_id: "p1".to_string(),
+            },
+        });
+        let encoded = encode_message(&msg);
+        let decoded: ServerMessage = ciborium::from_reader(encoded.as_slice()).unwrap();
+        if let ServerMessage::DeltaState(delta) = decoded {
+            assert_eq!(delta.unit_updates[0].position, Some(packed));
         } else {
             panic!("Expected DeltaState");
         }

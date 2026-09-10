@@ -468,6 +468,7 @@
       ],
       "properties": {
         "border_cells_changed": {
+          "description": "I4: sparse changed-cell list for the BORDER grid — same packed-u32 format as `vision_cells_changed` (the 8-bit value is the new player index, including 255 = no owner). Present instead of `border_grid_diff` when the change is below the ~5% threshold.",
           "type": [
             "array",
             "null"
@@ -479,17 +480,15 @@
           }
         },
         "border_grid_diff": {
+          "description": "Flat border/territory grid (1 byte per cell: player index 0..N or 255). Row-major, width = terrain width. `None` when unchanged.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "array",
-            "items": {
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 0.0
-            }
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
           }
         },
         "city_updates": {
@@ -497,6 +496,15 @@
           "items": {
             "$ref": "#/definitions/CityUpdate"
           }
+        },
+        "grid_width": {
+          "description": "Grid width in cells (sent whenever either grid diff is present so the client can index the flat arrays). Omitted when no grid changed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
         },
         "player": {
           "$ref": "#/definitions/PlayerState"
@@ -508,6 +516,7 @@
           }
         },
         "units_added": {
+          "description": "Shared across all players in a tick — `Arc` so per-player delta construction is a refcount bump, not a deep clone.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/UnitState"
@@ -519,19 +528,8 @@
             "type": "string"
           }
         },
-        "vision_grid_diff": {
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "array",
-            "items": {
-              "type": "boolean"
-            }
-          }
-        },
         "vision_cells_changed": {
+          "description": "I4: sparse changed-cell list for the VISION grid. Present *instead of* `vision_grid_diff` when fewer than ~5% of cells changed. Each entry packs the new value and the row-major cell index into one u32: `(new_value << bits) | cell_index`, `bits = ceil(log2(w*h))`. The value is always present — vision flips include 1→0 (cells becoming invisible), so a set-bit-only encoding would lose them.",
           "type": [
             "array",
             "null"
@@ -539,6 +537,18 @@
           "items": {
             "type": "integer",
             "format": "uint32",
+            "minimum": 0.0
+          }
+        },
+        "vision_grid_diff": {
+          "description": "Flat vision grid (1 byte per cell, 0 or 1). Row-major, width = terrain width. `None` when the grid is unchanged since the client's last snapshot. `Arc` so the per-player build shares the influence grid instead of copying 40 KB (W3); CBOR-serializes as a plain byte array.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
             "minimum": 0.0
           }
         }
@@ -944,12 +954,15 @@
           ]
         },
         "equipment": {
+          "description": "I3: per-slot equipment COUNTS, in `UnitState.equipment` slot order. Slot names/costs stay in the once-per-lifetime full state (`units_added`/`FullState`), so an equipment change ships only the counts instead of repeating every name + `cost_per_item`.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "$ref": "#/definitions/EquipmentState"
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
           }
         },
         "healing": {
@@ -1003,22 +1016,13 @@
           }
         },
         "position": {
+          "description": "I3: packed quantized position `(x_q << 16) | y_q` — see `pack_unit_position`.",
           "type": [
-            "array",
+            "integer",
             "null"
           ],
-          "items": [
-            {
-              "type": "number",
-              "format": "float"
-            },
-            {
-              "type": "number",
-              "format": "float"
-            }
-          ],
-          "maxItems": 2,
-          "minItems": 2
+          "format": "uint32",
+          "minimum": 0.0
         },
         "resupply_enabled": {
           "type": [

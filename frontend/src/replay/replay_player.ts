@@ -4,7 +4,14 @@ import { GameState } from '../game/game_state';
 import { Renderer } from '../game/renderer';
 import { Unit } from '../game/units';
 import type { TerrainType } from '../game/terrain';
-import { applyCells, flatTo2D, flatTo2DBools } from '../net/connection';
+import {
+  applyCells,
+  applyEquipmentCounts,
+  flatTo2D,
+  flatTo2DBools,
+  mapSizeFromTerrain,
+  unpackUnitPosition,
+} from '../net/connection';
 
 export class ReplayPlayer {
   private canvas: HTMLCanvasElement;
@@ -144,19 +151,26 @@ export class ReplayPlayer {
       for (const id of delta.units_removed || []) {
         this.gameState.units.delete(id);
       }
-      // Unit updates
+      // Unit updates — I3: packed position decoded against the terrain map
+      // size, equipment decoded as per-slot counts against the unit's
+      // full-state slot table (same rules as the live connection).
+      const mapSize = mapSizeFromTerrain(this.gameState.terrain);
       for (const rawUpdate of delta.unit_updates || []) {
         const update = rawUpdate as Record<string, unknown>;
         const unit = this.gameState.units.get(update.id as string);
         if (unit) {
-          if (update.position) {
-            const pos = update.position as [number, number];
-            unit.position = { x: pos[0], y: pos[1] };
+          // Packed position 0 (the origin) is valid — use explicit null checks.
+          if (update.position !== undefined && update.position !== null) {
+            if (mapSize) unit.position = unpackUnitPosition(update.position as number, mapSize);
           }
           if (update.men !== undefined) unit.men = update.men as number;
           if (update.organisation !== undefined) unit.organisation = update.organisation as number;
-          if (update.equipment)
-            unit.equipment = update.equipment as import('../generated/protocol').EquipmentState[];
+          if (update.equipment !== undefined && update.equipment !== null) {
+            const counts = update.equipment as number[];
+            if (!applyEquipmentCounts(unit, counts)) {
+              console.warn(`equipment counts for unit ${update.id} do not match its slot table`);
+            }
+          }
           if (update.path) unit.path = update.path as [number, number][];
           if (update.healing !== undefined) unit.healing = update.healing as boolean;
           if (update.resupply_enabled !== undefined) {

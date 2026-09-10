@@ -63,7 +63,7 @@ function flatTo2DBools(flat: number[], width: number): boolean[][] {
 function gridIndexBits(cells: number): number | null {
   if (cells <= 1) return 0;
   let bits = 1;
-  while ((1 << bits) < cells) bits += 1;
+  while (1 << bits < cells) bits += 1;
   return bits <= 24 ? bits : null;
 }
 
@@ -95,6 +95,60 @@ export function applyCells(
     if (toBool) (row as boolean[])[col] = value !== 0;
     else (row as number[])[col] = value;
   }
+  return true;
+}
+
+/**
+ * I3: quantization steps per map axis for packed unit positions — each axis
+ * is a `u16` quantized to 65,536 steps ACROSS THE FULL MAP (see the server's
+ * `UNIT_POSITION_STEPS` / `pack_unit_position`). This constant MUST stay in
+ * lockstep with `src/server/protocol.rs`.
+ */
+export const UNIT_POSITION_STEPS = 65_536;
+
+/**
+ * I3: decode a packed unit position (single `u32`: `x_q << 16 | y_q`, each
+ * axis quantized to `u16` over the full map) back to cell coordinates. This is
+ * the client-side inverse of the server's `pack_unit_position` — pass the
+ * same `map_size` (terrain width, height in cells) the server packed with.
+ */
+export function unpackUnitPosition(
+  packed: number,
+  mapSize: { width: number; height: number },
+): { x: number; y: number } {
+  const xq = packed >>> 16;
+  const yq = packed & 0xffff;
+  return {
+    x: (xq * mapSize.width) / UNIT_POSITION_STEPS,
+    y: (yq * mapSize.height) / UNIT_POSITION_STEPS,
+  };
+}
+
+/**
+ * I3: map size in cells from the client's 2-D terrain grid (rows × cols), or
+ * `null` when the grid is not ready — packed unit positions cannot be decoded
+ * until the full state has arrived.
+ */
+export function mapSizeFromTerrain(terrain: unknown[][]): { width: number; height: number } | null {
+  const height = terrain.length;
+  const first = height > 0 ? terrain[0] : undefined;
+  const width = first !== undefined ? first.length : 0;
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
+/**
+ * I3: apply a per-slot equipment COUNTS update (in `UnitState.equipment` slot
+ * order) to a unit, keeping slot names and `cost_per_item` from the
+ * once-per-lifetime full state. Returns `false` when the counts do not line up
+ * with the full-state slot table (different length) — the caller should keep
+ * the previous equipment rather than corrupt slot order.
+ */
+export function applyEquipmentCounts(
+  unit: { equipment: import('../generated/protocol').EquipmentState[] },
+  counts: number[],
+): boolean {
+  if (unit.equipment.length !== counts.length) return false;
+  unit.equipment = unit.equipment.map((slot, i) => ({ ...slot, count: counts[i] }));
   return true;
 }
 
@@ -452,7 +506,9 @@ export class Connection {
         this.renderer.markFogDirty();
       } else if (delta.vision_cells_changed && delta.grid_width) {
         // I4: sparse changed-cell list (packed u32) — patch the current grid.
-        if (applyCells(this.gameState.visionGrid, delta.vision_cells_changed, delta.grid_width, true)) {
+        if (
+          applyCells(this.gameState.visionGrid, delta.vision_cells_changed, delta.grid_width, true)
+        ) {
           this.renderer.markFogDirty();
         }
       }
@@ -461,7 +517,9 @@ export class Connection {
         this.renderer.markBorderDirty();
       } else if (delta.border_cells_changed && delta.grid_width) {
         // I4: sparse changed-cell list (packed u32) — patch the current grid.
-        if (applyCells(this.gameState.borderGrid, delta.border_cells_changed, delta.grid_width, false)) {
+        if (
+          applyCells(this.gameState.borderGrid, delta.border_cells_changed, delta.grid_width, false)
+        ) {
           this.renderer.markBorderDirty();
         }
       }
@@ -472,13 +530,25 @@ export class Connection {
       for (const id of delta.units_removed || []) {
         this.gameState.units.delete(id);
       }
+      // I3: packed unit positions are decoded against the terrain map size
+      // (cell dims), and equipment updates carry per-slot COUNTS only —
+      // decoded against the unit's full-state slot table (names/costs come
+      // from the once-per-lifetime full state).
+      const mapSize = mapSizeFromTerrain(this.gameState.terrain);
       for (const update of delta.unit_updates || []) {
         const unit = this.gameState.units.get(update.id);
         if (unit) {
-          if (update.position) unit.position = { x: update.position[0], y: update.position[1] };
+          // Packed position 0 (the origin) is a valid value — use `!= null`.
+          if (update.position != null && mapSize) {
+            unit.position = unpackUnitPosition(update.position, mapSize);
+          }
           if (update.men != null) unit.men = update.men;
           if (update.organisation != null) unit.organisation = update.organisation;
-          if (update.equipment) unit.equipment = update.equipment;
+          if (update.equipment) {
+            if (!applyEquipmentCounts(unit, update.equipment)) {
+              console.warn(`equipment counts for unit ${update.id} do not match its slot table`);
+            }
+          }
           if (update.path) unit.path = update.path;
           if (update.healing != null) unit.healing = update.healing;
           if (update.resupply_enabled != null) unit.resupplyEnabled = update.resupply_enabled;

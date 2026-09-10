@@ -1608,6 +1608,14 @@ impl Game {
             .unwrap_or(0)
     }
 
+    /// Returns the terrain height in cells (0 if no world data).
+    pub fn terrain_height(&self) -> u32 {
+        self.world
+            .world_data(self.world_entity)
+            .map(|wb| wb.terrain.height)
+            .unwrap_or(0)
+    }
+
     /// Supervisor (spectator/replay) view: union of every player's vision.
     /// A cell is visible if any player currently sees it.
     pub fn supervisor_vision_grid(&self) -> Option<Vec<Vec<bool>>> {
@@ -2021,6 +2029,8 @@ impl Game {
         // reference path's `compute_shared_deltas` arguments.
         let men_step = self.settings().recruitment_rate.max(5.0);
         let is_cold = cold_due(self.tick_number());
+        // I3: packed-position quantization scale — the map dimensions in cells.
+        let map_size = (self.terrain_width(), self.terrain_height());
 
         // PRE-COMMIT owner counts (what the old path derived from prev_units).
         let prev_owner_counts = store.prev_owner_counts();
@@ -2119,7 +2129,7 @@ impl Game {
                 );
                 let update = store
                     .resolve(entity)
-                    .map(|prev| build_unit_update(prev, &curr, is_cold))
+                    .map(|prev| build_unit_update(prev, &curr, is_cold, map_size))
                     .expect("baseline slot resolved moments ago");
                 // Commit: move the materialized state into the slot (the
                 // update's equipment/path payloads are already cloned out).
@@ -2942,6 +2952,8 @@ mod tests {
             let current_units = game.unit_states();
             let current_ids: HashSet<&str> = current_units.iter().map(|u| u.id.as_str()).collect();
             let men_step = game.settings().recruitment_rate.max(5.0);
+            // I3: must match the live pass's quantization scale.
+            let map_size = (game.terrain_width(), game.terrain_height());
             let shared = compute_shared_deltas(
                 &prev_units,
                 &prev_cities,
@@ -2953,6 +2965,7 @@ mod tests {
                 men_step,
                 game.tick_number(),
                 count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
+                map_size,
             );
 
             assert_eq!(

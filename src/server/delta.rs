@@ -32,8 +32,8 @@ use hecs::Entity;
 
 use crate::game::game::Game;
 use crate::server::protocol::{
-    encode_message_with_hint, estimate_delta_size, CityState, CityUpdate, GameDeltaMessage,
-    PlayerState, ServerMessage, UnitState, UnitUpdate,
+    encode_message_with_hint, estimate_delta_size, pack_unit_position, CityState, CityUpdate,
+    GameDeltaMessage, PlayerState, ServerMessage, UnitState, UnitUpdate,
 };
 
 // I2a: the `men` digest quantization step is resolved at RUNTIME as
@@ -276,9 +276,19 @@ pub(crate) fn count_units_by_owner<'a>(
 /// pass (`Game::update_states_in_place`) and the HashMap reference path
 /// (`compute_shared_deltas` — replay endpoint + tests) so the two can never
 /// drift in what fields an update carries.
-pub(crate) fn build_unit_update(prev: &UnitState, u: &UnitState, is_cold: bool) -> UnitUpdate {
+///
+/// `map_size` (width, height in cells) is the I3 position-quantization scale:
+/// each packed axis is u16 over the full map (see `pack_unit_position`).
+pub(crate) fn build_unit_update(
+    prev: &UnitState,
+    u: &UnitState,
+    is_cold: bool,
+    map_size: (u32, u32),
+) -> UnitUpdate {
     let new_pos = if u.position != prev.position {
-        Some(u.position)
+        // I3: quantized packed u32 (u16 x y over the full map) instead of
+        // two f32s — the digest still compares the exact (f32, f32).
+        Some(pack_unit_position(u.position, map_size))
     } else {
         None
     };
@@ -298,7 +308,9 @@ pub(crate) fn build_unit_update(prev: &UnitState, u: &UnitState, is_cold: bool) 
             u.equipment.iter().map(|e| e.count as u64).sum(),
         ) {
         if u.equipment != prev.equipment {
-            Some(u.equipment.clone())
+            // I3: per-slot COUNTS only, in `UnitState.equipment` slot order —
+            // slot names/costs stay in the once-per-lifetime full state.
+            Some(u.equipment.iter().map(|e| e.count).collect())
         } else {
             None
         }
@@ -443,6 +455,9 @@ pub(crate) fn compute_shared_deltas(
     // caller (`count_units_by_owner`) — one map per tick shared with the
     // active-player check instead of two.
     current_units_by_owner: HashMap<String, u32>,
+    // I3: map (width, height) in cells — the packed-position quantization
+    // scale (see `build_unit_update`).
+    map_size: (u32, u32),
 ) -> SharedDeltas {
     // I2b: on a cold tick the digest is full (cold fields compared and
     // emitted exactly as pre-I2b); on a hot tick cold fields only emit when
@@ -488,7 +503,7 @@ pub(crate) fn compute_shared_deltas(
             let curr_digest = UnitStateDigest::from_unit(u, men_step, is_cold);
             let prev_digest = UnitStateDigest::from_unit(prev, men_step, is_cold);
             if curr_digest != prev_digest {
-                unit_updates.push(build_unit_update(prev, u, is_cold));
+                unit_updates.push(build_unit_update(prev, u, is_cold, map_size));
             }
         }
     }
@@ -1228,6 +1243,10 @@ pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameS
 
 #[cfg(test)]
 mod tests {
+
+    /// I3: the packed-position quantization map for delta tests
+    /// (any positive dims work; positions are cell coords).
+    const TEST_MAP: (u32, u32) = (1000, 1000);
     use super::*;
 
     fn unit(id: &str, owner: &str, x: f32, y: f32) -> UnitState {
@@ -1298,6 +1317,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
         build_delta_inner(prev_funds, None, all_funds, &None, 0, player_id, &shared).map(|(m, _)| m)
     }
@@ -1347,7 +1367,10 @@ mod tests {
         let d = as_delta(msg);
         assert_eq!(d.unit_updates.len(), 1);
         assert_eq!(d.unit_updates[0].id, "u1");
-        assert_eq!(d.unit_updates[0].position, Some((3.0, 2.0)));
+        assert_eq!(
+            d.unit_updates[0].position,
+            Some(pack_unit_position((3.0, 2.0), TEST_MAP))
+        );
         assert!(d.units_added.is_empty());
         assert!(d.units_removed.is_empty());
     }
@@ -1371,7 +1394,10 @@ mod tests {
         assert_eq!(d.player.player_id, "");
         assert_eq!(d.unit_updates.len(), 1);
         assert_eq!(d.unit_updates[0].id, "u1");
-        assert_eq!(d.unit_updates[0].position, Some((3.0, 2.0)));
+        assert_eq!(
+            d.unit_updates[0].position,
+            Some(pack_unit_position((3.0, 2.0), TEST_MAP))
+        );
     }
 
     #[test]
@@ -1470,6 +1496,7 @@ mod tests {
             5.0,
             1000,
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
         let msg = build_delta_inner(
             &pf,
@@ -1516,6 +1543,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
         assert!(
             Arc::ptr_eq(shared.border_grid_diff.as_ref().unwrap(), &curr_border),
@@ -1618,6 +1646,7 @@ mod tests {
             5.0,
             1000,
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
 
         // Player A: vision changed from None to Some(vision_a) -> diff present
@@ -1673,6 +1702,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         // Brute-force counts for the CURRENT set.
@@ -1752,6 +1782,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         // Since the quantized digests are equal, no unit_updates should be produced
@@ -1783,6 +1814,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         // Digests differ → one unit update should be produced
@@ -1825,6 +1857,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         // Same 5-item bin → no unit_updates should be produced
@@ -1864,16 +1897,115 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
         assert_eq!(shared.unit_updates[0].id, "u1");
-        // The update carries the exact (unquantized) equipment
-        let eq = shared.unit_updates[0]
+        // I3: the update carries the exact (unquantized) per-slot counts.
+        assert_eq!(
+            shared.unit_updates[0].equipment.as_deref(),
+            Some([105u32].as_slice())
+        );
+    }
+
+    /// I3: slot-order invariant — an equipment update's count vector has the
+    /// SAME length as the full state's slot list and each count aligns with
+    /// its slot (order = `UnitState.equipment` order). The client maps counts
+    /// onto the full-state slot table by index, so a length or order drift
+    /// would silently assign counts to the wrong slot.
+    #[test]
+    fn equipment_update_slot_order_invariant() {
+        // Three slots with distinct names in a specific order; two counts
+        // change in a non-monotonic way so any ordering bug is visible.
+        let slots = [
+            ("rifle_alpha", 100u32, 1.5f32),
+            ("cannon_bravo", 40, 12.0),
+            ("medkit_charlie", 7, 0.5),
+        ];
+        let make_unit = |counts: [u32; 3]| {
+            let mut u = unit("u1", "a", 1.0, 2.0);
+            u.equipment = slots
+                .iter()
+                .enumerate()
+                .map(
+                    |(i, (name, _, cost))| crate::server::protocol::EquipmentState {
+                        name: (*name).to_string(),
+                        count: counts[i],
+                        cost_per_item: *cost,
+                    },
+                )
+                .collect();
+            u
+        };
+
+        let prev = make_unit([100, 40, 7]);
+        let curr = make_unit([95, 44, 3]); // slot 0 & 1 change, slot 2 untouched
+
+        let upd = build_unit_update(&prev, &curr, true, TEST_MAP); // cold tick
+        let counts = upd
             .equipment
             .as_ref()
-            .expect("equipment present");
-        assert_eq!(eq[0].count, 105);
+            .expect("equipment changed → counts present");
+        assert_eq!(
+            counts.len(),
+            curr.equipment.len(),
+            "update length == full-state length"
+        );
+        for (i, slot) in curr.equipment.iter().enumerate() {
+            assert_eq!(
+                counts[i], slot.count,
+                "slot {i} count aligned with full state"
+            );
+        }
+        assert_eq!(counts.as_slice(), [95u32, 44, 3]);
+
+        // Wire roundtrip through the shared-delta path: the counts survive
+        // encode/decode with their slot order intact.
+        let pu = units_map(&[prev]);
+        let cu = vec![curr];
+        let ids: HashSet<&str> = cu.iter().map(|u| u.id.as_str()).collect();
+        let shared = compute_shared_deltas(
+            &pu,
+            &HashMap::new(),
+            &cu,
+            &[],
+            &ids,
+            None,
+            &None,
+            5.0,
+            1000,
+            count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
+        );
+        assert_eq!(shared.unit_updates.len(), 1);
+        let encoded = crate::server::protocol::encode_message(&ServerMessage::DeltaState(
+            crate::server::protocol::GameDeltaMessage {
+                vision_grid_diff: None,
+                vision_cells_changed: None,
+                border_grid_diff: None,
+                border_cells_changed: None,
+                grid_width: None,
+                units_added: shared.units_added.clone(),
+                units_removed: shared.units_removed.clone(),
+                unit_updates: shared.unit_updates.clone(),
+                city_updates: shared.city_updates.clone(),
+                player: crate::server::protocol::PlayerState {
+                    funds: 0,
+                    units_owned: 0,
+                    player_id: "a".to_string(),
+                },
+            },
+        ));
+        let decoded: ServerMessage = ciborium::from_reader(encoded.as_slice()).unwrap();
+        if let ServerMessage::DeltaState(d) = decoded {
+            assert_eq!(
+                d.unit_updates[0].equipment.as_deref(),
+                Some([95u32, 44, 3].as_slice())
+            );
+        } else {
+            panic!("Expected DeltaState");
+        }
     }
 
     // ---- I2b: cold-field gate pure-fn tests ----
@@ -1966,10 +2098,11 @@ mod tests {
             5.0,
             11,
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
         assert_eq!(shared.unit_updates.len(), 1);
         let upd = &shared.unit_updates[0];
-        assert_eq!(upd.position, Some((2.0, 2.0)));
+        assert_eq!(upd.position, Some(pack_unit_position((2.0, 2.0), TEST_MAP)));
         assert!(
             upd.equipment.is_none(),
             "1-item wear must not emit equipment"
@@ -1999,6 +2132,7 @@ mod tests {
             5.0,
             20,
             count_units_by_owner(cu2.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
         // No hot change and no cold change vs prev2 → no update at all on a
         // cold tick either (digest equality).
@@ -2017,10 +2151,14 @@ mod tests {
             5.0,
             20,
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
         assert_eq!(shared3.unit_updates.len(), 1);
         let upd3 = &shared3.unit_updates[0];
-        assert_eq!(upd3.position, Some((2.0, 2.0)));
+        assert_eq!(
+            upd3.position,
+            Some(pack_unit_position((2.0, 2.0), TEST_MAP))
+        );
         assert!(upd3.equipment.is_some(), "cold tick carries equipment");
         assert!(upd3.path.is_some(), "cold tick carries path");
         assert_eq!(upd3.supply_percent, Some(56.0), "cold tick carries supply");
@@ -2050,6 +2188,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -2079,6 +2218,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -2110,6 +2250,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -2139,6 +2280,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -2172,6 +2314,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert!(shared.unit_updates.is_empty());
@@ -2203,6 +2346,7 @@ mod tests {
             5.0,
             1000, // I2b: cold tick — full digest (pre-I2b behavior)
             count_units_by_owner(cu.iter().map(|u| u.owner.as_str())),
+            TEST_MAP,
         );
 
         assert_eq!(shared.unit_updates.len(), 1);
@@ -2267,6 +2411,7 @@ mod tests {
             5.0,
             1000,
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
         assert!(at.border_grid_diff.is_none(), "5% must ship sparse");
         let cells = at.border_cells_changed.as_ref().unwrap();
@@ -2287,6 +2432,7 @@ mod tests {
             5.0,
             1000,
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
         assert!(over.border_cells_changed.is_none(), ">5% must ship full");
         assert!(over.border_grid_diff.is_some());
@@ -2304,6 +2450,7 @@ mod tests {
             5.0,
             1000,
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
         assert!(none.border_grid_diff.is_none());
         assert!(none.border_cells_changed.is_none());
@@ -2346,6 +2493,7 @@ mod tests {
             5.0,
             1000,
             count_units_by_owner(std::iter::empty::<&str>()),
+            TEST_MAP,
         );
         assert_eq!(
             shared.border_cells_changed.as_ref().map(|c| c.len()),

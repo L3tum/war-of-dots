@@ -2,10 +2,13 @@ import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
+  // Global ignores (their own object): generated code is out of lint scope
+  // entirely — otherwise the json2ts `/* eslint-disable */` banner reports as
+  // an unused directive on every regen.
+  { ignores: ["dist/**", "node_modules/**", "src/generated/**"] },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    ignores: ["dist/**", "node_modules/**", "src/generated/**"],
     languageOptions: {
       globals: {
         document: "readonly",

@@ -2,7 +2,12 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { decode, encode } from 'cbor-x';
-import { applyCells } from './connection';
+import {
+  applyCells,
+  applyEquipmentCounts,
+  mapSizeFromTerrain,
+  unpackUnitPosition,
+} from './connection';
 
 /** Recursively remove `undefined` values from plain objects and arrays. */
 function stripUndefined(value: unknown): unknown {
@@ -22,7 +27,7 @@ describe('I4 sparse changed-cell apply (applyCells)', () => {
     // 4×4 grid: 16 cells → bits = ceil(log2(16)) = 4.
     const vision: boolean[][] = Array.from({ length: 4 }, () => Array(4).fill(true));
     // idx 2 → 1 (already 1), idx 7 and 15 → 0 (1→0 flips must be applied).
-    const cells = [(1 << 4) | 2, 0 << 4, 0 << 4 | 7, 0 << 4 | 15];
+    const cells = [(1 << 4) | 2, 0 << 4, (0 << 4) | 7, (0 << 4) | 15];
     expect(applyCells(vision, cells, 4, true)).toBe(true);
     expect(vision[0][2]).toBe(true);
     expect(vision[1][3]).toBe(false);
@@ -33,7 +38,7 @@ describe('I4 sparse changed-cell apply (applyCells)', () => {
   it('applies border values including 255 (ownerless) at arbitrary indices', () => {
     // 3×5 grid: 15 cells → bits = ceil(log2(15)) = 4 (not a power of two).
     const border: number[][] = Array.from({ length: 3 }, () => Array(5).fill(0));
-    expect(applyCells(border, [255 << 4 | 4, 2 << 4 | 9], 5, false)).toBe(true);
+    expect(applyCells(border, [(255 << 4) | 4, (2 << 4) | 9], 5, false)).toBe(true);
     expect(border[0][4]).toBe(255);
     expect(border[1][4]).toBe(2);
     expect(border[2][2]).toBe(0);
@@ -73,6 +78,77 @@ describe('I4 sparse changed-cell apply (applyCells)', () => {
 
   it('refuses to apply without a baseline grid', () => {
     expect(applyCells([], [1], 4, true)).toBe(false);
+  });
+});
+
+describe('I3 packed unit position + equipment counts (connection decode)', () => {
+  it('unpacks a packed position to cell coords within one quantization step', () => {
+    // Mirror of the server's `pack_unit_position`: x_q = round(x*65536/w),
+    // y_q = round(y*65536/h), packed = (x_q<<16)|y_q.
+    const pack = (x: number, y: number, w: number, h: number) => {
+      const xq = Math.round((x * 65536) / w);
+      const yq = Math.round((y * 65536) / h);
+      return ((xq << 16) | yq) >>> 0;
+    };
+    const map = { width: 1000, height: 1000 };
+    const halfStep = 0.5 * (1000 / 65536);
+    for (const [x, y] of [
+      [0, 0],
+      [3.5, 4.25],
+      [999.123, 500.5],
+      [0.00001, 0.99999],
+    ]) {
+      const { x: dx, y: dy } = unpackUnitPosition(pack(x, y, 1000, 1000), map);
+      expect(Math.abs(dx - x)).toBeLessThanOrEqual(halfStep);
+      expect(Math.abs(dy - y)).toBeLessThanOrEqual(halfStep);
+    }
+    // Exact for whole-cell coords on a power-of-two map.
+    const exact = unpackUnitPosition(pack(11, 20, 32, 32), { width: 32, height: 32 });
+    expect(exact).toEqual({ x: 11, y: 20 });
+  });
+
+  it('decodes packed position 0 (the origin) to (0,0) — not skipped as falsy', () => {
+    expect(unpackUnitPosition(0, { width: 1000, height: 1000 })).toEqual({ x: 0, y: 0 });
+  });
+
+  it('decodes the max packed value to the map edge (clamped by the u16 range)', () => {
+    const w = 1000;
+    const h = 1000;
+    const { x, y } = unpackUnitPosition(0xffffffff, { width: w, height: h });
+    expect(Math.abs(x - w + w / 65536)).toBeLessThan(1e-6);
+    expect(Math.abs(y - h + h / 65536)).toBeLessThan(1e-6);
+  });
+
+  it('mapSizeFromTerrain derives cells from the 2-D grid, null when empty', () => {
+    const grid: unknown[][] = Array.from({ length: 10 }, () => Array(20).fill('plains'));
+    expect(mapSizeFromTerrain(grid)).toEqual({ width: 20, height: 10 });
+    expect(mapSizeFromTerrain([])).toBeNull();
+    expect(mapSizeFromTerrain([[]])).toBeNull();
+  });
+
+  it('applies equipment counts against the full-state slot table, preserving names/costs', () => {
+    const unit = {
+      equipment: [
+        { name: 'rifle', cost_per_item: 2, count: 100 },
+        { name: 'cannon', cost_per_item: 7, count: 40 },
+        { name: 'medkit', cost_per_item: 5, count: 10 },
+      ],
+    };
+    // Slot order == UnitState.equipment order: index i is slot i.
+    expect(applyEquipmentCounts(unit, [105, 0, 7])).toBe(true);
+    expect(unit.equipment).toEqual([
+      { name: 'rifle', cost_per_item: 2, count: 105 },
+      { name: 'cannon', cost_per_item: 7, count: 0 },
+      { name: 'medkit', cost_per_item: 5, count: 7 },
+    ]);
+  });
+
+  it('refuses a counts update whose length mismatches the slot table (no corruption)', () => {
+    const unit = {
+      equipment: [{ name: 'rifle', cost_per_item: 2, count: 100 }],
+    };
+    expect(applyEquipmentCounts(unit, [1, 2, 3])).toBe(false);
+    expect(unit.equipment).toEqual([{ name: 'rifle', cost_per_item: 2, count: 100 }]);
   });
 });
 
