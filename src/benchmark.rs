@@ -1730,7 +1730,7 @@ pub fn run_benchmark_json(config: BenchmarkConfig) -> serde_json::Value {
 }
 
 /// Generate a self-contained HTML report from benchmark results.
-pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>) -> String {
+pub fn generate_html_report(results: &BenchmarkResults, prev_path: Option<&str>) -> String {
     let tick_count = results.config.ticks;
     // Total ticks per run including warmup (for the "% of Ticks" denominator).
     let total_ticks_with_warmup = tick_count + BENCH_WARMUP_TICKS;
@@ -1815,10 +1815,10 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
     // Parse previous report for comparison (per-system objects + latency metrics).
     // `prev_timings` now maps system name -> the full per-system object so the
     // report can show per-column deltas (total/avg/calls/p50/p90/p99).
-    let (prev_timings, prev_json) = prev_html
+    let (prev_timings, prev_json) = prev_path
         .map(parse_previous_report)
         .unwrap_or((std::collections::HashMap::new(), serde_json::Value::Null));
-    let comparison_note = match prev_html {
+    let comparison_note = match prev_path {
         Some(p) => format!(
             "<p class='note'>📊 Comparison with: <b>{}</b> — 🟢 = faster/less, 🔴 = slower/more. Deltas appear under each value; comparisons are only meaningful if the previous run used the same ticks/units.</p>",
             p
@@ -2564,7 +2564,7 @@ pub fn generate_html_report(results: &BenchmarkResults, prev_html: Option<&str>)
             .join(", "),
         _ => "—".to_string(),
     };
-    let bench_prev_str: String = match prev_html {
+    let bench_prev_str: String = match prev_path {
         Some(p) => p.to_string(),
         None => "— (no --bench-prev)".to_string(),
     };

@@ -238,9 +238,12 @@ fn stress_benchmark_i2a() {
     let s = &results.summary;
 
     if let Ok(()) = std::fs::create_dir_all("reports") {
-        let prev = std::fs::read("reports/stress_base_r3.html").ok();
-        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
-        let html = war_of_dots::benchmark::generate_html_report(&results, prev_html.as_deref());
+        // generate_html_report expects the PREV REPORT PATH (it reads +
+        // parses the file itself), not the file content.
+        let prev = std::path::Path::new("reports/stress_base_r3.html")
+            .exists()
+            .then_some("reports/stress_base_r3.html");
+        let html = war_of_dots::benchmark::generate_html_report(&results, prev);
         let _ = std::fs::write("reports/stress_i2a.html", html);
     }
 
@@ -296,9 +299,11 @@ fn stress_benchmark_i2b() {
     let s = &results.summary;
 
     if let Ok(()) = std::fs::create_dir_all("reports") {
-        let prev = std::fs::read("reports/stress_i2a.html").ok();
-        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
-        let html = war_of_dots::benchmark::generate_html_report(&results, prev_html.as_deref());
+        // Path, not content — see stress_i2a test above.
+        let prev = std::path::Path::new("reports/stress_i2a.html")
+            .exists()
+            .then_some("reports/stress_i2a.html");
+        let html = war_of_dots::benchmark::generate_html_report(&results, prev);
         let _ = std::fs::write("reports/stress_i2b.html", html);
     }
 
@@ -358,9 +363,11 @@ fn stress_benchmark_i5() {
     let s = &results.summary;
 
     if let Ok(()) = std::fs::create_dir_all("reports") {
-        let prev = std::fs::read("reports/stress_i2b.html").ok();
-        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
-        let html = war_of_dots::benchmark::generate_html_report(&results, prev_html.as_deref());
+        // Path, not content — see stress_i2a test above.
+        let prev = std::path::Path::new("reports/stress_i2b.html")
+            .exists()
+            .then_some("reports/stress_i2b.html");
+        let html = war_of_dots::benchmark::generate_html_report(&results, prev);
         let _ = std::fs::write("reports/stress_i5.html", html);
     }
 
@@ -419,9 +426,14 @@ fn round4_config(bench_spectator: bool) -> BenchmarkConfig {
 
 fn round4_report(results: &war_of_dots::benchmark::BenchmarkResults, out: &str, prev: &str) {
     if let Ok(()) = std::fs::create_dir_all("reports") {
-        let prev = std::fs::read(format!("reports/{prev}")).ok();
-        let prev_html = prev.as_ref().map(|p| String::from_utf8_lossy(p));
-        let html = war_of_dots::benchmark::generate_html_report(results, prev_html.as_deref());
+        // Pass the prev report PATH (generate_html_report reads + parses the
+        // file itself); passing the content made every prev-delta silently
+        // vanish with a spurious "File name too long" read error.
+        let prev_path = format!("reports/{prev}");
+        let prev = std::path::Path::new(&prev_path)
+            .exists()
+            .then_some(prev_path.as_str());
+        let html = war_of_dots::benchmark::generate_html_report(results, prev);
         let _ = std::fs::write(format!("reports/{out}"), html);
         // JSON sidecar: the authoritative source for A/B numbers (the HTML
         // embeds the whole report-history chain, making the current section
