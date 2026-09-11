@@ -125,8 +125,7 @@ frontend-test:
 # No-server WebGPU E2E (Layer 2): builds dist, stages the committed replay
 # fixture at dist/replays/, serves it statically, and runs the Playwright suite
 # under xvfb-run with the Dawn/SwiftShader software GPU (CPU — no GPU hardware
-# needed). Skips gracefully (exit 0) when xvfb-run / Chromium / @playwright/test
-# are absent, so `make all` and CI stay green without them. Deliberately NOT in
-# the default `all` path.
+# needed). Skips with exit 77 (standard "skip" code) when xvfb-run / Chromium /
+# @playwright/test are absent. Deliberately NOT in the default `all` path.
 frontend-e2e:
 	bash $(FE)/e2e/run_e2e.sh

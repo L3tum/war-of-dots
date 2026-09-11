@@ -2103,6 +2103,156 @@ mod tests {
         assert_eq!(delta.player.player_id, "player_0");
     }
 
+    // ---------------------------------------------------------------------------
+    // Golden-CBOR contract fixture #2 — FullState
+    //
+    // `tests/fixtures/protocol_fullstate_golden.bin` is one canonical
+    // `ServerMessage::FullState`, mirroring the delta fixture. Every float in
+    // it is a WHOLE number (1000.0, 100.0, 10.0, 20.0) on purpose: cbor-x
+    // encodes those as CBOR integers, so the fixture byte-locks the
+    // `float_deser` acceptance path on the full-state (units_added) payload
+    // too — not just on the delta path. `cost_per_item: 2.5` stays
+    // non-whole as the control that real floats still go out as f64.
+    //
+    // Regenerate after an intentional protocol change:
+    //   cargo test --lib dump_protocol_fullstate_golden -- --ignored
+    // ---------------------------------------------------------------------------
+
+    fn golden_full_state() -> ServerMessage {
+        ServerMessage::FullState(GameStateMessage {
+            vision_grid: Some(vec![vec![true, true], vec![true, false]]),
+            border_grid: Some(vec![vec![0, 1], vec![2, 255]]),
+            terrain: vec![vec!["Plains".to_string(), "Forest".to_string()]; 2],
+            units: vec![
+                UnitState {
+                    id: "u1".to_string(),
+                    owner: "player_0".to_string(),
+                    position: (10.0, 20.0),
+                    unit_type: "infantry".to_string(),
+                    symbol: "I".to_string(),
+                    men: 1000.0,
+                    max_men: 1000.0,
+                    organisation: 100.0,
+                    equipment: vec![EquipmentState {
+                        name: "rifle".to_string(),
+                        count: 100,
+                        cost_per_item: 2.5,
+                    }],
+                    max_equipment: vec![EquipmentState {
+                        name: "rifle".to_string(),
+                        count: 100,
+                        cost_per_item: 2.5,
+                    }],
+                    path: vec![],
+                    healing: false,
+                    resupply_enabled: true,
+                    supply_percent: 100.0,
+                    encircled: false,
+                    attacking: false,
+                    on_water: false,
+                    boat_supply_percent: 0.0,
+                    embarking: false,
+                    disembarking: false,
+                },
+                UnitState {
+                    id: "u2".to_string(),
+                    owner: "player_1".to_string(),
+                    position: (5.0, 7.0),
+                    unit_type: "cavalry".to_string(),
+                    symbol: "C".to_string(),
+                    men: 800.0,
+                    max_men: 1000.0,
+                    organisation: 50.0,
+                    equipment: vec![],
+                    max_equipment: vec![],
+                    path: vec![],
+                    healing: true,
+                    resupply_enabled: false,
+                    supply_percent: 25.0,
+                    encircled: true,
+                    attacking: true,
+                    on_water: true,
+                    boat_supply_percent: 60.0,
+                    embarking: false,
+                    disembarking: false,
+                },
+            ],
+            cities: vec![CityState {
+                id: "c1".to_string(),
+                position: (3.0, 4.0),
+                level: 2,
+                manpower: 5000,
+                owner: Some("player_0".to_string()),
+            }],
+            player: PlayerState {
+                funds: 1000,
+                units_owned: 2,
+                player_id: "player_0".to_string(),
+            },
+        })
+    }
+
+    #[test]
+    #[ignore = "regenerate protocol_fullstate_golden.bin: cargo test --lib dump_protocol_fullstate_golden -- --ignored"]
+    fn dump_protocol_fullstate_golden() {
+        let bytes = to_cbor_bytes(&golden_full_state());
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(dir).join("protocol_fullstate_golden.bin"),
+            &bytes,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn protocol_fullstate_golden_contract() {
+        let golden: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/protocol_fullstate_golden.bin"
+        ));
+        // Byte-lock: ciborium's serialization is deterministic, so re-encoding
+        // the canonical message must reproduce the committed fixture exactly.
+        assert_eq!(
+            to_cbor_bytes(&golden_full_state()),
+            golden,
+            "protocol_fullstate_golden.bin is stale — regenerate: \n             cargo test --lib dump_protocol_fullstate_golden -- --ignored"
+        );
+        // Decode with plain ciborium and check the fields the frontend locks
+        // in `protocol_fullstate_golden.test.ts`. The all-whole floats are the
+        // float_deser acceptance check on the FullState payload.
+        let decoded: ServerMessage = ciborium::from_reader(golden).unwrap();
+        let ServerMessage::FullState(state) = decoded else {
+            panic!("expected FullState in golden fixture");
+        };
+        assert_eq!(state.terrain, vec![vec!["Plains".to_string(), "Forest".to_string()]; 2]);
+        assert_eq!(
+            state.vision_grid.as_deref(),
+            Some(&[vec![true, true], vec![true, false]][..])
+        );
+        assert_eq!(
+            state.border_grid.as_deref(),
+            Some(&[vec![0u32, 1], vec![2, 255]][..])
+        );
+        assert_eq!(state.units.len(), 2);
+        let (u1, u2) = (&state.units[0], &state.units[1]);
+        assert_eq!(u1.id, "u1");
+        assert_eq!(u1.position, (10.0, 20.0));
+        assert_eq!(u1.men, 1000.0);
+        assert_eq!(u1.equipment[0].cost_per_item, 2.5);
+        assert_eq!(u2.id, "u2");
+        assert!(u2.on_water);
+        assert_eq!(u2.boat_supply_percent, 60.0);
+        assert!(u2.encircled);
+        assert_eq!(state.cities[0].id, "c1");
+        assert_eq!(state.cities[0].position, (3.0, 4.0));
+        assert_eq!(state.cities[0].manpower, 5000);
+        assert_eq!(state.player.funds, 1000);
+        assert_eq!(state.player.units_owned, 2);
+        assert_eq!(state.player.player_id, "player_0");
+    }
+
     #[test]
     fn float_deser_accepts_cbor_x_integer_form_of_whole_floats() {
         // cbor-x (frontend) encodes a JS whole-number float — e.g.
@@ -2122,7 +2272,7 @@ mod tests {
             v: f32,
         }
         assert!(
-            ciborium::from_reader::<PlainF32, _>(&cbor_x_whole_float[..]).is_err(),
+            ciborium::from_reader::<PlainF32, _>(cbor_x_whole_float).is_err(),
             "plain ciborium must reject a CBOR integer for an f32 field — \
              that asymmetry is what float_deser exists for"
         );
@@ -2131,7 +2281,7 @@ mod tests {
             #[serde(deserialize_with = "float_deser::deserialize_f32")]
             v: f32,
         }
-        let w: WrapperF32 = ciborium::from_reader(&cbor_x_whole_float[..]).unwrap();
+        let w: WrapperF32 = ciborium::from_reader(cbor_x_whole_float).unwrap();
         assert_eq!(w.v, 1000.0);
 
         #[derive(Deserialize)]
@@ -2139,7 +2289,7 @@ mod tests {
             #[serde(deserialize_with = "float_deser::deserialize_f64")]
             v: f64,
         }
-        let w64: WrapperF64 = ciborium::from_reader(&cbor_x_whole_float[..]).unwrap();
+        let w64: WrapperF64 = ciborium::from_reader(cbor_x_whole_float).unwrap();
         assert_eq!(w64.v, 1000.0);
     }
 

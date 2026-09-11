@@ -10,6 +10,7 @@ import {
   FakeGPUDevice,
   FakeGPURenderPassEncoder,
   Fake2DContext,
+  FakeOffscreenCanvas,
   type FakeGPUBuffer,
   type WriteBufferCall,
 } from '../test/fake_gpu';
@@ -106,6 +107,7 @@ interface Harness {
   renderer: Renderer;
   device: FakeGPUDevice;
   canvas: HTMLCanvasElement;
+  unknownGpuCalls: string[];
 }
 
 /**
@@ -114,11 +116,11 @@ interface Harness {
  * so the pixel size is restored AFTER construction.
  */
 function makeRenderer(width = 1280, height = 720): Harness {
-  const { device, canvas } = createFakeGpu(width, height);
+  const { device, canvas, unknownGpuCalls } = createFakeGpu(width, height);
   const renderer = new Renderer(canvas, device as unknown as GPUDevice);
   canvas.width = width;
   canvas.height = height;
-  return { renderer, device, canvas };
+  return { renderer, device, canvas, unknownGpuCalls };
 }
 
 /** Private buffer fields the assertions read. */
@@ -338,6 +340,20 @@ describe('Renderer geometry payloads (recorded writeBuffer)', () => {
     harness.renderer.camera = { ...CAM };
     return harness;
   }
+
+  it('only ever calls WebGPU/2D methods the fake implements (no silent no-ops)', () => {
+    const harness = setup();
+    harness.renderer.render(makeGameState());
+    // The device proxy + symbol-canvas 2D proxy record any call to a method
+    // the fakes don't implement; a non-empty list means the renderer started
+    // using an un-faked API and the suite would otherwise stay green.
+    expect(harness.unknownGpuCalls, `un-faked device calls: ${harness.unknownGpuCalls}`).toEqual(
+      [],
+    );
+    const symbolCanvas = (harness.renderer as unknown as { symbolCanvas: FakeOffscreenCanvas })
+      .symbolCanvas;
+    expect(symbolCanvas.unknown2dCalls, 'un-faked 2d context calls').toEqual([]);
+  });
 
   it('terrain buffer carries the marchingSquares mesh verbatim', () => {
     const { renderer, device } = setup();
@@ -806,6 +822,17 @@ describe('renderFrame draw sequence', () => {
       [symbol, renderer.unitVertexCount],
       [fog, 4],
     ]);
+
+    // The recorded vertex-buffer / bind-group bindings (previously captured but
+    // never asserted) form a net against the "section binds nothing / wrong
+    // buffer" regression class. The symbol section is the regression-prone one
+    // (a missing bind = invisible glyphs), so assert its real buffers were
+    // bound AND a slot-1 bind group (the symbol texture attachment) was set.
+    const b = buffersOf(renderer);
+    const boundBuffers = pass.vertexBuffers.map((v) => v.buffer);
+    expect(boundBuffers).toContain(b.symbolPositionBuffer);
+    expect(boundBuffers).toContain(b.symbolColorBuffer);
+    expect(pass.bindGroups.some((g) => g.index === 1)).toBe(true);
   });
 });
 

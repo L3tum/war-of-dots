@@ -6,20 +6,26 @@
 # Playwright suite under xvfb-run with the Dawn/SwiftShader software GPU (CPU
 # rendering — no GPU hardware required).
 #
-# Skips gracefully (exit 0) when a required tool is absent so `make all` and
-# CI stay green without them.
+# Skips (exit 77 — the TAP/xunit standard "skip" code, so a missing-tools
+# environment is distinguishable from a green run) when a required tool is
+# absent. Deliberately NOT part of the default `make all` path.
 set -u
 
 FE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "$FE_DIR/.." && pwd)"
 
-skip() { echo "SKIP frontend-e2e: $1"; exit 0; }
+skip() { echo "SKIP frontend-e2e: $1"; exit 77; }
 
 command -v xvfb-run >/dev/null 2>&1 || skip "xvfb-run not found (e.g. apt-get install xvfb)"
 command -v python3 >/dev/null 2>&1 || skip "python3 not found (needed for the static file server)"
 [ -d "$FE_DIR/node_modules/@playwright/test" ] || skip "@playwright/test not installed (cd frontend && npm install)"
-ls "$HOME/.cache/ms-playwright" 2>/dev/null | grep -qE '^chromium-[0-9]+$' \
-  || skip "Playwright Chromium not found (cd frontend && npx playwright install chromium)"
+# Gate on the ACTUAL chromium binary (not just the chromium-* directory): the
+# Playwright config drives this exact path via launchOptions.executablePath.
+CHROME_BIN=""
+for d in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome; do
+  [ -x "$d" ] && CHROME_BIN="$d" && break
+done
+[ -n "$CHROME_BIN" ] || skip "Playwright Chromium not found (cd frontend && npx playwright install chromium)"
 
 echo "==> Building frontend bundle"
 # Fail hard on build errors: with no `set -e`, a broken build would otherwise
@@ -45,9 +51,13 @@ fi
 URL="http://127.0.0.1:${PORT}"
 
 echo "==> Serving $FE_DIR/dist at $URL"
-python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$FE_DIR/dist" >/tmp/webgpu_e2e_http.log 2>&1 &
+HTTP_LOG="$(mktemp)"
+python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$FE_DIR/dist" >"$HTTP_LOG" 2>&1 &
 SERVER_PID=$!
-cleanup() { kill "$SERVER_PID" >/dev/null 2>&1 || true; }
+cleanup() {
+  kill "$SERVER_PID" >/dev/null 2>&1 || true
+  rm -f "$HTTP_LOG"
+}
 trap cleanup EXIT
 
 # Wait for the static server to accept connections.
@@ -60,5 +70,6 @@ done
 
 echo "==> Running Playwright (headless:false under xvfb-run, SwiftShader CPU rendering)"
 cd "$FE_DIR"
+# The exit status of the suite is this script's exit status — do NOT swallow it
+# with `exit $?` (redundant, and fragile if a line is inserted below).
 WEBGPU_E2E_URL="$URL" xvfb-run -a npx playwright test --config playwright.config.ts
-exit $?

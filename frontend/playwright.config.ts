@@ -30,6 +30,11 @@ function cachedChromium(): string | undefined {
     const exe = path.join(root, c, 'chrome-linux64', 'chrome');
     if (fs.existsSync(exe)) return exe;
   }
+  console.warn(
+    '[playwright.config] No cached Playwright Chromium found under ~/.cache/ms-playwright — ' +
+      'falling back to the version-matched browser from node_modules (it may trigger a ' +
+      'download, and the run_e2e.sh skip-gate will exit 77 if it is absent).',
+  );
   return undefined;
 }
 

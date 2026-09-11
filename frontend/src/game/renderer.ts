@@ -80,6 +80,10 @@ export class Renderer {
 
   // Last render/validation error — surfaced via the debug overlay when active
   lastRenderError: string | null = null;
+  // Number of frames that completed a full render pass (submit reached the
+  // queue). Test hook for the E2E settle: polling this is stronger than a
+  // fixed timeout, which could elapse with zero frames rendered.
+  framesRendered = 0;
 
   // Fog overlay buffers (static fullscreen quad, created once)
   private fogPositionsBuffer: GPUBuffer;
@@ -921,6 +925,7 @@ export class Renderer {
 
       renderPass.end();
       this.device.queue.submit([commandEncoder.finish()]);
+      this.framesRendered++;
     } catch (err) {
       // Record the error so the debug overlay can surface it (instead of a silent blank frame).
       this.lastRenderError = err instanceof Error ? err.message : String(err);

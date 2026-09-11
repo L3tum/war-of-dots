@@ -36,6 +36,13 @@ export class ReplayPlayer {
   }
 
   async loadReplay(file: string): Promise<void> {
+    // `file` comes from the URL query (?replay=...) and is appended to a
+    // relative fetch path — restrict it to a plain basename (no path separator,
+    // ends in .jsonl) so the query param can't be used to fetch arbitrary files
+    // from the static server (e.g. ?replay=../secrets.jsonl).
+    if (!/^[A-Za-z0-9._-]+\.jsonl$/.test(file) || file.length > 128) {
+      throw new Error(`Invalid replay file name: ${file}`);
+    }
     try {
       const response = await fetch(`replays/${file}`);
       if (!response.ok) {
@@ -92,6 +99,15 @@ export class ReplayPlayer {
    */
   get renderError(): string | null {
     return this.renderer?.lastRenderError ?? null;
+  }
+
+  /**
+   * Test hook (frontend/e2e/webgpu.spec.ts): frames completed by the active
+   * renderer. Lets the E2E settle poll for real rendered frames instead of a
+   * fixed timeout that could elapse with zero frames drawn.
+   */
+  get framesRendered(): number {
+    return this.renderer?.framesRendered ?? 0;
   }
 
   private applyEvent(event: GameEvent): void {

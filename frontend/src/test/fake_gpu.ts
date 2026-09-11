@@ -257,6 +257,8 @@ export class FakeOffscreenCanvas {
   width: number;
   height: number;
   private ctx: Fake2DContext;
+  /** 2D canvas-API methods the renderer called that the fake doesn't implement. */
+  unknown2dCalls: string[] = [];
   transferredBitmaps: unknown[] = [];
 
   constructor(width: number, height: number) {
@@ -265,7 +267,9 @@ export class FakeOffscreenCanvas {
     this.ctx = new Fake2DContext();
   }
   getContext(_kind: string): Fake2DContext {
-    return this.ctx;
+    // Hand back a trapping proxy so an un-faked canvas-API call in the
+    // renderer fails loudly (recorded in unknown2dCalls) instead of no-oping.
+    return trapUnknownCalls(this.ctx, this.unknown2dCalls, '2d context');
   }
   transferToImageBitmap(): {
     kind: 'fake-image-bitmap';
@@ -364,12 +368,53 @@ export interface FakeGpuHarness {
 }
 
 /**
+ * Wrap a fake in a Proxy that records and REJECTS calls to WebGPU methods the
+ * fake doesn't implement. Without this, a future Renderer change that starts
+ * calling an un-faked API would either no-op (silently green) or throw an
+ * opaque TypeError; with it the test fails loudly and the missing method is
+ * named. Existing methods/properties pass through untouched.
+ */
+export function trapUnknownCalls<T extends object>(
+  target: T,
+  unknownCalls: string[],
+  kind: string,
+): T {
+  return new Proxy(target, {
+    get(obj, prop) {
+      const val = (obj as unknown as Record<PropertyKey, unknown>)[prop];
+      if (
+        typeof val !== 'function' &&
+        typeof prop === 'string' &&
+        !(prop in obj) &&
+        prop !== 'constructor' &&
+        prop !== 'toJSON'
+      ) {
+        unknownCalls.push(`${kind}.${prop}()`);
+        throw new Error(
+          `Fake WebGPU ${kind}: method '${prop}' is not implemented — the ` +
+            `Renderer now calls it. Add a recording fake to fake_gpu.ts rather ` +
+            `than leaving this trap to fail the suite.`,
+        );
+      }
+      return val;
+    },
+  });
+}
+
+/**
  * Create a canvas + fake device + fake webgpu context wired to `canvas` for
  * `new Renderer(canvas, device)`. The canvas gets an explicit pixel size (the
  * Renderer constructor's setCanvasDimensions() would otherwise zero it under
  * happy-dom, whose getBoundingClientRect() is 0×0).
+ *
+ * `device` is proxied: if the Renderer calls a WebGPU method the fake doesn't
+ * implement, the call is recorded in `unknownGpuCalls` and throws (see
+ * trapUnknownCalls) instead of silently no-oping.
  */
-export function createFakeGpu(width = 1280, height = 720): FakeGpuHarness {
+export function createFakeGpu(
+  width = 1280,
+  height = 720,
+): FakeGpuHarness & { unknownGpuCalls: string[] } {
   setupFakeGpu();
 
   const canvas = document.createElement('canvas');
@@ -382,6 +427,8 @@ export function createFakeGpu(width = 1280, height = 720): FakeGpuHarness {
     return null;
   };
 
-  const device = new FakeGPUDevice();
-  return { device, context, canvas };
+  const rawDevice = new FakeGPUDevice();
+  const unknownGpuCalls: string[] = [];
+  const device = trapUnknownCalls(rawDevice, unknownGpuCalls, 'device');
+  return { device, context, canvas, unknownGpuCalls };
 }

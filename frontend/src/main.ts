@@ -8,6 +8,7 @@ import { Controls } from './ui/controls';
 import { Spectator } from './ui/spectator';
 import { Advisor } from './ui/advisor';
 import { UnitInfoUI } from './ui/unit_info';
+import { escapeHtml } from './ui/html';
 import { ReplayPlayer } from './replay/replay_player';
 import { SpectatorReplay } from './replay/spectator';
 import {
@@ -51,9 +52,11 @@ async function main() {
       await replay.loadReplay(replayFile);
       await replay.start();
       // Small no-server test hook (read by frontend/e2e/webgpu.spec.ts) so the
-      // replay path can assert renderer.lastRenderError without a game server.
-      (window as unknown as { __replayRenderError?: () => string | null }).__replayRenderError =
-        () => replay.renderError;
+      // replay path can assert renderer health without a game server: the last
+      // render error plus how many frames actually completed.
+      (
+        window as unknown as { __replayStats?: () => { error: string | null; frames: number } }
+      ).__replayStats = () => ({ error: replay.renderError, frames: replay.framesRendered });
     } catch (err) {
       showErrorMessage(
         `Failed to load replay: ${err instanceof Error ? err.message : 'Unknown error'}`,
@@ -454,7 +457,7 @@ function showErrorMessage(message: string) {
   overlay.innerHTML = `
     <div style="background:#1a1a2e;border:1px solid #f44;border-radius:12px;padding:32px;max-width:500px;text-align:center;">
       <h2 style="color:#f44;margin:0 0 16px;">⚠️ Error</h2>
-      <p style="color:#ccc;line-height:1.5;margin:0;">${message}</p>
+      <p style="color:#ccc;line-height:1.5;margin:0;">${escapeHtml(message)}</p>
     </div>
   `;
 }
