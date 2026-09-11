@@ -2,7 +2,8 @@
 
 import { GameState } from './game_state';
 import { marchingSquares } from './terrain';
-import { fillTerritory, TERRITORY_NONE } from './territory';
+import { fillTerritory } from './territory';
+import { detectBorderEdges, type BorderEdge } from './geometry';
 import {
   CELL_SIZE,
   UNIT_DOT_SIZE,
@@ -92,13 +93,7 @@ export class Renderer {
   // Exposed dirty flags for external marking
   public borderDirty: boolean = true;
   private displayGrid: number[][] = [];
-  private borderCacheEdges: {
-    gridX: number;
-    gridY: number;
-    dir: 'h' | 'v';
-    ownerA: number;
-    ownerB: number;
-  }[] = [];
+  private borderCacheEdges: BorderEdge[] = [];
 
   // Symbol cache — track when unit data changes
   private symbolCacheKey: string | null = null;
@@ -1049,7 +1044,8 @@ export class Renderer {
       }
 
       // Only redraw symbols on the 2D canvas when unit types/water status changed
-      if (symbolKey !== this.symbolCacheKey) {
+      const symbolChanged = symbolKey !== this.symbolCacheKey;
+      if (symbolChanged) {
         this.symbolCtx.clearRect(0, 0, SYMBOL_ATLAS_SIZE, SYMBOL_ATLAS_SIZE);
         this.symbolCacheKey = symbolKey;
       }
@@ -1135,8 +1131,11 @@ export class Renderer {
           barY -= barSpacingWorld;
         }
 
-        // Draw symbol on canvas (only when cache invalidated)
-        if (symbolKey !== this.symbolCacheKey) {
+        // Draw symbol on canvas (only when the atlas was invalidated this
+        // frame). NOTE: must be `symbolChanged`, not a re-comparison against
+        // `this.symbolCacheKey` — that key is already committed above, so the
+        // re-comparison would always be false and no glyphs would ever draw.
+        if (symbolChanged) {
           this.symbolCtx.save();
 
           // Water unit indicator: blue border/tint
@@ -1180,7 +1179,7 @@ export class Renderer {
 
       // Upload symbol texture and buffers — only upload texture when cache invalidated
       if (unitIndex > 0) {
-        if (symbolKey !== this.symbolCacheKey) {
+        if (symbolChanged) {
           const imageBitmap = this.symbolCanvas.transferToImageBitmap();
           this.device.queue.copyExternalImageToTexture(
             { source: imageBitmap },
@@ -1248,33 +1247,7 @@ export class Renderer {
             ownerIdx: gameState.colorIndexForOwner(city.owner),
           }));
           const displayGrid = fillTerritory(borderGrid, gameState.terrain, cityAnchors);
-
-          for (let y = 0; y < displayGrid.length; y++) {
-            for (let x = 0; x < displayGrid[y].length; x++) {
-              const p1 = displayGrid[y][x];
-              const p2 = x + 1 < displayGrid[y].length ? displayGrid[y][x + 1] : TERRITORY_NONE;
-              const p3 = y + 1 < displayGrid.length ? displayGrid[y + 1][x] : TERRITORY_NONE;
-              // Draw borders between two different players
-              if (p1 !== p2 && p1 !== TERRITORY_NONE && p2 !== TERRITORY_NONE) {
-                this.borderCacheEdges.push({
-                  gridX: x,
-                  gridY: y,
-                  dir: 'h' as const,
-                  ownerA: p1,
-                  ownerB: p2,
-                });
-              }
-              if (p1 !== p3 && p1 !== TERRITORY_NONE && p3 !== TERRITORY_NONE) {
-                this.borderCacheEdges.push({
-                  gridX: x,
-                  gridY: y,
-                  dir: 'v' as const,
-                  ownerA: p1,
-                  ownerB: p3,
-                });
-              }
-            }
-          }
+          this.borderCacheEdges = detectBorderEdges(displayGrid);
         }
         this.borderDirty = false;
       }

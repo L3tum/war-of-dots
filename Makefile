@@ -1,7 +1,7 @@
 # llm-benchmark-runner — Quality & Development Makefile
 # Run with `make` or `make <target>`
 
-.PHONY: check fmt clippy test miri deny all build-release swebench-harness-image docs run run-no-resume report mock-report mock-report-official frontend-typecheck frontend-lint frontend-lint-fix frontend-fmt frontend-fmt-check frontend-check frontend-build
+.PHONY: check fmt clippy test miri deny all build-release swebench-harness-image docs run run-no-resume report mock-report mock-report-official frontend-typecheck frontend-lint frontend-lint-fix frontend-fmt frontend-fmt-check frontend-check frontend-build frontend-test frontend-e2e
 
 # Quick pre-commit checks
 check:
@@ -121,3 +121,12 @@ frontend-build:
 # Vitest — run frontend unit tests
 frontend-test:
 	cd $(FE) && npm run test
+
+# No-server WebGPU E2E (Layer 2): builds dist, stages the committed replay
+# fixture at dist/replays/, serves it statically, and runs the Playwright suite
+# under xvfb-run with the Dawn/SwiftShader software GPU (CPU — no GPU hardware
+# needed). Skips gracefully (exit 0) when xvfb-run / Chromium / @playwright/test
+# are absent, so `make all` and CI stay green without them. Deliberately NOT in
+# the default `all` path.
+frontend-e2e:
+	bash $(FE)/e2e/run_e2e.sh

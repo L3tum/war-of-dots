@@ -315,7 +315,9 @@ export class Connection {
         this.applyFullState(msg.FullState);
       } else if (msg.DeltaState) {
         this.applyDelta(msg.DeltaState);
-      } else if (msg.ClearSpectator) {
+      } else if ('ClearSpectator' in msg) {
+        // Unit variant — the server serializes it as { ClearSpectator: null },
+        // so a truthy check would never match.
         this.spectator.clearAll();
       } else if (msg.GameOver) {
         this.spectator.gameOver(msg.GameOver.winner, msg.GameOver.game_id, msg.GameOver.message);

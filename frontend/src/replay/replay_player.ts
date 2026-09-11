@@ -85,6 +85,15 @@ export class ReplayPlayer {
     this.paused = !this.paused;
   }
 
+  /**
+   * Test hook (frontend/e2e/webgpu.spec.ts): last render error from the active
+   * renderer, if any. Exposed so the no-server replay path can assert render
+   * health without a game server.
+   */
+  get renderError(): string | null {
+    return this.renderer?.lastRenderError ?? null;
+  }
+
   private applyEvent(event: GameEvent): void {
     // Bump the renderer's data version so the frame dirty gate keeps the
     // render loop advancing while replay events are still being applied.

@@ -45,10 +45,15 @@ async function main() {
   const urlParams = new URLSearchParams(window.location.search);
   const replayFile = urlParams.get('replay');
   if (replayFile) {
+    let replay: ReplayPlayer;
     try {
-      const replay = new ReplayPlayer(canvas);
+      replay = new ReplayPlayer(canvas);
       await replay.loadReplay(replayFile);
       await replay.start();
+      // Small no-server test hook (read by frontend/e2e/webgpu.spec.ts) so the
+      // replay path can assert renderer.lastRenderError without a game server.
+      (window as unknown as { __replayRenderError?: () => string | null }).__replayRenderError =
+        () => replay.renderError;
     } catch (err) {
       showErrorMessage(
         `Failed to load replay: ${err instanceof Error ? err.message : 'Unknown error'}`,

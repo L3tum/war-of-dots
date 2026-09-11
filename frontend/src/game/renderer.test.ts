@@ -1,354 +1,939 @@
-import { describe, it, expect } from 'vitest';
-import { CELL_SIZE, BORDER_LINE_WIDTH, PLAYER_COLORS, CITY_DOT_SIZE, CITY_COLORS } from './config';
-import type { TerrainType } from './terrain';
-import { colorForType } from './terrain';
+//! Renderer tests — run the REAL Renderer against the recording fake GPU
+//! (frontend/src/test/fake_gpu.ts). Geometry assertions read the recorded
+//! `queue.writeBuffer` payloads (world-space, as emitted — the camera transform
+//! lives in WGSL and is not re-implemented here).
 
-describe('Border edge detection', () => {
-  type BorderEdge = { gridX: number; gridY: number; dir: 'h' | 'v'; owner: number };
+import { describe, it, expect, vi } from 'vitest';
+import { Renderer } from './renderer';
+import {
+  createFakeGpu,
+  FakeGPUDevice,
+  FakeGPURenderPassEncoder,
+  Fake2DContext,
+  type FakeGPUBuffer,
+  type WriteBufferCall,
+} from '../test/fake_gpu';
+import { GameState } from './game_state';
+import { Unit } from './units';
+import { marchingSquares, colorForType, type TerrainType } from './terrain';
+import { fillTerritory, TERRITORY_NONE } from './territory';
+import { detectBorderEdges } from './geometry';
+import type { CityState, EquipmentState, UnitState } from '../generated/protocol';
+import {
+  CELL_SIZE,
+  UNIT_DOT_SIZE,
+  BORDER_LINE_WIDTH,
+  PATH_LINE_WIDTH,
+  BAR_HEIGHT,
+  BAR_SPACING,
+  BAR_WIDTH_MULTIPLIER,
+  PLAYER_COLORS,
+  CITY_COLORS,
+  CITY_DOT_SIZE,
+  OUTLINE_EXPAND,
+  OUTLINE_COLOR,
+  SYMBOL_CELL_SIZE,
+  SYMBOL_ATLAS_SIZE,
+} from './config';
 
-  const TERRITORY_NONE = 255;
+// ============================================================================
+// Fixtures & helpers
+// ============================================================================
 
-  function detectBorderEdges(borderGrid: number[][]): BorderEdge[] {
-    const edges: BorderEdge[] = [];
-    if (borderGrid.length === 0) return edges;
-    for (let y = 0; y < borderGrid.length - 1; y++) {
-      for (let x = 0; x < borderGrid[y].length - 1; x++) {
-        const p1 = borderGrid[y][x];
-        const p2 = borderGrid[y][x + 1];
-        const p3 = borderGrid[y + 1][x];
-        // Only borders between two different players — never claimed vs NONE.
-        if (p1 !== p2 && p1 !== TERRITORY_NONE && p2 !== TERRITORY_NONE) {
-          edges.push({ gridX: x, gridY: y, dir: 'h' as const, owner: p1 });
-        }
-        if (p1 !== p3 && p1 !== TERRITORY_NONE && p3 !== TERRITORY_NONE) {
-          edges.push({ gridX: x, gridY: y, dir: 'v' as const, owner: p1 });
-        }
-      }
-    }
-    return edges;
-  }
+function makeTerrain(w = 32, h = 16): TerrainType[][] {
+  return Array.from({ length: h }, () => Array.from({ length: w }, () => 'Plains' as TerrainType));
+}
 
-  it('does not draw border between a player and NONE (255)', () => {
-    // player 0 adjacent to unclaimed (255) → no border
-    const edges = detectBorderEdges([
+function makeUnitState(overrides: Partial<UnitState> = {}): UnitState {
+  const equipment: EquipmentState[] = [];
+  return {
+    id: 'u1',
+    owner: 'player_0',
+    position: [10, 8],
+    unit_type: 'infantry',
+    symbol: 'S',
+    men: 80,
+    max_men: 100,
+    organisation: 60,
+    equipment,
+    max_equipment: equipment,
+    path: [],
+    healing: false,
+    resupply_enabled: true,
+    supply_percent: 100,
+    encircled: false,
+    attacking: false,
+    on_water: false,
+    boat_supply_percent: 0,
+    embarking: false,
+    disembarking: false,
+    ...overrides,
+  };
+}
+
+function makeCityState(overrides: Partial<CityState> = {}): CityState {
+  return {
+    id: 'c1',
+    position: [6, 4],
+    owner: 'player_0',
+    manpower: 1000,
+    level: 1,
+    ...overrides,
+  };
+}
+
+/** A full game state: 32×16 map, one own unit, two cities, split borders, partial fog. */
+function makeGameState(): GameState {
+  const state = new GameState();
+  state.terrain = makeTerrain();
+  const w = state.terrain[0].length;
+  const h = state.terrain.length;
+  state.borderGrid = Array.from({ length: h }, () =>
+    Array.from({ length: w }, (_, x) => (x < w / 2 ? 0 : 1)),
+  );
+  state.visionGrid = Array.from({ length: h }, (_, y) =>
+    Array.from({ length: w }, (_, x) => (x + y) % 2 === 0),
+  );
+  state.units.set('u1', new Unit(makeUnitState()));
+  state.cities.set('c1', makeCityState());
+  state.cities.set('c2', makeCityState({ id: 'c2', position: [20, 4], owner: 'player_1' }));
+  state.player = { funds: 1000, units_owned: 1, player_id: 'player_0' };
+  state.ownPlayerId = 'player_0';
+  return state;
+}
+
+interface Harness {
+  renderer: Renderer;
+  device: FakeGPUDevice;
+  canvas: HTMLCanvasElement;
+}
+
+/**
+ * Construct the real Renderer on a fake device. The constructor's
+ * setCanvasDimensions() zeroes the canvas under happy-dom (0×0 bounding rect),
+ * so the pixel size is restored AFTER construction.
+ */
+function makeRenderer(width = 1280, height = 720): Harness {
+  const { device, canvas } = createFakeGpu(width, height);
+  const renderer = new Renderer(canvas, device as unknown as GPUDevice);
+  canvas.width = width;
+  canvas.height = height;
+  return { renderer, device, canvas };
+}
+
+/** Private buffer fields the assertions read. */
+function buffersOf(renderer: Renderer) {
+  return renderer as unknown as {
+    terrainPositionsBuffer: FakeGPUBuffer;
+    terrainColorBuffer: FakeGPUBuffer;
+    unitPositionsBuffer: FakeGPUBuffer;
+    unitColorBuffer: FakeGPUBuffer;
+    symbolPositionBuffer: FakeGPUBuffer;
+    symbolColorBuffer: FakeGPUBuffer;
+    borderPositionsBuffer: FakeGPUBuffer;
+    borderColorBuffer: FakeGPUBuffer;
+    pathPositionsBuffer: FakeGPUBuffer;
+    pathColorBuffer: FakeGPUBuffer;
+    barPositionsBuffer: FakeGPUBuffer;
+    barColorBuffer: FakeGPUBuffer;
+    cityPositionsBuffer: FakeGPUBuffer;
+    cityColorBuffer: FakeGPUBuffer;
+    outlinePositionsBuffer: FakeGPUBuffer;
+    outlineColorBuffer: FakeGPUBuffer;
+    uniformBuffer: FakeGPUBuffer;
+    fogUniformBuffer: FakeGPUBuffer;
+    fogTexture: { width: number; height: number } | null;
+  };
+}
+
+function writeCallsTo(queue: FakeGPUDevice['queue'], buffer: FakeGPUBuffer): WriteBufferCall[] {
+  return queue.writeBufferCalls.filter((c) => c.buffer === buffer);
+}
+
+function latestPayload(queue: FakeGPUDevice['queue'], buffer: FakeGPUBuffer): Float32Array {
+  const calls = writeCallsTo(queue, buffer);
+  expect(calls.length).toBeGreaterThan(0);
+  return calls[calls.length - 1].data as Float32Array;
+}
+
+function lastPass(device: FakeGPUDevice): FakeGPURenderPassEncoder {
+  const submitted = device.queue.submitted;
+  expect(submitted.length).toBeGreaterThan(0);
+  const last = submitted[submitted.length - 1] as {
+    renderPasses: FakeGPURenderPassEncoder[];
+  };
+  return last.renderPasses[0];
+}
+
+/** Buffer data is Float32 — round expected values the same way before comparing. */
+function f32(values: number[]): Float32Array {
+  return new Float32Array(values);
+}
+
+/** One full data-update + draw cycle, mirroring the rAF loop body. */
+function frame(renderer: Renderer, device: FakeGPUDevice, state: GameState): void {
+  renderer.render(state);
+  renderer.renderFrame();
+}
+
+// ============================================================================
+// detectBorderEdges — the REAL extracted function
+// ============================================================================
+
+describe('detectBorderEdges (real geometry.ts, filled grids)', () => {
+  const plains = (w: number, h: number): TerrainType[][] =>
+    Array.from({ length: h }, () => Array.from({ length: w }, () => 'Plains' as TerrainType));
+
+  it('returns no edges for an unclaimed map', () => {
+    const grid = Array.from({ length: 4 }, () => Array(4).fill(TERRITORY_NONE));
+    const display = fillTerritory(grid, plains(4, 4), []);
+    expect(detectBorderEdges(display)).toEqual([]);
+  });
+
+  it('draws no border between a player and unclaimed (255) land', () => {
+    // The raw-grid variant excludes player-vs-NONE edges...
+    const raw = [
       [0, 255],
       [0, 255],
-    ]);
-    expect(edges).toEqual([]);
+    ];
+    expect(detectBorderEdges(raw)).toEqual([]);
+    // ...and fillTerritory expands the player across unclaimed land, so the
+    // display grid also yields no border.
+    const display = fillTerritory(
+      [
+        [0, 255],
+        [0, 255],
+      ],
+      plains(2, 2),
+      [],
+    );
+    expect(display.every((row) => row.every((c) => c === 0))).toBe(true);
+    expect(detectBorderEdges(display)).toEqual([]);
   });
 
-  it('draws only the player-vs-player border when NONE is adjacent', () => {
-    // row: 255 | 0 | 1 → single horizontal border between 0 and 1 at x=1
-    const edges = detectBorderEdges([
-      [255, 0, 1],
-      [255, 0, 1],
-    ]);
-    expect(edges).toEqual([{ gridX: 1, gridY: 0, dir: 'h', owner: 0 }]);
-  });
-
-  it('returns empty for 1x1 grid', () => {
-    expect(detectBorderEdges([[0]])).toEqual([]);
-  });
-
-  it('returns no edges when all same owner', () => {
-    expect(
-      detectBorderEdges([
-        [0, 0],
-        [0, 0],
-      ]),
-    ).toEqual([]);
-  });
-
-  it('detects horizontal border', () => {
-    const edges = detectBorderEdges([
+  it('detects a full vertical border between two players (left/right columns)', () => {
+    const grid = [
       [0, 1],
       [0, 1],
+    ];
+    const display = fillTerritory(grid, plains(2, 2), []);
+    // 'v' = edge to the right-hand neighbour → drawn as a vertical line
+    expect(detectBorderEdges(display)).toEqual([
+      { gridX: 0, gridY: 0, dir: 'v', ownerA: 0, ownerB: 1 },
+      { gridX: 0, gridY: 1, dir: 'v', ownerA: 0, ownerB: 1 },
     ]);
-    expect(edges).toEqual([{ gridX: 0, gridY: 0, dir: 'h', owner: 0 }]);
   });
 
-  it('detects vertical border', () => {
-    const edges = detectBorderEdges([
+  it('detects a full horizontal border between two players (top/bottom rows)', () => {
+    const grid = [
       [0, 0],
       [1, 1],
+    ];
+    const display = fillTerritory(grid, plains(2, 2), []);
+    // 'h' = edge to the lower neighbour → drawn as a horizontal line
+    expect(detectBorderEdges(display)).toEqual([
+      { gridX: 0, gridY: 0, dir: 'h', ownerA: 0, ownerB: 1 },
+      { gridX: 1, gridY: 0, dir: 'h', ownerA: 0, ownerB: 1 },
     ]);
-    expect(edges).toEqual([{ gridX: 0, gridY: 0, dir: 'v', owner: 0 }]);
   });
 
-  it('detects both horizontal and vertical borders', () => {
-    const edges = detectBorderEdges([
+  it('detects both edge orientations at a corner', () => {
+    const grid = [
       [0, 1],
       [1, 1],
-    ]);
-    expect(edges).toEqual([
-      { gridX: 0, gridY: 0, dir: 'h', owner: 0 },
-      { gridX: 0, gridY: 0, dir: 'v', owner: 0 },
+    ];
+    // Right-neighbour ('v') edge is pushed before the lower-neighbour ('h') edge
+    expect(detectBorderEdges(fillTerritory(grid, plains(2, 2), []))).toEqual([
+      { gridX: 0, gridY: 0, dir: 'v', ownerA: 0, ownerB: 1 },
+      { gridX: 0, gridY: 0, dir: 'h', ownerA: 0, ownerB: 1 },
     ]);
   });
 
-  it('handles larger grid with multiple borders', () => {
-    const edges = detectBorderEdges([
-      [0, 0, 1],
-      [0, 0, 1],
-      [1, 1, 1],
+  it('returns empty for a 1×1 grid and for a single-owner map', () => {
+    expect(detectBorderEdges([[0]])).toEqual([]);
+    const grid = [
+      [0, 0],
+      [0, 0],
+    ];
+    expect(detectBorderEdges(fillTerritory(grid, plains(2, 2), []))).toEqual([]);
+  });
+
+  it('keeps the single player-vs-player border when NONE is adjacent', () => {
+    // row: 255 | 0 | 1 → one horizontal border between 0 and 1 at x=1
+    const raw = [
+      [255, 0, 1],
+      [255, 0, 1],
+    ];
+    expect(detectBorderEdges(raw)).toEqual([
+      { gridX: 1, gridY: 0, dir: 'v', ownerA: 0, ownerB: 1 },
+      { gridX: 1, gridY: 1, dir: 'v', ownerA: 0, ownerB: 1 },
     ]);
-    // Horizontal borders at (0,1) and (1,1)
-    // Vertical borders at (0,0) and (1,0)
-    expect(edges).toHaveLength(4);
+    const grid = Array.from({ length: 8 }, () => Array(8).fill(TERRITORY_NONE));
+    const display = fillTerritory(grid, plains(8, 8), [
+      { x: 0, y: 0, ownerIdx: 0 },
+      { x: 7, y: 7, ownerIdx: 1 },
+    ]);
+    // Both territories claim land and meet somewhere
+    expect(display[0][0]).toBe(0);
+    expect(display[7][7]).toBe(1);
+    const edges = detectBorderEdges(display);
+    expect(edges.length).toBeGreaterThan(0);
+    for (const e of edges) {
+      expect([e.ownerA, e.ownerB].sort()).toEqual([0, 1]);
+    }
+  });
+
+  it('does not expand territories through water', () => {
+    // 0 0 W 1 — water column separates the players; no 0-vs-1 border exists.
+    const terrain = [
+      ['Plains', 'Plains', 'Water', 'Plains'],
+      ['Plains', 'Plains', 'Water', 'Plains'],
+    ] as TerrainType[][];
+    const grid = [
+      [0, 0, 255, 1],
+      [0, 0, 255, 1],
+    ];
+    const display = fillTerritory(grid, terrain, []);
+    expect(display[0]).toEqual([0, 0, 255, 1]);
+    expect(detectBorderEdges(display)).toEqual([]);
   });
 });
 
-describe('Border vertex generation', () => {
-  function generateBorderVertices(
-    edges: Array<{ gridX: number; gridY: number; dir: 'h' | 'v'; owner: number }>,
-    camera: { x: number; y: number; zoom: number },
-  ) {
-    const positions: number[] = [];
-    const colors: number[] = [];
+// ============================================================================
+// Renderer construction on the fake device
+// ============================================================================
 
-    const BORDER_COLORS = [
-      { r: 1, g: 0.2, b: 0.2 },
-      { r: 0.2, g: 0.2, b: 1 },
-    ];
+describe('Renderer construction (fake GPU)', () => {
+  it('creates the five pipelines and configures the canvas context', () => {
+    const { device, canvas } = makeRenderer();
+    expect(device.createdPipelines).toHaveLength(5);
+    const ctx = canvas.getContext('webgpu') as unknown as {
+      configured: { device: unknown; format: string } | null;
+    };
+    expect(ctx.configured?.format).toBe('bgra8unorm');
+    expect(ctx.configured?.device).toBe(device);
+  });
 
-    for (const edge of edges) {
-      const c = BORDER_COLORS[edge.owner % 2] || { r: 1, g: 1, b: 1 };
-      if (edge.dir === 'h') {
-        const sx = (camera.x + edge.gridX * CELL_SIZE) * camera.zoom;
-        const sy = (camera.y + (edge.gridY + 1) * CELL_SIZE) * camera.zoom;
-        positions.push(
-          sx,
-          sy - BORDER_LINE_WIDTH,
-          sx + CELL_SIZE * camera.zoom,
-          sy - BORDER_LINE_WIDTH,
-          sx + CELL_SIZE * camera.zoom,
-          sy + BORDER_LINE_WIDTH,
-          sx,
-          sy + BORDER_LINE_WIDTH,
-        );
-      } else {
-        const sx = (camera.x + (edge.gridX + 1) * CELL_SIZE) * camera.zoom;
-        const sy = (camera.y + edge.gridY * CELL_SIZE) * camera.zoom;
-        positions.push(
-          sx - BORDER_LINE_WIDTH,
-          sy,
-          sx + BORDER_LINE_WIDTH,
-          sy,
-          sx + BORDER_LINE_WIDTH,
-          sy + CELL_SIZE * camera.zoom,
-          sx - BORDER_LINE_WIDTH,
-          sy + CELL_SIZE * camera.zoom,
-        );
-      }
-      for (let i = 0; i < 4; i++) colors.push(c.r, c.g, c.b);
-    }
+  it('uploads the initial uniform buffer (camera 0,0,1)', () => {
+    const { device } = makeRenderer();
+    expect(device.queue.writeBufferCalls.length).toBeGreaterThan(0);
+  });
 
-    return { positions, colors };
+  it('keeps an explicit canvas size after construction', () => {
+    const { canvas } = makeRenderer(640, 480);
+    expect(canvas.width).toBe(640);
+    expect(canvas.height).toBe(480);
+  });
+});
+
+// ============================================================================
+// Geometry payloads — recorded writeBuffer content (world space)
+// ============================================================================
+
+describe('Renderer geometry payloads (recorded writeBuffer)', () => {
+  const CAM = { x: 512, y: 256, zoom: 1 };
+
+  function setup(): Harness {
+    const harness = makeRenderer();
+    harness.renderer.camera = { ...CAM };
+    return harness;
   }
 
-  it('generates correct vertex count for one border', () => {
-    const edges = [{ gridX: 0, gridY: 0, dir: 'h' as const, owner: 0 }];
-    const { positions, colors } = generateBorderVertices(edges, { x: 0, y: 0, zoom: 1 });
-
-    // One quad = 4 vertices * 2 coords = 8 positions
-    expect(positions.length).toBe(8);
-    // One quad = 4 vertices * 3 color components = 12 colors
-    expect(colors.length).toBe(12);
+  it('terrain buffer carries the marchingSquares mesh verbatim', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    const b = buffersOf(renderer);
+    const expected = marchingSquares(state.terrain, CELL_SIZE, CAM, CAM.zoom, 1280, 720);
+    expect(expected.positions.length).toBeGreaterThan(0);
+    expect(latestPayload(device.queue, b.terrainPositionsBuffer)).toEqual(
+      new Float32Array(expected.positions),
+    );
+    expect(latestPayload(device.queue, b.terrainColorBuffer)).toEqual(
+      new Float32Array(expected.colors),
+    );
+    expect(renderer.terrainVertexCount).toBe(expected.positions.length / 2);
   });
 
-  it('scales border positions with zoom', () => {
-    const edges = [{ gridX: 0, gridY: 0, dir: 'h' as const, owner: 0 }];
-    const { positions } = generateBorderVertices(edges, { x: 0, y: 0, zoom: 2 });
-
-    // Border should span CELL_SIZE * zoom = 30
-    expect(positions[2] - positions[0]).toBe(CELL_SIZE * 2);
+  it('uploads unit dots at world-space cell centers with owner color', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.unitPositionsBuffer);
+    // Unit at (10, 8) → world (320, 256), half-size = UNIT_DOT_SIZE/2/zoom
+    const wx = 10 * CELL_SIZE;
+    const wy = 8 * CELL_SIZE;
+    const half = UNIT_DOT_SIZE / 2 / CAM.zoom;
+    expect(p).toEqual(
+      f32([wx - half, wy - half, wx + half, wy - half, wx + half, wy + half, wx - half, wy + half]),
+    );
+    const c = latestPayload(device.queue, b.unitColorBuffer);
+    expect(c).toEqual(
+      f32([
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+      ]),
+    );
+    expect(renderer.unitVertexCount).toBe(4);
   });
 
-  it('offsets border positions with camera', () => {
-    const edges = [{ gridX: 0, gridY: 0, dir: 'h' as const, owner: 0 }];
-    const { positions } = generateBorderVertices(edges, { x: 100, y: 100, zoom: 1 });
-
-    // Horizontal border: sy = (100 + (0+1) * CELL_SIZE) * 1 = 100 + 15 = 115
-    // positions[1] = sy - BORDER_LINE_WIDTH = 115 - 3 = 112
-    expect(positions[0]).toBe(100);
-    expect(positions[1]).toBe(100 + CELL_SIZE - BORDER_LINE_WIDTH);
-  });
-});
-
-describe('Unit vertex generation', () => {
-  it('generates unit quad at correct screen position', () => {
-    const camera = { x: 0, y: 0, zoom: 1 };
-    const unitPos = { x: 10, y: 20 };
-    const unitDotSize = 5;
-
-    const sx = (camera.x + unitPos.x * CELL_SIZE) * camera.zoom;
-    const sy = (camera.y + unitPos.y * CELL_SIZE) * camera.zoom;
-
-    // Quad corners
-    const topLeftX = sx - unitDotSize;
-    const topLeftY = sy - unitDotSize;
-    const bottomRightX = sx + unitDotSize;
-    const bottomRightY = sy + unitDotSize;
-
-    expect(topLeftX).toBe(10 * CELL_SIZE - unitDotSize);
-    expect(topLeftY).toBe(20 * CELL_SIZE - unitDotSize);
-    expect(bottomRightX).toBe(10 * CELL_SIZE + unitDotSize);
-    expect(bottomRightY).toBe(20 * CELL_SIZE + unitDotSize);
-  });
-
-  it('scales unit position with zoom', () => {
-    const camera = { x: 0, y: 0, zoom: 2 };
-    const unitPos = { x: 10, y: 20 };
-
-    const sx = (camera.x + unitPos.x * CELL_SIZE) * camera.zoom;
-    const sy = (camera.y + unitPos.y * CELL_SIZE) * camera.zoom;
-
-    expect(sx).toBe(10 * CELL_SIZE * 2);
-    expect(sy).toBe(20 * CELL_SIZE * 2);
+  it('interleaves symbol positions and UVs (stride 16) at 0.8× dot size', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.symbolPositionBuffer);
+    const wx = 10 * CELL_SIZE;
+    const wy = 8 * CELL_SIZE;
+    const half = (UNIT_DOT_SIZE / 2 / CAM.zoom) * 0.8;
+    const uv = SYMBOL_CELL_SIZE / SYMBOL_ATLAS_SIZE;
+    expect(p.length).toBe(16); // 4 vertices × 4 floats
+    expect(p).toEqual(
+      f32([
+        wx - half,
+        wy - half,
+        0,
+        0,
+        wx + half,
+        wy - half,
+        uv,
+        0,
+        wx + half,
+        wy + half,
+        uv,
+        uv,
+        wx - half,
+        wy + half,
+        0,
+        uv,
+      ]),
+    );
   });
 
-  it('offsets unit position with camera', () => {
-    const camera = { x: 100, y: 200, zoom: 1 };
-    const unitPos = { x: 10, y: 20 };
-
-    const sx = (camera.x + unitPos.x * CELL_SIZE) * camera.zoom;
-    const sy = (camera.y + unitPos.y * CELL_SIZE) * camera.zoom;
-
-    expect(sx).toBe(100 + 10 * CELL_SIZE);
-    expect(sy).toBe(200 + 20 * CELL_SIZE);
-  });
-
-  it('selects correct player color by index', () => {
-    const colorIdx = parseInt('player_1'.replace('player_', '') || '0') || 0;
-    const color = PLAYER_COLORS[colorIdx % PLAYER_COLORS.length];
-
-    expect(color).toBe(PLAYER_COLORS[1]);
-  });
-
-  it('handles player with numeric ID', () => {
-    const colorIdx = parseInt('player_2'.replace('player_', '') || '0') || 0;
-    const color = PLAYER_COLORS[colorIdx % PLAYER_COLORS.length];
-
-    expect(color).toBe(PLAYER_COLORS[2]);
-  });
-});
-
-describe('Uniform buffer data', () => {
-  it('generates correct uniform data from camera state', () => {
-    const camera = { x: 100, y: 200, zoom: 1.5 };
-    const uniformData = new Float32Array([camera.x, camera.y, camera.zoom]);
-
-    expect(uniformData).toEqual(new Float32Array([100, 200, 1.5]));
-    expect(uniformData.length).toBe(3);
-    expect(uniformData.byteLength).toBe(12); // 3 floats * 4 bytes
-  });
-
-  it('generates default uniform data at origin', () => {
-    const camera = { x: 0, y: 0, zoom: 1.0 };
-    const uniformData = new Float32Array([camera.x, camera.y, camera.zoom]);
-
-    expect(uniformData).toEqual(new Float32Array([0, 0, 1.0]));
-  });
-});
-
-describe('Camera transform', () => {
-  function worldToScreen(
-    worldX: number,
-    worldY: number,
-    camera: { x: number; y: number; zoom: number },
-  ) {
-    // Same math as WGSL shader (center-based camera):
-    // screenX = (worldX - camera.x) * zoom / (canvasWidth/2)
-    // screenY = (camera.y - worldY) * zoom / (canvasHeight/2)
-    const screenX = ((worldX - camera.x) * camera.zoom) / 250; // 2 / 500
-    const screenY = ((camera.y - worldY) * camera.zoom) / 150; // 2 / 300
-    return { screenX, screenY };
-  }
-
-  it('maps world point at camera center to NDC origin', () => {
-    const result = worldToScreen(100, 50, { x: 100, y: 50, zoom: 1 });
-    expect(result.screenX).toBeCloseTo(0);
-    expect(result.screenY).toBeCloseTo(0);
-  });
-
-  it('applies zoom correctly', () => {
-    const result = worldToScreen(100, 0, { x: 0, y: 0, zoom: 2 });
-    expect(result.screenX).toBeCloseTo((100 * 2) / 250);
-    expect(result.screenY).toBeCloseTo(0);
-  });
-
-  it('applies camera offset correctly', () => {
-    const result = worldToScreen(0, 0, { x: 250, y: 150, zoom: 1 });
-    expect(result.screenX).toBeCloseTo((0 - 250) / 250); // -1 (left edge)
-    expect(result.screenY).toBeCloseTo((150 - 0) / 150); // 1 (top edge)
-  });
-});
-
-describe('Fog of war generation', () => {
-  it('marks cells as visible when in vision grid', () => {
-    const visionGrid: boolean[][] = [
-      [true, false, true],
-      [false, true, false],
-    ];
-
-    const fogValues: number[] = [];
-    for (let y = 0; y < visionGrid.length; y++) {
-      for (let x = 0; x < visionGrid[y].length; x++) {
-        fogValues.push(visionGrid[y][x] ? 0 : 128);
-      }
-    }
-
-    expect(fogValues).toEqual([0, 128, 0, 128, 0, 128]);
-  });
-});
-
-describe('Bar vertex generation', () => {
-  it('generates bar quad at correct position above unit', () => {
-    const unitScreenPos = { x: 100, y: 200 };
-    const barWidth = 20;
-    const barSpacing = 2.5;
-    const symSize = 4; // unitDotSize * 0.8
-
-    // First bar is above symbol
-    const barY = unitScreenPos.y - symSize - barSpacing;
-    const bx = unitScreenPos.x - barWidth / 2;
-
-    expect(bx).toBe(90);
-    expect(barY).toBe(193.5);
-  });
-
-  it('stacks bars with correct spacing', () => {
-    const unitScreenPos = { x: 100, y: 200 };
-    const barWidth = 20;
-    const barHeight = 2;
-    const barSpacing = 2.5;
-    const symSize = 4;
-
-    let barY = unitScreenPos.y - symSize - barSpacing;
-    const barPositions: number[] = [];
-
+  it('emits three status bars per unit with percent widths', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.barPositionsBuffer);
+    const wx = 10 * CELL_SIZE;
+    const wy = 8 * CELL_SIZE;
+    const symHalf = (UNIT_DOT_SIZE / 2 / CAM.zoom) * 0.8;
+    const barWidth = symHalf * BAR_WIDTH_MULTIPLIER;
+    const bx = wx - barWidth / 2;
+    let barY = wy - symHalf - BAR_SPACING / CAM.zoom;
+    const percents = [80, 60, 100]; // men%, org%, supply%
     for (let i = 0; i < 3; i++) {
-      const bx = unitScreenPos.x - barWidth / 2;
-      const actualWidth = barWidth * 0.5; // 50% health
-      barPositions.push(
+      const actual = (barWidth * percents[i]) / 100;
+      const expected = [
         bx,
         barY,
-        bx + actualWidth,
+        bx + actual,
         barY,
-        bx + actualWidth,
-        barY + barHeight,
+        bx + actual,
+        barY + BAR_HEIGHT,
         bx,
-        barY + barHeight,
-      );
-      barY -= barSpacing;
+        barY + BAR_HEIGHT,
+      ];
+      expect(new Float32Array(p.slice(i * 8, i * 8 + 8))).toEqual(f32(expected));
+      barY -= BAR_SPACING / CAM.zoom;
     }
+    expect(renderer.barVertexCount).toBe(12);
+  });
 
-    expect(barPositions.length).toBe(3 * 8); // 3 bars, 8 positions each
-    // Bar 1 top edge Y at index 1, Bar 2 top edge Y at index 9
-    // Each bar is barSpacing apart (stacked downward)
-    expect(barPositions[9] - barPositions[1]).toBeCloseTo(-barSpacing);
+  it('renders each border as two owner-coloured half-width quads (world space)', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    // 32×16 split at col 16 → 16 vertical edges at gridX=15
+    expect(renderer.borderVertexCount).toBe(16 * 8);
+    const p = latestPayload(device.queue, b.borderPositionsBuffer);
+    const c = latestPayload(device.queue, b.borderColorBuffer);
+    const lw = BORDER_LINE_WIDTH / CAM.zoom;
+    const wx = 16 * CELL_SIZE;
+    const wy = 0 * CELL_SIZE;
+    // First edge (gridY=0): quad A (owner 0) then quad B (owner 1)
+    expect(new Float32Array(p.slice(0, 16))).toEqual(
+      f32([
+        wx - lw,
+        wy,
+        wx,
+        wy,
+        wx,
+        wy + CELL_SIZE,
+        wx - lw,
+        wy + CELL_SIZE,
+        wx,
+        wy,
+        wx + lw,
+        wy,
+        wx + lw,
+        wy + CELL_SIZE,
+        wx,
+        wy + CELL_SIZE,
+      ]),
+    );
+    expect(new Float32Array(c.slice(0, 24))).toEqual(
+      f32([
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[0].r,
+        PLAYER_COLORS[0].g,
+        PLAYER_COLORS[0].b,
+        PLAYER_COLORS[1].r,
+        PLAYER_COLORS[1].g,
+        PLAYER_COLORS[1].b,
+        PLAYER_COLORS[1].r,
+        PLAYER_COLORS[1].g,
+        PLAYER_COLORS[1].b,
+        PLAYER_COLORS[1].r,
+        PLAYER_COLORS[1].g,
+        PLAYER_COLORS[1].b,
+        PLAYER_COLORS[1].r,
+        PLAYER_COLORS[1].g,
+        PLAYER_COLORS[1].b,
+      ]),
+    );
+  });
+
+  it('border quads scale inversely with zoom (constant screen width)', () => {
+    const h = setup();
+    h.renderer.camera.zoom = 2;
+    h.renderer.render(makeGameState());
+    const b = buffersOf(h.renderer);
+    const p = latestPayload(h.device.queue, b.borderPositionsBuffer);
+    const lw = BORDER_LINE_WIDTH / 2;
+    const wx = 16 * CELL_SIZE;
+    expect(p[0]).toBe(wx - lw);
+    expect(p[1]).toBe(0); // wy = 0 for first edge
+    expect(p[8]).toBe(wx);
+    expect(p[10] - p[8]).toBe(lw);
+  });
+
+  it('uploads path preview quads in world space', () => {
+    const { renderer, device } = setup();
+    renderer.currentPath = [
+      { x: 5, y: 4 },
+      { x: 6, y: 4 },
+    ];
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.pathPositionsBuffer);
+    expect(p).toEqual(
+      f32([
+        5 * CELL_SIZE - PATH_LINE_WIDTH,
+        4 * CELL_SIZE,
+        5 * CELL_SIZE + PATH_LINE_WIDTH,
+        4 * CELL_SIZE,
+        6 * CELL_SIZE + PATH_LINE_WIDTH,
+        4 * CELL_SIZE,
+        6 * CELL_SIZE - PATH_LINE_WIDTH,
+        4 * CELL_SIZE,
+      ]),
+    );
+    expect(renderer.pathVertexCount).toBe(4);
+  });
+
+  it('city dots: own city 1.5× with 50% white mix, other city 1× flat color', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.cityPositionsBuffer);
+    const c = latestPayload(device.queue, b.cityColorBuffer);
+    // City A (own) at (6,4): dot 18, half 9. City B at (20,4): dot 12, half 6.
+    const ax = 6 * CELL_SIZE,
+      ay = 4 * CELL_SIZE;
+    const bx = 20 * CELL_SIZE,
+      by = 4 * CELL_SIZE;
+    expect(p).toEqual(
+      f32([
+        ax - 9,
+        ay - 9,
+        ax + 9,
+        ay - 9,
+        ax + 9,
+        ay + 9,
+        ax - 9,
+        ay + 9,
+        bx - 6,
+        by - 6,
+        bx + 6,
+        by - 6,
+        bx + 6,
+        by + 6,
+        bx - 6,
+        by + 6,
+      ]),
+    );
+    // Own city color: CITY_COLORS[0] mixed 50% white
+    expect(c).toEqual(
+      f32([
+        CITY_COLORS[0].r * 0.5 + 0.5,
+        CITY_COLORS[0].g * 0.5 + 0.5,
+        CITY_COLORS[0].b * 0.5 + 0.5,
+        CITY_COLORS[0].r * 0.5 + 0.5,
+        CITY_COLORS[0].g * 0.5 + 0.5,
+        CITY_COLORS[0].b * 0.5 + 0.5,
+        CITY_COLORS[0].r * 0.5 + 0.5,
+        CITY_COLORS[0].g * 0.5 + 0.5,
+        CITY_COLORS[0].b * 0.5 + 0.5,
+        CITY_COLORS[0].r * 0.5 + 0.5,
+        CITY_COLORS[0].g * 0.5 + 0.5,
+        CITY_COLORS[0].b * 0.5 + 0.5,
+        CITY_COLORS[1].r,
+        CITY_COLORS[1].g,
+        CITY_COLORS[1].b,
+        CITY_COLORS[1].r,
+        CITY_COLORS[1].g,
+        CITY_COLORS[1].b,
+        CITY_COLORS[1].r,
+        CITY_COLORS[1].g,
+        CITY_COLORS[1].b,
+        CITY_COLORS[1].r,
+        CITY_COLORS[1].g,
+        CITY_COLORS[1].b,
+      ]),
+    );
+    expect(renderer.cityVertexCount).toBe(8);
+  });
+
+  it('city dots keep constant screen size across zoom', () => {
+    const h1 = setup();
+    h1.renderer.render(makeGameState());
+    const b1 = buffersOf(h1.renderer);
+    const p1 = latestPayload(h1.device.queue, b1.cityPositionsBuffer);
+    const widthAtZoom1 = p1[2] - p1[0];
+
+    const h2 = makeRenderer();
+    h2.renderer.camera = { ...CAM, zoom: 2 };
+    h2.renderer.render(makeGameState());
+    const b2 = buffersOf(h2.renderer);
+    const p2 = latestPayload(h2.device.queue, b2.cityPositionsBuffer);
+    const widthAtZoom2 = p2[2] - p2[0];
+
+    // Screen-space constancy: worldWidth * zoom = constant dot screen size
+    expect(widthAtZoom1 * 1).toBeCloseTo(CITY_DOT_SIZE * 1.5, 5);
+    expect(widthAtZoom2 * 2).toBeCloseTo(CITY_DOT_SIZE * 1.5, 5);
+  });
+
+  it('outline halo covers own units and cities only', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.outlinePositionsBuffer);
+    const c = latestPayload(device.queue, b.outlineColorBuffer);
+    // Own unit outline first (half = UNIT_DOT_SIZE/2 + OUTLINE_EXPAND = 7)
+    const wx = 10 * CELL_SIZE,
+      wy = 8 * CELL_SIZE;
+    const uHalf = UNIT_DOT_SIZE / 2 + OUTLINE_EXPAND;
+    expect(Array.from(p.slice(0, 8))).toEqual([
+      wx - uHalf,
+      wy - uHalf,
+      wx + uHalf,
+      wy - uHalf,
+      wx + uHalf,
+      wy + uHalf,
+      wx - uHalf,
+      wy + uHalf,
+    ]);
+    // Then own city (half = CITY_DOT_SIZE/2 + OUTLINE_EXPAND = 9)
+    const cx = 6 * CELL_SIZE,
+      cy = 4 * CELL_SIZE;
+    const cHalf = CITY_DOT_SIZE / 2 + OUTLINE_EXPAND;
+    expect(Array.from(p.slice(8, 16))).toEqual([
+      cx - cHalf,
+      cy - cHalf,
+      cx + cHalf,
+      cy - cHalf,
+      cx + cHalf,
+      cy + cHalf,
+      cx - cHalf,
+      cy + cHalf,
+    ]);
+    expect(p.length).toBe(16); // opponent city NOT outlined
+    for (let i = 0; i < 8; i++) {
+      expect([c[i * 3], c[i * 3 + 1], c[i * 3 + 2]]).toEqual([
+        OUTLINE_COLOR.r,
+        OUTLINE_COLOR.g,
+        OUTLINE_COLOR.b,
+      ]);
+    }
+    expect(renderer.outlineVertexCount).toBe(8);
+  });
+
+  it('uploads fog texture with alpha 255 where invisible', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    const calls = device.queue.writeTextureCalls;
+    expect(calls.length).toBe(1);
+    const call = calls[0];
+    const w = state.terrain[0].length,
+      h = state.terrain.length;
+    expect(call.size).toEqual([w, h, 1]);
+    expect(call.layout.bytesPerRow).toBe(w * 4);
+    expect(call.data.length).toBe(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const visible = state.visionGrid[y][x];
+        const alpha = call.data[(y * w + x) * 4 + 3];
+        expect(alpha).toBe(visible ? 0 : 255);
+      }
+    }
+  });
+
+  it('uploads the symbol atlas texture when the unit composition changes', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    expect(device.queue.copyExternalImageCalls).toHaveLength(1);
+    const call = device.queue.copyExternalImageCalls[0];
+    expect(call.size).toEqual([SYMBOL_ATLAS_SIZE, SYMBOL_ATLAS_SIZE, 1]);
+    // The atlas texture is the first texture the constructor creates
+    expect(call.texture).toBe(device.createdTextures[0]);
+    // Unit composition unchanged → second render must NOT re-upload the atlas
+    renderer.render(state);
+    expect(device.queue.copyExternalImageCalls).toHaveLength(1);
+    // New unit type → re-upload
+    state.units.set('u2', new Unit(makeUnitState({ id: 'u2', symbol: 'N', position: [11, 8] })));
+    renderer.render(state);
+    expect(device.queue.copyExternalImageCalls).toHaveLength(2);
+  });
+
+  it('paints unit symbols onto the 2D atlas when the composition changes', () => {
+    const { renderer } = setup();
+    const ctx = (renderer as unknown as { symbolCtx: Fake2DContext }).symbolCtx;
+    const state = makeGameState();
+    renderer.render(state);
+    // Initial render must actually paint the glyph (regression: the draw gate
+    // compared against an already-committed cache key and never fired).
+    const texts = ctx.fillTextCalls.map((c) => c.text);
+    expect(texts).toContain('S');
+    // Composition unchanged → no repaint on the next frame
+    renderer.render(state);
+    expect(ctx.fillTextCalls).toHaveLength(texts.length);
+    // Composition changed → repaints, including the new symbol
+    state.units.set('u2', new Unit(makeUnitState({ id: 'u2', symbol: 'N', position: [11, 8] })));
+    renderer.render(state);
+    expect(ctx.fillTextCalls.map((c) => c.text)).toContain('N');
+    expect(ctx.fillTextCalls.length).toBeGreaterThan(texts.length);
+  });
+
+  it('writes camera + canvas uniforms each frame', () => {
+    const { renderer, device } = setup();
+    renderer.renderFrame();
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.uniformBuffer);
+    expect(Array.from(p)).toEqual([CAM.x, CAM.y, CAM.zoom, 1280, 720]);
+  });
+
+  it('writes fog uniforms including CELL_SIZE once fog exists', () => {
+    const { renderer, device } = setup();
+    renderer.render(makeGameState());
+    renderer.renderFrame();
+    const b = buffersOf(renderer);
+    const p = latestPayload(device.queue, b.fogUniformBuffer);
+    expect(Array.from(p)).toEqual([CAM.x, CAM.y, CAM.zoom, 1280, 720, CELL_SIZE]);
+  });
+
+  it('renders only terrain + fog for a unit-less state', () => {
+    const { renderer, device } = setup();
+    const empty = new GameState();
+    empty.terrain = makeTerrain();
+    empty.visionGrid = Array.from({ length: 16 }, () => Array(32).fill(true));
+    frame(renderer, device, empty);
+    expect(renderer.unitVertexCount).toBe(0);
+    expect(renderer.borderVertexCount).toBe(0);
+    expect(renderer.outlineVertexCount).toBe(0);
+    expect(renderer.cityVertexCount).toBe(0);
+    expect(renderer.lastRenderError).toBeNull();
+    const pass = lastPass(device);
+    const [main, , , , fog] = device.createdPipelines;
+    expect(pass.draws.map((d) => d.pipeline)).toEqual([main, fog]);
+    expect(pass.draws[1].vertexCount).toBe(4);
+  });
+
+  it('ignores a state without terrain (lobby) and uploads nothing', () => {
+    const { renderer, device } = setup();
+    const before = device.queue.writeBufferCalls.length;
+    renderer.render(new GameState());
+    expect(device.queue.writeBufferCalls.length).toBe(before);
   });
 });
+
+// ============================================================================
+// Draw sequence
+// ============================================================================
+
+describe('renderFrame draw sequence', () => {
+  it('draws passes in z-order with the cached vertex counts', () => {
+    const { renderer, device } = makeRenderer();
+    renderer.camera = { x: 512, y: 256, zoom: 1 };
+    const state = makeGameState();
+    frame(renderer, device, state);
+
+    const pass = lastPass(device);
+    expect(pass.clearValue).toEqual({ r: 0.05, g: 0.05, b: 0.1, a: 1 });
+
+    const [main, symbol, line, outline, fog] = device.createdPipelines;
+    const draws = pass.draws.map((d) => [d.pipeline, d.vertexCount] as const);
+    const expectedTerrainCount =
+      marchingSquares(state.terrain, CELL_SIZE, renderer.camera, 1, 1280, 720).positions.length / 2;
+    // z-order: terrain → borders → outlines → cities → units → bars → symbols → fog
+    // (path draw skipped — currentPath empty)
+    expect(draws).toEqual([
+      [main, expectedTerrainCount],
+      [line, renderer.borderVertexCount],
+      [outline, renderer.outlineVertexCount],
+      [main, renderer.cityVertexCount],
+      [main, renderer.unitVertexCount],
+      [main, renderer.barVertexCount],
+      [symbol, renderer.unitVertexCount],
+      [fog, 4],
+    ]);
+  });
+});
+
+// ============================================================================
+// Cache / dirty-flag gating
+// ============================================================================
+
+describe('dirty-flag and cache gating', () => {
+  it('terrain cache: no re-upload while camera+terrain unchanged, re-upload after camera move', () => {
+    const { renderer, device } = makeRenderer();
+    renderer.camera = { x: 512, y: 256, zoom: 1 };
+    const state = makeGameState();
+    const b = buffersOf(renderer);
+
+    renderer.render(state);
+    const afterFirst = writeCallsTo(device.queue, b.terrainPositionsBuffer).length;
+    expect(afterFirst).toBe(1);
+
+    renderer.render(state);
+    expect(writeCallsTo(device.queue, b.terrainPositionsBuffer).length).toBe(afterFirst);
+
+    // Camera pan changes the visible range → recompute + re-upload
+    // (512 px moves the clamped tStartCol; smaller pans clamp at the map edge)
+    renderer.camera.x += 512;
+    renderer.render(state);
+    expect(writeCallsTo(device.queue, b.terrainPositionsBuffer).length).toBe(afterFirst + 1);
+  });
+
+  it('terrain cache: a different terrain reference invalidates the cache', () => {
+    const { renderer, device } = makeRenderer();
+    renderer.camera = { x: 512, y: 256, zoom: 1 };
+    const state = makeGameState();
+    const b = buffersOf(renderer);
+    renderer.render(state);
+    const afterFirst = writeCallsTo(device.queue, b.terrainPositionsBuffer).length;
+    state.terrain = makeTerrain(); // new reference, same content
+    renderer.render(state);
+    expect(writeCallsTo(device.queue, b.terrainPositionsBuffer).length).toBe(afterFirst + 1);
+  });
+
+  it('fog: uploaded once, re-uploaded only after markFogDirty or size change', () => {
+    const { renderer, device } = makeRenderer();
+    renderer.camera = { x: 512, y: 256, zoom: 1 };
+    const state = makeGameState();
+
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(1);
+
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(1);
+
+    renderer.markFogDirty();
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(2);
+
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(2);
+  });
+
+  it('fog: a differently sized vision grid forces a re-upload', () => {
+    const { renderer, device } = makeRenderer();
+    renderer.camera = { x: 512, y: 256, zoom: 1 };
+    const state = makeGameState();
+    renderer.render(state);
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(1);
+    state.visionGrid = Array.from({ length: 8 }, () => Array(8).fill(true));
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(2);
+  });
+
+  it('rAF frame gate: updateCallback fires on key change, suppressed while idle', async () => {
+    const { renderer } = makeRenderer();
+    const state = makeGameState();
+
+    let callbacks = 0;
+    renderer.setUpdateCallback(() => {
+      callbacks++;
+      renderer.render(state);
+    });
+
+    // Pre-consume the initial fog/border dirty flags — they flip on first
+    // render and would otherwise change the frame key once more.
+    renderer.render(state);
+
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 16));
+    vi.useFakeTimers();
+    try {
+      renderer.startRenderLoop();
+      await vi.advanceTimersByTimeAsync(16);
+      expect(callbacks).toBe(1);
+
+      // Same camera/canvas/data → key unchanged → no callback
+      await vi.advanceTimersByTimeAsync(16);
+      expect(callbacks).toBe(1);
+
+      // markDataDirty changes the frame key → next frame runs
+      renderer.markDataDirty();
+      await vi.advanceTimersByTimeAsync(16);
+      expect(callbacks).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// ============================================================================
+// Error surfacing
+// ============================================================================
+
+describe('render error surfacing', () => {
+  it('records lastRenderError when the queue fails mid-frame', () => {
+    const { renderer, device } = makeRenderer();
+    device.queue.submit = () => {
+      throw new Error('swiftshader exploded');
+    };
+    renderer.renderFrame();
+    expect(renderer.lastRenderError).toBe('swiftshader exploded');
+    // A healthy queue must not throw further
+    device.queue.submit = () => {};
+    expect(() => renderer.renderFrame()).not.toThrow();
+  });
+});
+
+// ============================================================================
+// Terrain colors (real terrain.ts)
+// ============================================================================
 
 describe('Terrain color generation', () => {
   it('returns correct colors for terrain types', () => {
@@ -359,292 +944,18 @@ describe('Terrain color generation', () => {
       Water: '#3878c9',
       Mountain: '#555555',
     };
-
     for (const [type, expected] of Object.entries(terrainColors)) {
-      const actual = colorForType(type as TerrainType);
-      expect(actual).toBe(expected);
+      expect(colorForType(type as TerrainType)).toBe(expected);
     }
   });
 
-  it('falls back to a colored value (never undefined/white) for unknown terrain', () => {
-    const color = colorForType('Unknown' as TerrainType);
-    expect(color).toBeDefined();
-    expect(color).toBe('#7eb547'); // safe colored fallback, never blanks the screen
+  it('falls back to Plains for unknown terrain', () => {
+    expect(colorForType('Unknown' as TerrainType)).toBe('#7eb547');
   });
 });
 
 // ============================================================================
-// Camera Centering Tests
-// ============================================================================
-
-describe('Camera centering', () => {
-  /**
-   * Same centering logic as Connection.centerCameraOnTerrain()
-   */
-  function computeTerrainCenter(terrain: { length: number; [key: number]: unknown[] }): {
-    x: number;
-    y: number;
-  } {
-    const cellSize = CELL_SIZE;
-    let minCol = Infinity,
-      maxCol = -Infinity;
-    for (let r = 0; r < terrain.length; r++) {
-      const row = terrain[r];
-      if (row && row.length > 0) {
-        minCol = Math.min(minCol, 0);
-        maxCol = Math.max(maxCol, row.length - 1);
-      }
-    }
-    const minRow = 0;
-    const maxRow = terrain.length - 1;
-
-    return {
-      x: ((minCol + maxCol) / 2 + 0.5) * cellSize,
-      y: ((minRow + maxRow) / 2 + 0.5) * cellSize,
-    };
-  }
-
-  it('centers correctly on a 10x10 terrain', () => {
-    const terrain = Array.from({ length: 10 }, () => Array(10).fill(null));
-    const center = computeTerrainCenter(terrain);
-
-    // Center should be at (160, 160) = (5 + 0.5) * 32
-    expect(center.x).toBe((4.5 + 0.5) * CELL_SIZE); // = 160
-    expect(center.y).toBe((4.5 + 0.5) * CELL_SIZE); // = 160
-  });
-
-  it('centers correctly on a 2x2 terrain', () => {
-    const terrain = [
-      [null, null],
-      [null, null],
-    ];
-    const center = computeTerrainCenter(terrain);
-
-    // For 2x2: minCol=0, maxCol=1 → center = ((0+1)/2 + 0.5) * 32 = 32
-    expect(center.x).toBe(1.0 * CELL_SIZE);
-    expect(center.y).toBe(1.0 * CELL_SIZE);
-  });
-
-  it('centers correctly on a wide terrain (20x5)', () => {
-    const terrain = Array.from({ length: 5 }, () => Array(20).fill(null));
-    const center = computeTerrainCenter(terrain);
-
-    expect(center.x).toBe((9.5 + 0.5) * CELL_SIZE); // = 320
-    expect(center.y).toBe((2 + 0.5) * CELL_SIZE); // = 80
-  });
-
-  it('handles irregular (ragged) terrain grid', () => {
-    // Row 0: 3 cells, Row 1: 5 cells, Row 2: 4 cells
-    const terrain = [
-      [null, null, null],
-      [null, null, null, null, null],
-      [null, null, null, null],
-    ];
-    const center = computeTerrainCenter(terrain);
-
-    // minCol=0, maxCol=4 (from row 1), minRow=0, maxRow=2
-    // centerX = ((0+4)/2 + 0.5) * 32 = (2 + 0.5) * 32 = 80
-    // centerY = ((0+2)/2 + 0.5) * 32 = (1 + 0.5) * 32 = 48
-    expect(center.x).toBe(2.5 * CELL_SIZE); // = 80
-    expect(center.y).toBe(1.5 * CELL_SIZE); // = 48
-  });
-
-  it('returns zero center for empty terrain', () => {
-    const terrain: unknown[][] = [];
-    // centerCameraOnTerrain returns early for empty terrain
-    // So this tests the guard condition
-    expect(terrain.length).toBe(0);
-  });
-});
-
-// ============================================================================
-// City Dot Vertex Generation Tests
-// ============================================================================
-
-describe('City dot vertex generation', () => {
-  interface CityData {
-    id: string;
-    position: [number, number];
-    owner?: string;
-  }
-
-  function generateCityDotVertices(
-    cities: CityData[],
-    camera: { x: number; y: number; zoom: number },
-  ): { positions: number[]; colors: number[] } {
-    const positions: number[] = [];
-    const colors: number[] = [];
-
-    for (const city of cities) {
-      const wx = city.position[0] * CELL_SIZE;
-      const wy = city.position[1] * CELL_SIZE;
-      const halfSizeWorld = CITY_DOT_SIZE / 2 / camera.zoom;
-      positions.push(
-        wx - halfSizeWorld,
-        wy - halfSizeWorld,
-        wx + halfSizeWorld,
-        wy - halfSizeWorld,
-        wx + halfSizeWorld,
-        wy + halfSizeWorld,
-        wx - halfSizeWorld,
-        wy + halfSizeWorld,
-      );
-
-      const colorIdx = parseInt((city.owner ?? '').replace('player_', '') || '0') || 0;
-      const color = CITY_COLORS[colorIdx % CITY_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
-      for (let i = 0; i < 4; i++) {
-        colors.push(color.r, color.g, color.b);
-      }
-    }
-
-    return { positions, colors };
-  }
-
-  it('generates one quad (8 positions) for one city', () => {
-    const cities = [{ id: 'city_0', position: [5, 5] as [number, number] }];
-    const { positions, colors } = generateCityDotVertices(cities, {
-      x: 0,
-      y: 0,
-      zoom: 1,
-    });
-
-    expect(positions.length).toBe(8);
-    expect(colors.length).toBe(12);
-  });
-
-  it('generates correct quad at world position for city at (5,5)', () => {
-    const cities = [{ id: 'city_0', position: [5, 5] as [number, number] }];
-    const { positions } = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 1 });
-
-    const wx = 5 * CELL_SIZE; // 160
-    const wy = 5 * CELL_SIZE; // 160
-    const halfSizeWorld = CITY_DOT_SIZE / 2 / 1; // 6
-
-    expect(positions[0]).toBe(wx - halfSizeWorld); // 154
-    expect(positions[1]).toBe(wy - halfSizeWorld); // 154
-    expect(positions[2]).toBe(wx + halfSizeWorld); // 166
-    expect(positions[3]).toBe(wy - halfSizeWorld); // 154
-  });
-
-  it('maintains constant screen-space city dot size across zoom levels', () => {
-    const cities = [{ id: 'city_0', position: [5, 5] as [number, number] }];
-
-    // At zoom=1, world-space width = CITY_DOT_SIZE
-    const atZoom1 = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 1 });
-    const widthAtZoom1 = atZoom1.positions[2] - atZoom1.positions[0];
-    expect(widthAtZoom1).toBe(CITY_DOT_SIZE); // 12 world units at zoom 1
-
-    // At zoom=2, world-space width = CITY_DOT_SIZE / 2 (screen size stays constant)
-    const atZoom2 = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 2 });
-    const widthAtZoom2 = atZoom2.positions[2] - atZoom2.positions[0];
-    expect(widthAtZoom2).toBe(CITY_DOT_SIZE / 2); // 6 world units at zoom 2
-
-    // Screen-space size is constant: worldWidth * zoom = constant
-    expect(widthAtZoom1 * 1).toBe(widthAtZoom2 * 2);
-  });
-
-  it('colors city by owner index', () => {
-    const cities = [{ id: 'city_0', position: [0, 0] as [number, number], owner: 'player_1' }];
-    const { colors } = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 1 });
-
-    // player_1 -> index 1 -> CITY_COLORS[1] = Yellow
-    expect(colors[0]).toBe(CITY_COLORS[1].r);
-    expect(colors[1]).toBe(CITY_COLORS[1].g);
-    expect(colors[2]).toBe(CITY_COLORS[1].b);
-  });
-
-  it('handles unknown owner with gray fallback', () => {
-    const cities = [{ id: 'city_0', position: [0, 0] as [number, number] }];
-    const { colors } = generateCityDotVertices(cities, { x: 0, y: 0, zoom: 1 });
-
-    // No owner -> index 0 -> CITY_COLORS[0] = Red (first color)
-    expect(colors[0]).toBe(CITY_COLORS[0].r);
-  });
-
-  it('generates quads for multiple cities', () => {
-    const cities = [
-      { id: 'city_0', position: [0, 0] as [number, number] },
-      { id: 'city_1', position: [10, 10] as [number, number] },
-      { id: 'city_2', position: [20, 5] as [number, number] },
-    ];
-    const { positions, colors } = generateCityDotVertices(cities, {
-      x: 0,
-      y: 0,
-      zoom: 1,
-    });
-
-    expect(positions.length).toBe(3 * 8); // 3 cities * 8 positions
-    expect(colors.length).toBe(3 * 12); // 3 cities * 12 colors
-  });
-});
-
-// ============================================================================
-// Fog Quad Tests
-// ============================================================================
-
-describe('Fog fullscreen quad', () => {
-  /**
-   * Simulates the NDC fullscreen quad with UVs for fog rendering.
-   * 4 vertices, stride 8: pos(x,y) + uv(x,y)
-   */
-  function generateFogQuadData(): Float32Array {
-    return new Float32Array([
-      // Left-bottom NDC + UV
-      -1, -1, 0, 0,
-      // Right-bottom NDC + UV
-      1, -1, 1, 0,
-      // Left-top NDC + UV
-      -1, 1, 0, 1,
-      // Right-top NDC + UV
-      1, 1, 1, 1,
-    ]);
-  }
-
-  it('generates correct buffer size for fog quad', () => {
-    const data = generateFogQuadData();
-    expect(data.length).toBe(16); // 4 vertices * 4 floats
-    expect(data.byteLength).toBe(64); // 16 * 4 bytes
-  });
-
-  it('covers full NDC space from -1 to +1', () => {
-    const data = generateFogQuadData();
-    // Positions: data[0,1] = -1,-1; data[4,5] = 1,-1; data[8,9] = -1,1; data[12,13] = 1,1
-    expect(data[0]).toBe(-1); // left-bottom X
-    expect(data[1]).toBe(-1); // left-bottom Y
-    expect(data[4]).toBe(1); // right-bottom X
-    expect(data[5]).toBe(-1); // right-bottom Y
-    expect(data[8]).toBe(-1); // left-top X
-    expect(data[9]).toBe(1); // left-top Y
-    expect(data[12]).toBe(1); // right-top X
-    expect(data[13]).toBe(1); // right-top Y
-  });
-
-  it('maps UVs from (0,0) to (1,1)', () => {
-    const data = generateFogQuadData();
-    // UVs: data[2,3] = 0,0; data[6,7] = 1,0; data[10,11] = 0,1; data[14,15] = 1,1
-    expect(data[2]).toBe(0); // left-bottom UV X
-    expect(data[3]).toBe(0); // left-bottom UV Y
-    expect(data[6]).toBe(1); // right-bottom UV X
-    expect(data[7]).toBe(0); // right-bottom UV Y
-    expect(data[10]).toBe(0); // left-top UV X
-    expect(data[11]).toBe(1); // left-top UV Y
-    expect(data[14]).toBe(1); // right-top UV X
-    expect(data[15]).toBe(1); // right-top UV Y
-  });
-
-  it('fog quad is independent of canvas dimensions', () => {
-    // Unlike the old SCREEN_WIDTH/SCREEN_HEIGHT approach, the NDC quad
-    // covers the full screen regardless of canvas size
-    const data = generateFogQuadData();
-    // All values should be -1, 0, or 1 — no canvas-dependent values
-    for (const val of data) {
-      expect([-1, 0, 1]).toContain(val);
-    }
-  });
-});
-
-// ============================================================================
-// Config Constant Tests
+// Config constants
 // ============================================================================
 
 describe('Config constants', () => {
@@ -654,7 +965,6 @@ describe('Config constants', () => {
 
   it('CITY_COLORS has 6 distinct colors', () => {
     expect(CITY_COLORS.length).toBe(6);
-    // Pairwise inequality
     for (let i = 0; i < CITY_COLORS.length; i++) {
       for (let j = i + 1; j < CITY_COLORS.length; j++) {
         expect(CITY_COLORS[i]).not.toEqual(CITY_COLORS[j]);
@@ -662,23 +972,12 @@ describe('Config constants', () => {
     }
   });
 
-  it('CITY_COLORS[0] is red', () => {
-    expect(CITY_COLORS[0]).toEqual({ r: 1, g: 0.2, b: 0.2 });
-  });
-
-  it('CITY_COLORS[1] is yellow', () => {
-    expect(CITY_COLORS[1]).toEqual({ r: 1, g: 1, b: 0.2 });
-  });
-
-  it('CITY_COLORS[2] is blue', () => {
-    expect(CITY_COLORS[2]).toEqual({ r: 0.2, g: 0.4, b: 1 });
-  });
-
-  it('SCREEN_WIDTH and SCREEN_HEIGHT are removed from config', async () => {
-    // These should not exist anymore — fog now uses NDC fullscreen quad
-    // We import the config module and check that the constants are not exported
-    const configModule = await import('./config');
-    expect((configModule as Record<string, unknown>).SCREEN_WIDTH).toBeUndefined();
-    expect((configModule as Record<string, unknown>).SCREEN_HEIGHT).toBeUndefined();
+  it('PLAYER_COLORS has 6 distinct colors', () => {
+    expect(PLAYER_COLORS.length).toBe(6);
+    for (let i = 0; i < PLAYER_COLORS.length; i++) {
+      for (let j = i + 1; j < PLAYER_COLORS.length; j++) {
+        expect(PLAYER_COLORS[i]).not.toEqual(PLAYER_COLORS[j]);
+      }
+    }
   });
 });

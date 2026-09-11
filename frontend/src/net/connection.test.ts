@@ -1,6 +1,6 @@
 //! Connection message dispatch tests.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { decode, encode } from 'cbor-x';
 import {
   applyCells,
@@ -8,6 +8,16 @@ import {
   mapSizeFromTerrain,
   unpackUnitPosition,
 } from './connection';
+import { Connection } from './connection';
+import { CELL_SIZE } from '../game/config';
+import { GameState } from '../game/game_state';
+import { Unit } from '../game/units';
+import { Renderer } from '../game/renderer';
+import { createFakeGpu } from '../test/fake_gpu';
+import type { Spectator } from '../ui/spectator';
+import type { Advisor } from '../ui/advisor';
+import type { LobbyUI } from '../ui/lobby';
+import type { UnitState, CityState, EquipmentState } from '../generated/protocol';
 
 /** Recursively remove `undefined` values from plain objects and arrays. */
 function stripUndefined(value: unknown): unknown {
@@ -103,12 +113,18 @@ describe('I3 packed unit position + equipment counts (connection decode)', () =>
       expect(Math.abs(dy - y)).toBeLessThanOrEqual(halfStep);
     }
     // Exact for whole-cell coords on a power-of-two map.
-    const exact = unpackUnitPosition(pack(11, 20, 32, 32), { width: 32, height: 32 });
+    const exact = unpackUnitPosition(pack(11, 20, 32, 32), {
+      width: 32,
+      height: 32,
+    });
     expect(exact).toEqual({ x: 11, y: 20 });
   });
 
   it('decodes packed position 0 (the origin) to (0,0) — not skipped as falsy', () => {
-    expect(unpackUnitPosition(0, { width: 1000, height: 1000 })).toEqual({ x: 0, y: 0 });
+    expect(unpackUnitPosition(0, { width: 1000, height: 1000 })).toEqual({
+      x: 0,
+      y: 0,
+    });
   });
 
   it('decodes the max packed value to the map edge (clamped by the u16 range)', () => {
@@ -177,7 +193,13 @@ describe('CBOR encoding strips undefined values', () => {
   });
 
   it('preserves null values', () => {
-    const input: Record<string, unknown> = { a: null, b: undefined, c: 0, d: false, e: '' };
+    const input: Record<string, unknown> = {
+      a: null,
+      b: undefined,
+      c: 0,
+      d: false,
+      e: '',
+    };
     const cleaned = stripUndefined(input);
     expect(cleaned).toEqual({ a: null, c: 0, d: false, e: '' });
   });
@@ -217,7 +239,9 @@ describe('CBOR encoding strips undefined values', () => {
 
 describe('Connection message routing', () => {
   it('recognizes FullState message', () => {
-    const msg = { FullState: { terrain: [], units: [], cities: [], player: {} } };
+    const msg = {
+      FullState: { terrain: [], units: [], cities: [], player: {} },
+    };
     expect(msg).toHaveProperty('FullState');
     expect(msg).not.toHaveProperty('DeltaState');
   });
@@ -439,7 +463,9 @@ describe('CBOR roundtrip for server messages', () => {
   });
 
   it('encodes and decodes GameOver', () => {
-    const msg = { GameOver: { game_id: 'g1', winner: 'player_1', message: 'Victory!' } };
+    const msg = {
+      GameOver: { game_id: 'g1', winner: 'player_1', message: 'Victory!' },
+    };
     const bytes = encode(msg);
     const decoded = decode(bytes);
     expect(decoded).toHaveProperty('GameOver');
@@ -462,7 +488,15 @@ describe('Game start transition (FullState → lobby hide)', () => {
       vision_grid: [[true]],
       border_grid: [[0]],
       units: [],
-      cities: [{ id: 'city_0', position: [0, 0], owner: 'player_1', manpower: 10000, level: 1 }],
+      cities: [
+        {
+          id: 'city_0',
+          position: [0, 0],
+          owner: 'player_1',
+          manpower: 10000,
+          level: 1,
+        },
+      ],
       player: { funds: 1000, units_owned: 0 },
     };
 
@@ -570,5 +604,390 @@ describe('Game start transition (FullState → lobby hide)', () => {
     // centerY = (1 + 0.5) * 32 = 48
     expect(centerX).toBe(80);
     expect(centerY).toBe(48);
+  });
+});
+
+// ============================================================================
+// Real Connection class — dispatch against a fake WebSocket
+// ============================================================================
+
+/** Recording WebSocket double: captures outbound frames, injects scripted inbound. */
+class FakeWebSocket {
+  static instances: FakeWebSocket[] = [];
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+
+  readonly url: string;
+  readyState = FakeWebSocket.CONNECTING;
+  binaryType = '';
+  sent: Uint8Array[] = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((ev: { data: unknown }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: ((err: unknown) => void) | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+    FakeWebSocket.instances.push(this);
+  }
+
+  send(data: Uint8Array) {
+    this.sent.push(data);
+  }
+
+  close() {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.();
+  }
+
+  /** Test helper: simulate a successful open. */
+  open() {
+    this.readyState = FakeWebSocket.OPEN;
+    this.onopen?.();
+  }
+
+  /** Test helper: inject a CBOR-encoded server message. */
+  feedServerMessage(msg: Record<string, unknown>) {
+    const bytes = encode(msg);
+    this.onmessage?.({ data: new Uint8Array(bytes).buffer });
+  }
+}
+
+function makeUnitState(overrides: Partial<UnitState> = {}): UnitState {
+  const equipment: EquipmentState[] = [{ name: 'rifle', cost_per_item: 2, count: 10 }];
+  return {
+    id: 'u1',
+    owner: 'player_0',
+    position: [2, 3],
+    unit_type: 'infantry',
+    symbol: 'S',
+    men: 80,
+    max_men: 100,
+    organisation: 60,
+    equipment,
+    max_equipment: equipment,
+    path: [],
+    healing: false,
+    resupply_enabled: true,
+    supply_percent: 100,
+    encircled: false,
+    attacking: false,
+    on_water: false,
+    boat_supply_percent: 0,
+    embarking: false,
+    disembarking: false,
+    ...overrides,
+  };
+}
+
+function makeCityState(overrides: Partial<CityState> = {}): CityState {
+  return {
+    id: 'c1',
+    position: [4, 5],
+    owner: 'player_0',
+    manpower: 1000,
+    level: 1,
+    ...overrides,
+  };
+}
+
+type MockFn = ReturnType<typeof vi.fn>;
+
+interface ConnHarness {
+  conn: Connection;
+  gameState: GameState;
+  renderer: Renderer;
+  spectator: { clearAll: MockFn; gameOver: MockFn; addReason: MockFn };
+  advisor: { show: MockFn };
+  lobbyUI: {
+    enableStartButton: MockFn;
+    showTab: MockFn;
+    updatePlayers: MockFn;
+    showLeaderboard: MockFn;
+    hide: MockFn;
+  };
+  ws: FakeWebSocket;
+}
+
+function makeConnection(spectatorMode = false): ConnHarness {
+  const gameState = new GameState();
+  const { device, canvas } = createFakeGpu(1280, 720);
+  const renderer = new Renderer(canvas, device as unknown as GPUDevice);
+  canvas.width = 1280;
+  canvas.height = 720;
+
+  const spectator: ConnHarness['spectator'] = {
+    clearAll: vi.fn(),
+    gameOver: vi.fn(),
+    addReason: vi.fn(),
+  };
+  const advisor: ConnHarness['advisor'] = { show: vi.fn() };
+  const lobbyUI: ConnHarness['lobbyUI'] = {
+    enableStartButton: vi.fn(),
+    showTab: vi.fn(),
+    updatePlayers: vi.fn(),
+    showLeaderboard: vi.fn(),
+    hide: vi.fn(),
+  };
+
+  const conn = new Connection(
+    gameState,
+    renderer,
+    spectator as unknown as Spectator,
+    advisor as unknown as Advisor,
+    lobbyUI as unknown as LobbyUI,
+    spectatorMode,
+  );
+  conn.connect();
+  const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
+  ws.open();
+  return { conn, gameState, renderer, spectator, advisor, lobbyUI, ws };
+}
+
+describe('Connection (real class, fake WebSocket)', () => {
+  let h: ConnHarness;
+
+  beforeEach(() => {
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    FakeWebSocket.instances = [];
+    h = makeConnection();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('connects to /ws and sends CBOR frames with undefined stripped', () => {
+    expect(h.ws.url).toBe('ws://localhost/ws');
+    h.conn.send({
+      LobbyMessage: {
+        CreateLobby: {
+          settings: { map: 'default', use_standard_ruleset: true },
+          password: undefined,
+        },
+      },
+    } as Record<string, unknown>);
+    expect(h.ws.sent).toHaveLength(1);
+    const decoded = decode(h.ws.sent[0]) as Record<string, Record<string, Record<string, unknown>>>;
+    const create = decoded.LobbyMessage.CreateLobby;
+    expect(create.password).toBeUndefined();
+    expect((create.settings as Record<string, unknown>).map).toBe('default');
+  });
+
+  it('spectator-mode connections never send frames', () => {
+    const s = makeConnection(true);
+    s.conn.send({ Action: { Move: { id: 'u1', x: 0, y: 0 } } });
+    expect(s.ws.sent).toHaveLength(0);
+  });
+
+  it('applies FullState: grids, units, cities, player, camera centered on own territory', () => {
+    const dataDirty = vi.spyOn(h.renderer, 'markDataDirty');
+    const fogDirty = vi.spyOn(h.renderer, 'markFogDirty');
+    const borderDirty = vi.spyOn(h.renderer, 'markBorderDirty');
+
+    const terrain = Array.from({ length: 10 }, () => Array(10).fill('Plains'));
+    h.ws.feedServerMessage({
+      FullState: {
+        terrain,
+        vision_grid: Array.from({ length: 10 }, () => Array(10).fill(true)),
+        border_grid: Array.from({ length: 10 }, () => Array(10).fill(0)),
+        units: [makeUnitState()],
+        cities: [makeCityState()],
+        player: { funds: 500, units_owned: 1, player_id: 'player_0' },
+      },
+    });
+
+    // Grids
+    expect(h.gameState.terrain).toEqual(terrain);
+    expect(h.gameState.visionGrid[0][0]).toBe(true);
+    expect(h.gameState.borderGrid).toEqual(Array.from({ length: 10 }, () => Array(10).fill(0)));
+    // Units are real Unit objects
+    const unit = h.gameState.units.get('u1');
+    expect(unit).toBeInstanceOf(Unit);
+    expect(unit!.position).toEqual({ x: 2, y: 3 });
+    // Cities
+    expect(h.gameState.cities.get('c1')?.manpower).toBe(1000);
+    // Player
+    expect(h.gameState.player.funds).toBe(500);
+    expect(h.gameState.ownPlayerId).toBe('player_0');
+    // Camera centered on own unit (2,3) + own city (4,5): avg (3,4) * CELL_SIZE
+    expect(h.renderer.camera.x).toBeCloseTo(3 * CELL_SIZE, 5);
+    expect(h.renderer.camera.y).toBeCloseTo(4 * CELL_SIZE, 5);
+    // Dirty marks fired
+    expect(dataDirty).toHaveBeenCalled();
+    expect(fogDirty).toHaveBeenCalled();
+    expect(borderDirty).toHaveBeenCalled();
+  });
+
+  it('spectator FullState (no own id) centers on map center', () => {
+    const terrain = Array.from({ length: 10 }, () => Array(10).fill('Plains'));
+    h.ws.feedServerMessage({
+      FullState: {
+        terrain,
+        units: [makeUnitState({ owner: 'player_1' })],
+        cities: [makeCityState({ owner: 'player_1' })],
+        player: { funds: 0, units_owned: 0, player_id: '' },
+      },
+    });
+    // 10x10 → center (5,5) * CELL_SIZE
+    expect(h.renderer.camera.x).toBeCloseTo(5 * CELL_SIZE, 5);
+    expect(h.renderer.camera.y).toBeCloseTo(5 * CELL_SIZE, 5);
+  });
+
+  it('I4: sparse vision_cells_changed patches the existing vision grid in place', () => {
+    const fogDirty = vi.spyOn(h.renderer, 'markFogDirty');
+    // Baseline 4x4 all-visible
+    h.gameState.visionGrid = Array.from({ length: 4 }, () => Array(4).fill(true));
+    h.gameState.terrain = Array.from({ length: 4 }, () => Array(4).fill('Plains'));
+    // Patch index 5 (row 1, col 1) → false. bits=ceil(log2(16))=4, value 0 → packed=5
+    h.ws.feedServerMessage({
+      DeltaState: {
+        vision_cells_changed: [5],
+        grid_width: 4,
+        city_updates: [],
+        unit_updates: [],
+        units_added: [],
+        units_removed: [],
+        player: { funds: 0, units_owned: 0, player_id: '' },
+      },
+    });
+    expect(h.gameState.visionGrid[1][1]).toBe(false);
+    expect(h.gameState.visionGrid[0][0]).toBe(true); // untouched
+    expect(fogDirty).toHaveBeenCalled();
+  });
+
+  it('I4: sparse border_cells_changed patches the border grid including 255', () => {
+    const borderDirty = vi.spyOn(h.renderer, 'markBorderDirty');
+    h.gameState.borderGrid = Array.from({ length: 4 }, () => Array(4).fill(0));
+    h.gameState.terrain = Array.from({ length: 4 }, () => Array(4).fill('Plains'));
+    // index 3 → 255 (bits=4, value 255 → (255<<4)|3 = 4083); index 7 → 2 (→ (2<<4)|7 = 39)
+    h.ws.feedServerMessage({
+      DeltaState: {
+        border_cells_changed: [4083, 39],
+        grid_width: 4,
+        city_updates: [],
+        unit_updates: [],
+        units_added: [],
+        units_removed: [],
+        player: { funds: 0, units_owned: 0, player_id: '' },
+      },
+    });
+    expect(h.gameState.borderGrid[0][3]).toBe(255);
+    expect(h.gameState.borderGrid[1][3]).toBe(2);
+    expect(h.gameState.borderGrid[0][0]).toBe(0);
+    expect(borderDirty).toHaveBeenCalled();
+  });
+
+  it('I3: packed unit position decoded against map size + equipment counts applied', () => {
+    const terrain = Array.from({ length: 10 }, () => Array(10).fill('Plains'));
+    h.ws.feedServerMessage({
+      FullState: {
+        terrain,
+        units: [makeUnitState({ position: [0, 0] })],
+        cities: [],
+        player: { funds: 0, units_owned: 1, player_id: 'player_0' },
+      },
+    });
+    const unit = h.gameState.units.get('u1')!;
+    // Pack (2.5, 5) on a 10x10 map: x_q=round(2.5*65536/10)=16384, y_q=round(5*65536/10)=32768
+    const packed = (16384 << 16) | 32768;
+    h.ws.feedServerMessage({
+      DeltaState: {
+        unit_updates: [{ id: 'u1', position: packed, equipment: [25] }],
+        city_updates: [],
+        units_added: [],
+        units_removed: [],
+        player: { funds: 0, units_owned: 1, player_id: 'player_0' },
+      },
+    });
+    expect(unit.position).toEqual({ x: 2.5, y: 5 });
+    expect(unit.equipment[0].count).toBe(25);
+    expect(unit.equipment[0].name).toBe('rifle'); // slot name preserved from full state
+  });
+
+  it('applies units_added/removed, city_updates, and player funds from a delta', () => {
+    h.ws.feedServerMessage({
+      FullState: {
+        terrain: Array.from({ length: 4 }, () => Array(4).fill('Plains')),
+        units: [makeUnitState()],
+        cities: [makeCityState()],
+        player: { funds: 100, units_owned: 1, player_id: 'player_0' },
+      },
+    });
+    h.ws.feedServerMessage({
+      DeltaState: {
+        units_added: [makeUnitState({ id: 'u2', owner: 'player_1' })],
+        units_removed: [],
+        city_updates: [{ id: 'c1', manpower: 42, level: 3 }],
+        unit_updates: [],
+        player: { funds: 999, units_owned: 2, player_id: 'player_0' },
+      },
+    });
+    expect(h.gameState.units.has('u2')).toBe(true);
+    expect(h.gameState.cities.get('c1')?.manpower).toBe(42);
+    expect(h.gameState.cities.get('c1')?.level).toBe(3);
+    expect(h.gameState.player.funds).toBe(999);
+
+    // Now remove u1
+    h.ws.feedServerMessage({
+      DeltaState: {
+        units_added: [],
+        units_removed: ['u1'],
+        city_updates: [],
+        unit_updates: [],
+        player: { funds: 999, units_owned: 1, player_id: 'player_0' },
+      },
+    });
+    expect(h.gameState.units.has('u1')).toBe(false);
+  });
+
+  it('GameOver routes to spectator + re-enables start button', () => {
+    h.ws.feedServerMessage({
+      GameOver: { game_id: 'g1', winner: 'player_0', message: 'Victory' },
+    });
+    expect(h.spectator.gameOver).toHaveBeenCalledWith('player_0', 'g1', 'Victory');
+    expect(h.lobbyUI.enableStartButton).toHaveBeenCalled();
+  });
+
+  it('LobbyUpdate sets gameState.playerList + ownerIdToIndex and updates lobby UI', () => {
+    h.ws.feedServerMessage({
+      LobbyUpdate: {
+        players: [
+          { id: 'player_a', name: 'Alice', is_human: true, llm_provider: null },
+          {
+            id: 'player_b',
+            name: 'Bob',
+            is_human: false,
+            llm_provider: 'openai',
+          },
+        ],
+        settings: { map: 'default', use_standard_ruleset: true },
+      },
+    });
+    expect(h.gameState.playerList).toEqual([
+      { id: 'player_a', name: 'Alice', slot: 0 },
+      { id: 'player_b', name: 'Bob', slot: 1 },
+    ]);
+    expect(h.gameState.ownerIdToIndex.get('player_b')).toBe(1);
+    expect(h.lobbyUI.updatePlayers).toHaveBeenCalled();
+  });
+
+  it('Advice → advisor.show; LlmReasonLog → spectator.addReason; ClearSpectator → spectator.clearAll', () => {
+    h.ws.feedServerMessage({ Advice: { text: 'Hold the line' } });
+    expect(h.advisor.show).toHaveBeenCalledWith('Hold the line');
+
+    h.ws.feedServerMessage({
+      LlmReasonLog: {
+        player_name: 'Alice',
+        action: 'move',
+        reason: 'flanking',
+      },
+    });
+    expect(h.spectator.addReason).toHaveBeenCalledWith('Alice', 'move', 'flanking');
+
+    h.ws.feedServerMessage({ ClearSpectator: null });
+    expect(h.spectator.clearAll).toHaveBeenCalled();
   });
 });

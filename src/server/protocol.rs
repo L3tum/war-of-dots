@@ -1941,6 +1941,208 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Golden-CBOR contract fixture (Rust <-> frontend lockstep)
+    //
+    // `tests/fixtures/protocol_delta_golden.bin` is one canonical
+    // `ServerMessage::DeltaState` encoded by ciborium. The frontend's
+    // `src/net/protocol_golden.test.ts` decodes the same bytes with plain
+    // cbor-x and asserts the same values. Any schema rename/reorder or I3/I4
+    // constant change breaks one side (or both).
+    //
+    // Regenerate after an intentional protocol change:
+    //   cargo test --lib dump_protocol_delta_golden -- --ignored
+    // ---------------------------------------------------------------------------
+
+    /// I4 packed cells for a 4x4 grid (bits = 4): vision `(0<<4)|5`, `(1<<4)|1`;
+    /// border `(255<<4)|3` (no owner), `(2<<4)|7` (player 2).
+    const GOLDEN_VISION_CELLS: [u32; 2] = [5, 17];
+    const GOLDEN_BORDER_CELLS: [u32; 2] = [4083, 39];
+    /// I3: `pack_unit_position((11.0, 5.0), (32, 16))` — exact on this grid:
+    /// `(round(11*65536/32) << 16) | round(5*65536/16)` = `(22528 << 16) | 20480`.
+    const GOLDEN_PACKED_POS: u32 = 0x5800_5000;
+
+    fn golden_delta() -> ServerMessage {
+        ServerMessage::DeltaState(GameDeltaMessage {
+            vision_grid_diff: None,
+            vision_cells_changed: Some(Arc::new(GOLDEN_VISION_CELLS.to_vec())),
+            border_grid_diff: None,
+            border_cells_changed: Some(Arc::new(GOLDEN_BORDER_CELLS.to_vec())),
+            grid_width: Some(4),
+            units_added: Arc::new(vec![UnitState {
+                id: "u1".to_string(),
+                owner: "player_0".to_string(),
+                position: (2.5, 5.0),
+                unit_type: "infantry".to_string(),
+                symbol: "I".to_string(),
+                men: 1000.0,
+                max_men: 1000.0,
+                organisation: 100.0,
+                equipment: vec![EquipmentState {
+                    name: "rifle".to_string(),
+                    count: 100,
+                    cost_per_item: 2.0,
+                }],
+                max_equipment: vec![EquipmentState {
+                    name: "rifle".to_string(),
+                    count: 100,
+                    cost_per_item: 2.0,
+                }],
+                path: vec![(3.0, 5.0), (4.0, 5.0)],
+                healing: false,
+                resupply_enabled: true,
+                supply_percent: 75.0,
+                encircled: false,
+                attacking: false,
+                on_water: false,
+                boat_supply_percent: 0.0,
+                embarking: false,
+                disembarking: false,
+            }]),
+            units_removed: Arc::new(vec!["u0".to_string()]),
+            unit_updates: Arc::new(vec![UnitUpdate {
+                id: "u2".to_string(),
+                position: Some(GOLDEN_PACKED_POS),
+                men: Some(1000.0),
+                organisation: None,
+                equipment: Some(vec![25]),
+                path: None,
+                healing: None,
+                resupply_enabled: None,
+                supply_percent: None,
+                encircled: None,
+                attacking: None,
+                on_water: None,
+                boat_supply_percent: None,
+                embarking: None,
+                disembarking: None,
+            }]),
+            city_updates: Arc::new(vec![CityUpdate {
+                id: "c1".to_string(),
+                manpower: Some(42),
+                owner: None,
+                level: Some(3),
+            }]),
+            player: PlayerState {
+                funds: 500,
+                units_owned: 2,
+                player_id: "player_0".to_string(),
+            },
+        })
+    }
+
+    /// Regeneration path — writes the committed fixture. Ignored by default so
+    /// ordinary `cargo test` runs never rewrite tracked files.
+    #[test]
+    #[ignore = "regenerate protocol_delta_golden.bin: cargo test --lib dump_protocol_delta_golden -- --ignored"]
+    fn dump_protocol_delta_golden() {
+        let bytes = to_cbor_bytes(&golden_delta());
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(dir).join("protocol_delta_golden.bin"),
+            &bytes,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn protocol_delta_golden_contract() {
+        let golden: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/protocol_delta_golden.bin"
+        ));
+        // Byte-lock: ciborium's serialization is deterministic, so re-encoding
+        // the canonical message must reproduce the committed fixture exactly.
+        assert_eq!(
+            to_cbor_bytes(&golden_delta()),
+            golden,
+            "protocol_delta_golden.bin is stale — regenerate: \
+             cargo test --lib dump_protocol_delta_golden -- --ignored"
+        );
+        // Decode with plain ciborium and check the fields the frontend locks
+        // in `protocol_golden.test.ts`.
+        let decoded: ServerMessage = ciborium::from_reader(golden).unwrap();
+        let ServerMessage::DeltaState(delta) = decoded else {
+            panic!("expected DeltaState in golden fixture");
+        };
+        assert_eq!(delta.grid_width, Some(4));
+        assert_eq!(
+            delta.vision_cells_changed.as_ref().map(|v| v.as_slice()),
+            Some(GOLDEN_VISION_CELLS.as_slice())
+        );
+        assert_eq!(
+            delta.border_cells_changed.as_ref().map(|v| v.as_slice()),
+            Some(GOLDEN_BORDER_CELLS.as_slice())
+        );
+        assert!(delta.vision_grid_diff.is_none());
+        assert!(delta.border_grid_diff.is_none());
+        // I3: packed position round-trips against the map size it was packed with.
+        let update = &delta.unit_updates[0];
+        assert_eq!(update.id, "u2");
+        assert_eq!(update.position, Some(GOLDEN_PACKED_POS));
+        let (x, y) = unpack_unit_position(GOLDEN_PACKED_POS, (32, 16));
+        assert_eq!(x, 11.0);
+        assert_eq!(y, 5.0);
+        assert_eq!(update.men, Some(1000.0));
+        assert_eq!(update.equipment, Some(vec![25]));
+        // I3 equipment counts reference the once-sent slot names:
+        let added = &delta.units_added[0];
+        assert_eq!(added.id, "u1");
+        assert_eq!(added.position, (2.5, 5.0));
+        assert_eq!(added.men, 1000.0);
+        assert_eq!(added.supply_percent, 75.0);
+        assert_eq!(added.equipment[0].name, "rifle");
+        assert_eq!(added.equipment[0].count, 100);
+        assert_eq!(&*delta.units_removed, &["u0"][..]);
+        assert_eq!(delta.city_updates[0].manpower, Some(42));
+        assert_eq!(delta.city_updates[0].level, Some(3));
+        assert_eq!(delta.player.funds, 500);
+        assert_eq!(delta.player.units_owned, 2);
+        assert_eq!(delta.player.player_id, "player_0");
+    }
+
+    #[test]
+    fn float_deser_accepts_cbor_x_integer_form_of_whole_floats() {
+        // cbor-x (frontend) encodes a JS whole-number float — e.g.
+        // `llm_thinking_delay: 3` or `game_speed: 1000` — as a CBOR *integer*
+        // (major type 0), never as a CBOR float. Plain ciborium rejects a
+        // CBOR integer for an `f32`/`f64` field (see `deserialize_f64` in
+        // ciborium's deserializer), which is exactly what `float_deser`
+        // exists to absorb.
+        //
+        // `19 03 e8` = uint16(1000) — the exact bytes cbor-x emits for 1000.0.
+        // Here as a one-entry map `{"v": 1000}` (the wire form of a field):
+        // `a1` map(1), `61 76` text "v", `19 03 e8` uint16(1000).
+        let cbor_x_whole_float: &[u8] = &[0xa1, 0x61, 0x76, 0x19, 0x03, 0xe8];
+        #[derive(Deserialize)]
+        #[allow(dead_code)] // only the decode error is asserted, never the field
+        struct PlainF32 {
+            v: f32,
+        }
+        assert!(
+            ciborium::from_reader::<PlainF32, _>(&cbor_x_whole_float[..]).is_err(),
+            "plain ciborium must reject a CBOR integer for an f32 field — \
+             that asymmetry is what float_deser exists for"
+        );
+        #[derive(Deserialize)]
+        struct WrapperF32 {
+            #[serde(deserialize_with = "float_deser::deserialize_f32")]
+            v: f32,
+        }
+        let w: WrapperF32 = ciborium::from_reader(&cbor_x_whole_float[..]).unwrap();
+        assert_eq!(w.v, 1000.0);
+
+        #[derive(Deserialize)]
+        struct WrapperF64 {
+            #[serde(deserialize_with = "float_deser::deserialize_f64")]
+            v: f64,
+        }
+        let w64: WrapperF64 = ciborium::from_reader(&cbor_x_whole_float[..]).unwrap();
+        assert_eq!(w64.v, 1000.0);
+    }
+
     #[cfg(test)]
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
