@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './harness/static-server';
 
 type ReplayStats = { error: string | null; frames: number; events: number };
 
@@ -9,7 +9,8 @@ type ReplayStats = { error: string | null; frames: number; events: number };
  * replay pipeline (`ReplayPlayer` → real `Renderer` → real WGSL shaders
  * compiled by naga/tint and rasterized on CPU by Dawn/SwiftShader). No game
  * server and no WebSocket are involved — the page and fixture are served
- * statically (see the `frontend-e2e` make target).
+ * statically by the `static-server` harness fixture (see the `frontend-e2e`
+ * make target).
  *
  * Asserts only render health: no error overlay, a clean
  * `renderer.lastRenderError`, and the frames >= events invariant polled via
@@ -60,7 +61,9 @@ test('replay renders with no WebGPU render errors', async ({ page }) => {
       MIN_EXPECTED_EVENTS,
       { timeout: FRAME_POLL_MS, polling: 250 },
     )
-    .then((h) => h.jsonValue() as ReplayStats);
+    // The predicate only passes when the hook returned the stats object
+    // (never `false`), hence the safe cast.
+    .then((h) => h.jsonValue() as unknown as ReplayStats);
   expect(stats.events, 'all fixture events must have been applied').toBeGreaterThanOrEqual(
     MIN_EXPECTED_EVENTS,
   );

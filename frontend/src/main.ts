@@ -138,6 +138,19 @@ async function main() {
   // Establish WebSocket connection to the server
   connection.connect();
 
+  // Small E2E test hook (read by frontend/e2e/live/lobby.spec.ts) so the live
+  // path can assert renderer health without scraping the DOM — the mirror of
+  // __replayStats for the no-server layer: the last render error and how many
+  // render passes have been submitted since load.
+  (
+    window as unknown as {
+      __gameStats?: () => { error: string | null; frames: number };
+    }
+  ).__gameStats = () => ({
+    error: renderer.lastRenderError,
+    frames: renderer.framesSubmitted,
+  });
+
   const lobbyUI = new LobbyUI(connection);
   connection.setLobbyUI(lobbyUI);
 

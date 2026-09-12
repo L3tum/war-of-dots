@@ -105,6 +105,17 @@ impl LobbyManager {
         connection: PlayerSender,
         custom_unit_types: Vec<super::protocol::CustomUnitType>,
     ) -> String {
+        // A `max_players` of 0 means "unspecified": standard-ruleset clients
+        // omit the field entirely (their form section is hidden) and serde
+        // fills in 0. Without normalizing it, the lobby would be join-proof —
+        // the full check `players.len() >= max_players` is immediately true
+        // (1 >= 0) and every JoinLobby fails with "Lobby full". The default
+        // map puts city clusters at the four corners, so four is the natural
+        // cap for an unspecified lobby.
+        let mut settings = settings;
+        if settings.max_players == 0 {
+            settings.max_players = 4;
+        }
         let code = Uuid::new_v4().to_string()[..12].to_string();
         let lobby = Lobby {
             code: code.clone(),

@@ -4,13 +4,21 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 /**
- * No-server WebGPU E2E config (Layer 2).
+ * E2E config — two layers, one runner.
  *
- * Runs the *real* GPU stack on CPU: full Chromium (not the headless shell,
- * which has no `navigator.gpu`) under `xvfb-run`, rasterized by Dawn/SwiftShader.
- * The Makefile target `frontend-e2e` builds the bundle, stages the replay
- * fixture at `dist/replays/`, serves `dist/` statically, and sets
- * `WEBGPU_E2E_URL` to point the suite at it.
+ * Both projects run the *real* GPU stack on CPU: full Chromium (not the
+ * headless shell, which has no `navigator.gpu`) under `xvfb-run`, rasterized
+ * by Dawn/SwiftShader. The Makefile target `frontend-e2e` (via
+ * e2e/run_e2e.sh) builds the bundle + server binary, then runs this suite.
+ *
+ * Each layer's server lifecycle lives in a harness fixture (e2e/harness/),
+ * which also overrides the `baseURL` fixture — so specs use relative
+ * `page.goto('/')` and never touch ports or URLs:
+ *
+ *   - `no-server` (webgpu.spec.ts): static file server over dist/ — the fast
+ *     render-pipeline smoke layer (replay mode, no Rust, no WebSocket).
+ *   - `live` (live/*.spec.ts): the real war-of-dots binary — full E2E with
+ *     the baked-in frontend, real /ws traffic, and the WP3 handshake.
  */
 
 /**
@@ -47,10 +55,21 @@ export default defineConfig({
   workers: 1,
   fullyParallel: false,
   reporter: [['list']],
+  projects: [
+    {
+      name: 'no-server',
+      testMatch: 'webgpu.spec.ts',
+    },
+    {
+      name: 'live',
+      testMatch: 'live/**/*.spec.ts',
+    },
+  ],
   use: {
     // WebGPU needs the full Chromium build; the page is driven under xvfb-run.
     headless: false,
-    baseURL: process.env.WEBGPU_E2E_URL ?? 'http://127.0.0.1:8123',
+    // NOTE: no top-level baseURL — each harness fixture overrides it (a
+    // static server for `no-server`, the live binary for `live`).
     launchOptions: {
       executablePath: cachedChromium(),
       args: [

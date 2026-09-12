@@ -3752,6 +3752,87 @@ replay_path = "{replay}"
         handle.abort();
     }
 
+    /// Scenario: a standard-ruleset lobby — where the client payload omits
+    /// `max_players` entirely, as the browser's standard mode does — must
+    /// still be joinable. Regression for a real bug (caught by the live E2E
+    /// suite): serde defaults the omitted field to 0, and the join full-check
+    /// `players.len() >= max_players` was then immediately true (1 >= 0), so
+    /// every join failed with "Lobby full". create_lobby normalizes 0 → 4.
+    #[tokio::test]
+    async fn tcp_standard_lobby_omitting_max_players_is_joinable() {
+        let server = make_server().await;
+        let (mut host, host_handle) = spawn_tcp_server(server.clone()).await;
+
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        write_frame(&mut host, &cbor_bytes(&hello)).await.unwrap();
+        read_until_match(&mut host, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+
+        // default_lobby_settings() deliberately has no max_players key — the
+        // exact shape the browser sends in standard mode.
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("Host".to_string()),
+        });
+        write_frame(&mut host, &cbor_bytes(&create)).await.unwrap();
+        let code = match read_until_match(&mut host, |m| {
+            matches!(m, ServerMessage::LobbyCreated { .. })
+        })
+        .await
+        {
+            ServerMessage::LobbyCreated { lobby_code } => lobby_code,
+            other => panic!("expected LobbyCreated, got {other:?}"),
+        };
+        assert!(!code.is_empty());
+
+        // A second client joins the same lobby.
+        let (mut guest, guest_handle) = spawn_tcp_server(server.clone()).await;
+        write_frame(&mut guest, &cbor_bytes(&hello)).await.unwrap();
+        read_until_match(&mut guest, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+        let join = ClientMessage::LobbyMessage(LobbyMessage::JoinLobby {
+            lobby_code: code.clone(),
+            password: None,
+            player_name: Some("Guest".to_string()),
+        });
+        write_frame(&mut guest, &cbor_bytes(&join)).await.unwrap();
+
+        // The guest gets LobbyJoined — not Error("Lobby full").
+        match read_until_match(&mut guest, |m| {
+            matches!(m, ServerMessage::LobbyJoined { .. })
+                || matches!(m, ServerMessage::Error { .. })
+        })
+        .await
+        {
+            ServerMessage::LobbyJoined { lobby_code } => assert_eq!(lobby_code, code),
+            other => panic!("expected LobbyJoined, got {other:?}"),
+        }
+
+        // The host converges on the two-player roster (LobbyUpdate broadcast).
+        let update = read_until_match(&mut host, |m| match m {
+            ServerMessage::LobbyUpdate { players, .. } => players.len() == 2,
+            _ => false,
+        })
+        .await;
+        match update {
+            ServerMessage::LobbyUpdate {
+                players, settings, ..
+            } => {
+                assert_eq!(players.len(), 2);
+                assert_eq!(
+                    settings.max_players, 4,
+                    "unspecified cap must normalize to the default, not 0"
+                );
+            }
+            other => panic!("expected LobbyUpdate, got {other:?}"),
+        }
+
+        host_handle.abort();
+        guest_handle.abort();
+    }
+
     /// Scenario 2: first frame is not a Hello → Error, then the server closes.
     #[tokio::test]
     async fn tcp_rejects_non_hello_first_message() {

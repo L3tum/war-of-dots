@@ -404,6 +404,12 @@ export class Connection {
         const overlay = document.getElementById('game-over-overlay');
         if (overlay) overlay.classList.add('hidden');
 
+        // Mirror LobbyCreated: set the code display so a joining player can
+        // read/share the lobby code (previously the guest's display stayed
+        // blank after a successful join).
+        const codeDisplay = document.getElementById('lobby-code-display');
+        if (codeDisplay) codeDisplay.textContent = msg.LobbyJoined.lobby_code;
+
         // Delegate to LobbyUI for tab/panel management
         if (this.lobbyUI) {
           this.lobbyUI.showTab('info');
