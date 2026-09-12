@@ -187,6 +187,16 @@ export class Connection {
   private reconnectDelay = 1000; // start at 1 second, doubles each attempt
   private maxReconnectDelay = 30000; // cap at 30 seconds
 
+  // WP3: handshake — the server requires a Hello as the first message and
+  // answers HelloAck before any lobby/game traffic. Sends that arrive
+  // before the ack are queued (bounded); a rejected handshake is fatal
+  // (no reconnect storm against a server that will never accept us).
+  private static readonly PROTOCOL_VERSION = 1;
+  private static readonly FEATURES = 0; // no feature bits requested in v1
+  private helloAcked = false;
+  private handshakeFailed = false;
+  private pendingSends: Array<Record<string, unknown>> = [];
+
   // UI references — delegates all display logic to UI modules
   private spectator: Spectator;
   private advisor: Advisor;
@@ -226,6 +236,18 @@ export class Connection {
       console.log('Connected to server');
       this.reconnectDelay = 1000; // reset delay on success
       this.showDisconnected(false);
+      // WP3: Hello MUST be the first message (spectator connections are
+      // read-only and use a different server endpoint that has no
+      // handshake).
+      if (!this.spectatorMode) {
+        this.helloAcked = false;
+        this.sendRaw({
+          Hello: {
+            protocol_version: Connection.PROTOCOL_VERSION,
+            features: Connection.FEATURES,
+          },
+        });
+      }
     };
 
     this.ws.onmessage = (event: MessageEvent) => {
@@ -278,6 +300,22 @@ export class Connection {
   send(message: Record<string, unknown>) {
     // Spectator / replay connections are read-only — never send control messages.
     if (this.spectatorMode) return;
+    // WP3: the server rejects lobby/game traffic until the Hello handshake
+    // completes. Queue briefly (bounded) instead of dropping — a
+    // user-initiated send can race the ack in the first moments of a
+    // connection.
+    if (!this.helloAcked) {
+      if (this.pendingSends.length >= 16) {
+        console.warn('[WS] dropping send before HelloAck (queue full)');
+        return;
+      }
+      this.pendingSends.push(message);
+      return;
+    }
+    this.sendRaw(message);
+  }
+
+  private sendRaw(message: Record<string, unknown>) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       const encoded = CBOR.encode(message);
       // Debug: log sent message in dev mode
@@ -296,6 +334,9 @@ export class Connection {
   }
 
   private reconnect() {
+    // WP3: a rejected handshake is fatal — retrying cannot succeed against
+    // this server, so don't hammer it with reconnect attempts.
+    if (this.handshakeFailed) return;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       this.connect();
@@ -307,6 +348,26 @@ export class Connection {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private handleServerMessage(msg: ServerMessage & Record<string, any>) {
     try {
+      // WP3: handshake completion — the server accepted our protocol
+      // version. Flush any sends that raced the ack.
+      if (msg.HelloAck) {
+        this.helloAcked = true;
+        if (msg.HelloAck.features) {
+          console.log('[WS] negotiated features:', msg.HelloAck.features);
+        }
+        const pending = this.pendingSends;
+        this.pendingSends = [];
+        for (const m of pending) this.sendRaw(m);
+        return;
+      }
+      if (!this.helloAcked && 'Error' in msg) {
+        // Any Error before HelloAck is a handshake rejection (unknown
+        // protocol version / Hello not first).
+        console.error('Handshake rejected by server:', msg.Error?.message);
+        this.handshakeFailed = true;
+        this.showDisconnected(true);
+        return;
+      }
       // The server uses Rust enum serialization: { FullState: {...} }, { DeltaState: {...} }
       // E-5: Use typed ServerMessage from generated protocol. The & Record<string, any>
       // allows accessing runtime fields that the generated types may not fully cover

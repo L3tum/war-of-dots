@@ -214,9 +214,43 @@ pub struct PlayerState {
 }
 
 // Client -> server messages
+/// WP3: the wire protocol version spoken by this server. A client's first
+/// message must be `Hello { protocol_version, features }`; the server
+/// rejects any other version.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// WP3: feature bits negotiated in `Hello.features` ∩ server support and
+/// echoed in `HelloAck.features`. Each bit lights up as its work package
+/// lands; until then the wire format for that feature is the legacy one.
+// Forward-declared protocol surface: no non-test code reads the bits yet
+// (SERVER_SUPPORTED_FEATURES is 0); each is referenced as its WP lands.
+#[allow(dead_code)]
+pub const F_GRID_RLE: u32 = 1 << 0;
+#[allow(dead_code)]
+pub const F_COMPACT_ENTITIES: u32 = 1 << 1;
+#[allow(dead_code)]
+pub const F_AOI: u32 = 1 << 2;
+
+/// WP3: the features this server actually implements today. None yet —
+/// every bit above is still legacy-format on the wire.
+pub const SERVER_SUPPORTED_FEATURES: u32 = 0;
+
+/// WP3: negotiated feature set for a client's Hello.
+pub fn negotiate_features(client_features: u32) -> u32 {
+    client_features & SERVER_SUPPORTED_FEATURES
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub enum ClientMessage {
+    /// WP3: MUST be the first message on a new connection (WS binary frame
+    /// or raw-TCP length-prefixed frame). `features` is the client's
+    /// requested feature set; the server responds with `HelloAck` carrying
+    /// the negotiated (ANDed) set.
+    Hello {
+        protocol_version: u16,
+        features: u32,
+    },
     MoveTroop {
         troop_id: String,
         path: Vec<(f32, f32)>,
@@ -418,6 +452,13 @@ pub struct LeaderboardEntry {
 // Server -> client messages
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum ServerMessage {
+    /// WP3: handshake response — MUST be the server's first message on a
+    /// new connection. `features` is the negotiated set (client request
+    /// ANDed with [`SERVER_SUPPORTED_FEATURES`]).
+    HelloAck {
+        protocol_version: u16,
+        features: u32,
+    },
     FullState(GameStateMessage),
     DeltaState(GameDeltaMessage),
     LobbyCreated {
@@ -2306,5 +2347,62 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex byte"))
             .collect()
+    }
+
+    // ── WP3: handshake ──────────────────────────────────────────────────────
+
+    #[test]
+    fn hello_decodes_from_cbor() {
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                features: F_GRID_RLE | F_AOI,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let msg: ClientMessage = ciborium::from_reader(&buf[..]).unwrap();
+        match msg {
+            ClientMessage::Hello {
+                protocol_version,
+                features,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(features, F_GRID_RLE | F_AOI);
+            }
+            other => panic!("decoded the wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn helloack_encodes_with_negotiated_features() {
+        let msg = ServerMessage::HelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            features: negotiate_features(F_COMPACT_ENTITIES | F_AOI | 0xF0),
+        };
+        let buf = encode_message(&msg);
+        let back: ServerMessage = ciborium::from_reader(&buf[..]).unwrap();
+        match back {
+            ServerMessage::HelloAck {
+                protocol_version,
+                features,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                // SERVER_SUPPORTED_FEATURES is 0 today: everything is ANDed out.
+                assert_eq!(features, 0);
+            }
+            other => panic!("decoded the wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_features_is_and_with_server_support() {
+        assert_eq!(negotiate_features(0), 0);
+        assert_eq!(negotiate_features(u32::MAX), SERVER_SUPPORTED_FEATURES);
+        assert_eq!(
+            negotiate_features(F_GRID_RLE | F_COMPACT_ENTITIES | F_AOI),
+            0
+        );
     }
 }

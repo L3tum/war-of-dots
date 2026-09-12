@@ -9,6 +9,35 @@
       ]
     },
     {
+      "description": "WP3: handshake response — MUST be the server's first message on a new connection. `features` is the negotiated set (client request ANDed with [`SERVER_SUPPORTED_FEATURES`]).",
+      "type": "object",
+      "required": [
+        "HelloAck"
+      ],
+      "properties": {
+        "HelloAck": {
+          "type": "object",
+          "required": [
+            "features",
+            "protocol_version"
+          ],
+          "properties": {
+            "features": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "protocol_version": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
       "type": "object",
       "required": [
         "FullState"

@@ -1,8 +1,18 @@
-//! Console client for War of Dots - headless testing
+//! Console client for War of Dots — headless testing.
+//!
+//! Speaks the wire protocol directly: u32 BE length-prefixed CBOR frames
+//! over raw TCP, starting with the WP3 Hello handshake (Hello must be the
+//! first frame; the client waits for HelloAck before sending anything else).
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use std::io::Write;
+
+use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use war_of_dots::server::framing::{read_frame, write_frame};
+use war_of_dots::server::protocol::{
+    ClientMessage, LobbyMessage, LobbySettings, ServerMessage, PROTOCOL_VERSION,
+};
 
 const SERVER_URL: &str = "127.0.0.1:8081";
 
@@ -11,129 +21,220 @@ fn main() {
     rt.block_on(async {
         let addr = std::env::var("WOZ_SERVER").unwrap_or_else(|_| SERVER_URL.to_string());
         println!("Connecting to {}", addr);
-        match TcpStream::connect(addr).await {
-            Ok(stream) => {
-                let (mut reader, mut writer) = stream.into_split();
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to connect: {e}");
+                return;
+            }
+        };
+        let (mut reader, mut writer) = stream.into_split();
 
-                // Spawn a reader task to receive server messages
-                let reader_task = tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    loop {
-                        match reader.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                match ciborium::from_reader::<ciborium::Value, _>(buf.as_slice()) {
-                                    Ok(msg) => {
-                                        // Extract the "type" field from a CBOR map
-                                        let type_name = extract_type(&msg);
-                                        match type_name {
-                                            Some(name) => println!("{}: {:?}", name, msg),
-                                            None => println!("{:?}", msg),
-                                        }
-                                    }
-                                    Err(_) => {
-                                        println!("Server raw: {}", String::from_utf8_lossy(&buf));
-                                    }
-                                }
-                                buf.clear();
-                            }
-                            Err(_) => break,
-                        }
+        // ── WP3 handshake: Hello MUST be the first frame ────────────────────────
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0, // no feature bits requested in v1
+        };
+        if write_frame(&mut writer, &cbor(&hello)).await.is_err() {
+            eprintln!("Failed to send Hello");
+            return;
+        }
+        match read_frame(&mut reader).await {
+            Ok(ack) => match ciborium::from_reader::<ServerMessage, _>(&ack[..]) {
+                Ok(ServerMessage::HelloAck {
+                    protocol_version,
+                    features,
+                }) => {
+                    println!("HelloAck (protocol v{protocol_version}, features {features:#b})");
+                }
+                Ok(other) => {
+                    eprintln!("Expected HelloAck, got {other:?}");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Failed to decode HelloAck: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                eprintln!("Handshake failed: {e}");
+                return;
+            }
+        }
+
+        // ── Reader task: framed ServerMessage stream ──────────────────────────
+        let reader_task = tokio::spawn(async move {
+            while let Ok(buf) = read_frame(&mut reader).await {
+                match ciborium::from_reader::<ServerMessage, _>(&buf[..]) {
+                    Ok(msg) => {
+                        let _ = writeln!(std::io::stdout(), "{}", describe(&msg));
                     }
-                });
+                    Err(e) => println!("(undecoded {e} frame, {} bytes)", buf.len()),
+                }
+            }
+        });
 
-                // Spawn a task to read from stdin asynchronously and send commands
-                let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
-                let stdin = tokio::io::stdin();
-                let stdin_task = tokio::spawn(async move {
-                    let mut reader = tokio::io::BufReader::new(stdin);
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break, // EOF
-                            Ok(_) => {
-                                let trimmed = line.trim().to_string();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-                                if cmd_tx.send(trimmed).await.is_err() {
+        // ── Stdin → framed ClientMessage stream ─────────────────────────────
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMessage>(100);
+        let stdin_task = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let cmd = line.trim();
+                        if cmd.is_empty() {
+                            continue;
+                        }
+                        match parse_command(cmd) {
+                            Some(msg) => {
+                                if cmd_tx.send(msg).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            None => break, // quit/exit
                         }
                     }
-                });
-
-                // Receive commands from stdin task and write to TCP
-                while let Some(cmd_line) = cmd_rx.recv().await {
-                    if let Ok(msg_bytes) = parse_command(&cmd_line) {
-                        if writer.write_all(&msg_bytes).await.is_err() {
-                            break;
-                        }
-                    }
+                    Err(_) => break,
                 }
-
-                reader_task.await.ok();
-                stdin_task.await.ok();
             }
-            Err(e) => {
-                eprintln!("Failed to connect: {}", e);
+        });
+
+        while let Some(msg) = cmd_rx.recv().await {
+            if write_frame(&mut writer, &cbor(&msg)).await.is_err() {
+                break;
             }
         }
+        reader_task.await.ok();
+        stdin_task.await.ok();
+        println!("Disconnected");
     });
 }
 
-/// Extract the "type" field from a CBOR map value
-fn extract_type(value: &ciborium::Value) -> Option<String> {
-    if let ciborium::Value::Map(entries) = value {
-        for (k, v) in entries {
-            if let (ciborium::Value::Text(key), ciborium::Value::Text(val)) = (k, v) {
-                if key == "type" {
-                    return Some(val.clone());
-                }
-            }
-        }
-    }
-    None
+fn cbor<T: serde::Serialize>(msg: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(msg, &mut buf).expect("CBOR encode");
+    buf
 }
 
-fn parse_command(input: &str) -> Result<Vec<u8>, String> {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.is_empty() {
-        return Err("Empty command".to_string());
+/// Compact one-line rendering of a server message (FullState/DeltaState
+/// would flood the terminal with grid bytes).
+fn describe(msg: &ServerMessage) -> String {
+    match msg {
+        ServerMessage::HelloAck { .. } => "HelloAck (duplicate)".to_string(),
+        ServerMessage::FullState(s) => {
+            format!(
+                "FullState (terrain {}x{}, units {}, cities {})",
+                s.terrain.len(),
+                s.terrain.first().map(|r| r.len()).unwrap_or(0),
+                s.units.len(),
+                s.cities.len()
+            )
+        }
+        ServerMessage::DeltaState(d) => {
+            format!(
+                "DeltaState (units +{}/~{}, cities ~{}, vision grid {} cells)",
+                d.units_added.len(),
+                d.unit_updates.len(),
+                d.city_updates.len(),
+                d.vision_grid_diff.as_ref().map(|g| g.len()).unwrap_or(0)
+            )
+        }
+        ServerMessage::LobbyCreated { lobby_code } => format!("LobbyCreated {lobby_code}"),
+        ServerMessage::LobbyJoined { lobby_code } => format!("LobbyJoined {lobby_code}"),
+        ServerMessage::LobbyUpdate { players, settings } => {
+            let names: Vec<&str> = players.iter().map(|p| p.name.as_str()).collect();
+            format!(
+                "LobbyUpdate ({}: {} | map {})",
+                players.len(),
+                names.join(", "),
+                settings.map
+            )
+        }
+        ServerMessage::Error { message } => format!("Error: {message}"),
+        ServerMessage::LlmReasonLog {
+            player_name,
+            action,
+            reason,
+        } => format!("LlmReasonLog {player_name} {action}: {reason}"),
+        ServerMessage::Advice { text } => format!("Advice: {text}"),
+        ServerMessage::ClearSpectator => "ClearSpectator".to_string(),
+        ServerMessage::Leaderboard { entries } => {
+            let top: Vec<String> = entries
+                .iter()
+                .take(3)
+                .map(|e| format!("{} ({}W/{}G)", e.name, e.games_won, e.games_played))
+                .collect();
+            format!("Leaderboard ({})", top.join(", "))
+        }
+        ServerMessage::GameOver {
+            winner,
+            game_id,
+            message,
+        } => format!("GameOver winner={winner} game={game_id} {message}"),
     }
+}
+
+fn parse_command(input: &str) -> Option<ClientMessage> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
     match parts[0] {
-        "quit" | "exit" => Ok(b"quit".to_vec()),
+        "quit" | "exit" => None,
         "help" => {
-            println!("Commands:");
-            println!("  recruit <city_id> <unit_type>  - Recruit a unit");
-            println!("  move <unit_id> <x>,<y>          - Move a unit");
-            println!("  heal <unit_id>                  - Toggle healing");
-            println!("  create_lobby                    - Create a new lobby");
-            println!("  join <lobby_code>               - Join a lobby");
-            println!("  start_game                      - Start game in your lobby");
-            println!("  quit/exit                       - Quit");
-            Ok(b"help".to_vec())
+            println!("Commands: create_lobby [name] | join <code> [name] | start_game |");
+            println!("  recruit <city_id> <type> | move <unit_id> <x>,<y> | heal <unit_id> |");
+            println!("  leaderboard | quit");
+            Some(ClientMessage::GetLeaderboard)
         }
-        "recruit" if parts.len() >= 3 => {
-            let city_id = parts[1];
-            let unit_type = parts[2];
-            Ok(format!("recruit_{}_{}", city_id, unit_type).into_bytes())
+        "create_lobby" => {
+            let name = parts.get(1).map(|s| s.to_string());
+            // Everything not specified takes the serde default — the same
+            // baseline a UI user gets with the standard ruleset.
+            let settings: LobbySettings = toml::from_str(
+                r#"
+                map = "default"
+                use_standard_ruleset = true
+                llm_thinking_delay = 0.0
+                "#,
+            )
+            .expect("default lobby settings");
+            Some(ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+                settings,
+                password: None,
+                player_name: name,
+            }))
         }
+        "join" if parts.len() >= 2 => {
+            let name = parts.get(2).map(|s| s.to_string());
+            Some(ClientMessage::LobbyMessage(LobbyMessage::JoinLobby {
+                lobby_code: parts[1].to_string(),
+                password: None,
+                player_name: name,
+            }))
+        }
+        "start_game" => Some(ClientMessage::LobbyMessage(LobbyMessage::StartGame)),
+        "recruit" if parts.len() >= 3 => Some(ClientMessage::RecruitUnit {
+            city_id: parts[1].to_string(),
+            unit_type: parts[2].to_string(),
+        }),
         "move" if parts.len() >= 3 => {
-            let unit_id = parts[1];
-            let coords = parts[2];
-            Ok(format!("move_{}_{}", unit_id, coords).into_bytes())
+            let (x, y) = parts[2]
+                .split_once(',')
+                .and_then(|(a, b)| a.parse::<f32>().ok().zip(b.parse::<f32>().ok()))?;
+            Some(ClientMessage::MoveUnit {
+                unit_id: parts[1].to_string(),
+                path: vec![(x, y)],
+            })
         }
-        "heal" if parts.len() >= 2 => Ok(format!("heal_{}", parts[1]).into_bytes()),
-        "create_lobby" => Ok(b"create_lobby".to_vec()),
-        "join" if parts.len() >= 2 => Ok(format!("join_{}", parts[1]).into_bytes()),
-        "start_game" => Ok(b"start_game".to_vec()),
+        "heal" if parts.len() >= 2 => Some(ClientMessage::ToggleHealing {
+            unit_id: parts[1].to_string(),
+            enabled: true,
+        }),
+        "leaderboard" => Some(ClientMessage::GetLeaderboard),
         other => {
-            println!("Unknown command: {}", other);
-            Ok(b"unknown".to_vec())
+            println!("Unknown command: {other:?} (try 'help')");
+            Some(ClientMessage::GetLeaderboard)
         }
     }
 }

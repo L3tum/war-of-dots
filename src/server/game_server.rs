@@ -4,7 +4,6 @@ use bytes::Bytes;
 use sqlite::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -28,11 +27,12 @@ use crate::replay::replay::ReplayEvent;
 use crate::server::delta::{
     run_network_phase, NetworkBaselines, NetworkPhaseResult, UnitBaselineStore,
 };
+use crate::server::framing;
 use crate::server::lobby::LobbyManager;
 use crate::server::protocol::{
     decode_client_message, encode_message, encode_message_with_hint, estimate_delta_size,
-    CityState, ClientMessage, GameStateMessage, LobbyMessage, LobbySettings, PlayerState,
-    ServerMessage, UnitState,
+    negotiate_features, CityState, ClientMessage, GameStateMessage, LobbyMessage, LobbySettings,
+    PlayerState, ServerMessage, UnitState, PROTOCOL_VERSION,
 };
 
 // Re-export types from room module for use throughout game_server
@@ -55,6 +55,10 @@ pub struct GameServer {
     pub(crate) games: Mutex<HashMap<String, Arc<Mutex<GameRoom>>>>,
     /// Maps a connection UUID to (player_id, game_room_id)
     pub(crate) player_map: Mutex<HashMap<Uuid, (String, String)>>,
+    /// WP3: negotiated feature bits per connection (Hello ∩ server support).
+    /// Inserted at handshake, removed on disconnect. Future work packages
+    /// (grid RLE, compact entities, AoI) read this to pick the wire format.
+    pub(crate) negotiated_features: Mutex<HashMap<Uuid, u32>>,
     /// Shared storage for statistics and leaderboards
     pub(crate) storage: crate::storage::Storage,
 }
@@ -70,6 +74,7 @@ impl GameServer {
             lobby_manager: Mutex::new(LobbyManager::new()),
             games: Mutex::new(HashMap::new()),
             player_map: Mutex::new(HashMap::new()),
+            negotiated_features: Mutex::new(HashMap::new()),
             storage,
         })
     }
@@ -1493,7 +1498,8 @@ pub(crate) async fn tcp_egress_loop(
             Some(data) => data,
             None => continue, // stale delta superseded by a newer ring entry
         };
-        if writer.write_all(&data).await.is_err() {
+        // WP3: length-prefixed frame (u32 BE + payload).
+        if framing::write_frame(&mut writer, &data).await.is_err() {
             break;
         }
     }
@@ -1529,13 +1535,18 @@ pub(crate) fn configure_game_tcp_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
 }
 
+/// WP3: how long a freshly-accepted connection may take to complete the
+/// Hello handshake before the server drops it (an idle, un-handshaked
+/// connection is useless and would otherwise pin reader + egress tasks).
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub(crate) async fn handle_tcp_client(
     stream: tokio::net::TcpStream,
     server_state: Arc<Mutex<GameServer>>,
 ) {
     let conn_id = Uuid::new_v4();
     configure_game_tcp_stream(&stream);
-    let (reader, writer) = tokio::io::split(stream);
+    let (mut reader, writer) = tokio::io::split(stream);
     // I7: channel carries tagged envelopes; the ring bounds delta memory
     let (tx, rx) = mpsc::unbounded_channel::<EgressMessage>();
     let tx_clone = tx.clone();
@@ -1548,46 +1559,88 @@ pub(crate) async fn handle_tcp_client(
     // Spawn sender task
     tokio::spawn(tcp_egress_loop(writer, rx, ring));
 
-    // Read loop
-    let mut reader = reader;
-    let mut buf = Vec::new();
+    // Read loop — WP3: length-prefixed frames (u32 BE + CBOR payload); the
+    // first frame MUST be Hello (HANDSHAKE_TIMEOUT budget, then the idle
+    // connection is dropped).
+    let mut handshaken = false;
     loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(_) => {
-                // Message size limit
-                if buf.len() > 1_048_576 {
+        let frame = if handshaken {
+            framing::read_frame(&mut reader).await
+        } else {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, framing::read_frame(&mut reader)).await {
+                Ok(inner) => inner,
+                Err(_) => {
                     tracing::warn!(
-                        msg_len = buf.len(),
-                        "Message exceeds size limit (TCP), closing connection"
+                        "TCP client did not complete the Hello handshake in time, closing"
                     );
                     break;
                 }
-                match decode_client_message(&buf) {
-                    Ok(msg) => {
-                        handle_client_message(&conn_id, server_state.clone(), &msg, &player_sender)
-                            .await;
-                        // Message fully consumed — reset the buffer. The console client writes
-                        // one complete CBOR message per write, so a single message either
-                        // arrives within one read or is fully reassembled before this point.
-                        buf.clear();
-                    }
-                    Err(e) => {
-                        // Do NOT clear on decode failure: a CBOR message can be split across
-                        // multiple TCP reads. Keep the undecoded bytes so the next read can
-                        // reassemble the partial message instead of discarding it.
-                        // Buffer growth is bounded by the size-limit check above (1MB), so a
-                        // client that sends malformed data will eventually be disconnected.
-                        tracing::info!(
-                            error = %e,
-                            msg_len = buf.len(),
-                            "Failed to decode ClientMessage (TCP), buffering for reassembly"
-                        );
-                    }
+            }
+        };
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                // Framing violated (length 0/oversized, connection mid-frame):
+                // the stream can no longer be reassembled, so close.
+                tracing::info!(error = %e, "TCP frame read failed, closing connection");
+                break;
+            }
+        };
+        let msg = match decode_client_message(&frame) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::info!(error = %e, "Failed to decode ClientMessage (TCP), closing");
+                let resp = ServerMessage::Error {
+                    message: "Invalid message format".to_string(),
+                };
+                let _ = player_sender
+                    .send_reliable(encode_message(&resp).into())
+                    .await;
+                break;
+            }
+        };
+        if !handshaken {
+            match msg {
+                ClientMessage::Hello {
+                    protocol_version,
+                    features,
+                } if protocol_version == PROTOCOL_VERSION => {
+                    let negotiated = negotiate_features(features);
+                    let ack = ServerMessage::HelloAck {
+                        protocol_version,
+                        features: negotiated,
+                    };
+                    let _ = player_sender
+                        .send_reliable(encode_message(&ack).into())
+                        .await;
+                    server_state_clone
+                        .lock()
+                        .await
+                        .negotiated_features
+                        .lock()
+                        .await
+                        .insert(conn_id, negotiated);
+                    handshaken = true;
+                }
+                other => {
+                    tracing::info!(
+                        ?other,
+                        "First TCP message must be Hello v{PROTOCOL_VERSION}, closing"
+                    );
+                    let resp = ServerMessage::Error {
+                        message: format!(
+                            "Protocol error: first message must be Hello (version {PROTOCOL_VERSION})"
+                        ),
+                    };
+                    let _ = player_sender
+                        .send_reliable(encode_message(&resp).into())
+                        .await;
+                    break;
                 }
             }
-            Err(_) => break,
+            continue;
         }
+        handle_client_message(&conn_id, server_state.clone(), &msg, &player_sender).await;
     }
 
     // Cleanup on disconnect
@@ -1596,6 +1649,7 @@ pub(crate) async fn handle_tcp_client(
         let mut player_map = server.player_map.lock().await;
         // Just remove the connection; the game room will handle player removal internally
         player_map.remove(&conn_id);
+        server.negotiated_features.lock().await.remove(&conn_id);
     }
 }
 
@@ -1617,9 +1671,25 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
     let ws_sink_clone = Arc::clone(&ws_sink);
     tokio::spawn(ws_egress_loop(ws_sink_clone, rx, ring));
 
-    // Read loop — receive WebSocket messages
+    // Read loop — receive WebSocket messages. WP3: the first binary message
+    // MUST be Hello (HANDSHAKE_TIMEOUT budget). WS frames are self-framing —
+    // no length prefix on this path.
+    let mut handshaken = false;
     loop {
-        match ws_stream.next().await {
+        let incoming = if handshaken {
+            ws_stream.next().await
+        } else {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, ws_stream.next()).await {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::warn!(
+                        "WS client did not complete the Hello handshake in time, closing"
+                    );
+                    break;
+                }
+            }
+        };
+        match incoming {
             Some(Ok(Message::Binary(data))) => {
                 // Message size limit
                 if data.len() > 1_048_576 {
@@ -1629,25 +1699,66 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
                     );
                     break;
                 }
-                match decode_client_message(&data) {
-                    Ok(msg) => {
-                        handle_client_message(
-                            &conn_id,
-                            server_state.clone(),
-                            &msg,
-                            &actual_player_sender,
-                        )
-                        .await;
-                    }
+                let msg = match decode_client_message(&data) {
+                    Ok(m) => m,
                     Err(e) => {
                         tracing::info!(error = %e, msg_len = data.len(), "Failed to decode ClientMessage (WS)");
                         let resp = ServerMessage::Error {
                             message: "Invalid message format".to_string(),
                         };
-                        let encoded = encode_message(&resp);
-                        let _ = actual_player_sender.send_reliable(encoded.into()).await;
+                        let _ = actual_player_sender
+                            .send_reliable(encode_message(&resp).into())
+                            .await;
+                        // A malformed FIRST frame can't be the Hello handshake — fatal.
+                        if !handshaken {
+                            break;
+                        }
+                        continue; // post-handshake: keep the connection (legacy behaviour)
                     }
+                };
+                if !handshaken {
+                    match msg {
+                        ClientMessage::Hello {
+                            protocol_version,
+                            features,
+                        } if protocol_version == PROTOCOL_VERSION => {
+                            let negotiated = negotiate_features(features);
+                            let ack = ServerMessage::HelloAck {
+                                protocol_version,
+                                features: negotiated,
+                            };
+                            let _ = actual_player_sender
+                                .send_reliable(encode_message(&ack).into())
+                                .await;
+                            server_state_clone
+                                .lock()
+                                .await
+                                .negotiated_features
+                                .lock()
+                                .await
+                                .insert(conn_id, negotiated);
+                            handshaken = true;
+                        }
+                        other => {
+                            tracing::info!(
+                                ?other,
+                                "First WS message must be Hello v{PROTOCOL_VERSION}, closing"
+                            );
+                            let resp = ServerMessage::Error {
+                                message: format!(
+                                    "Protocol error: first message must be Hello (version {PROTOCOL_VERSION})"
+                                ),
+                            };
+                            let _ = actual_player_sender
+                                .send_reliable(encode_message(&resp).into())
+                                .await;
+                            break;
+                        }
+                    }
+                    continue;
                 }
+                handle_client_message(&conn_id, server_state.clone(), &msg, &actual_player_sender)
+                    .await;
             }
             Some(Ok(Message::Close(_))) | None => break,
             Some(Ok(Message::Text(_)))
@@ -1664,6 +1775,7 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
         let server = server_state_clone.lock().await;
         let mut player_map = server.player_map.lock().await;
         player_map.remove(&conn_id);
+        server.negotiated_features.lock().await.remove(&conn_id);
     }
 }
 
@@ -1708,6 +1820,16 @@ pub(crate) async fn handle_client_message(
     player_sender: &PlayerSender,
 ) {
     match msg {
+        // WP3: Hello is only valid as the connection's FIRST message (the
+        // read loops gate it before dispatch); a repeated Hello is a
+        // protocol violation.
+        ClientMessage::Hello { .. } => {
+            let resp = ServerMessage::Error {
+                message: "Protocol error: Hello is only allowed as the first message".to_string(),
+            };
+            let encoded = encode_message(&resp);
+            let _ = player_sender.send_reliable(encoded.into()).await;
+        }
         ClientMessage::LobbyMessage(lobby_msg) => {
             match lobby_msg {
                 LobbyMessage::CreateLobby {
@@ -3083,7 +3205,7 @@ mod i7_egress_tests {
     use super::*;
     use crate::server::room::{DeltaRing, DELTA_RING_DEPTH};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const DELTA_SIZE: usize = 64 * 1024;
     const N_DELTAS: u64 = 512;
@@ -3129,7 +3251,7 @@ mod i7_egress_tests {
         buf
     }
 
-    fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    pub(crate) fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
         bytes.windows(needle.len()).position(|w| w == needle)
     }
 
@@ -3146,7 +3268,7 @@ mod i7_egress_tests {
 
     /// Reassemble server→client frame payloads (unmasked; continuation
     /// frames appended, ping/pong skipped, close ends the stream).
-    fn parse_ws_frames(data: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn parse_ws_frames(data: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         let mut i = 0;
         while i + 2 <= data.len() {
@@ -3460,5 +3582,423 @@ mod i7_egress_tests {
             // drain task handle_ws_game spawns.
             tokio::spawn(gated_ws_egress_loop(pending, sink));
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP3: handshake tests — the three-scenario matrix over real sockets.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod wp3_handshake_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::server::framing::{read_frame, write_frame};
+    use crate::server::protocol::{
+        ClientMessage, LobbyMessage, LobbySettings, ServerMessage, F_AOI, F_COMPACT_ENTITIES,
+        F_GRID_RLE, PROTOCOL_VERSION,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A real GameServer with throwaway storage (unique temp dir per test so
+    /// parallel tests never share a sqlite file).
+    async fn make_server() -> Arc<Mutex<GameServer>> {
+        let dir = std::env::temp_dir().join(format!("wod-wp3-{}", Uuid::new_v4()));
+        let toml_str = format!(
+            r#"
+[llm]
+
+[standard_ruleset]
+enabled = true
+unit_types = []
+
+[storage]
+database_path = "{db}"
+replay_path = "{replay}"
+"#,
+            db = dir.join("db.sqlite").display(),
+            replay = dir.join("replays").display(),
+        );
+        let cfg: Config = toml::from_str::<Config>(&toml_str).unwrap().resolve();
+        Arc::new(Mutex::new(GameServer::new(cfg, 0).await.unwrap()))
+    }
+
+    fn cbor_bytes<T: serde::Serialize>(msg: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(msg, &mut buf).expect("CBOR encode");
+        buf
+    }
+
+    fn default_lobby_settings() -> LobbySettings {
+        toml::from_str(
+            r#"
+            map = "default"
+            use_standard_ruleset = true
+            llm_thinking_delay = 0.0
+            "#,
+        )
+        .expect("default lobby settings")
+    }
+
+    /// Start a server task that runs `handle_tcp_client` on the accepted
+    /// connection; returns the client side of the pair.
+    async fn spawn_tcp_server(
+        server: Arc<Mutex<GameServer>>,
+    ) -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_tcp_client(stream, server).await;
+            }
+        });
+        let client = TcpStream::connect(addr).await.unwrap();
+        (client, handle)
+    }
+
+    /// Read frames until the first matching one; returns it (others are
+    /// tolerated — e.g. a LobbyUpdate broadcast following LobbyCreated).
+    async fn read_until_match(
+        client: &mut TcpStream,
+        mut is_match: impl FnMut(&ServerMessage) -> bool,
+    ) -> ServerMessage {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, read_frame(client))
+                .await
+                .expect("frame in time")
+                .expect("connection still open");
+            let msg: ServerMessage = ciborium::from_reader(&frame[..]).expect("valid server frame");
+            if is_match(&msg) {
+                return msg;
+            }
+        }
+    }
+
+    /// Scenario 1: Hello (requesting every v1 feature bit) → HelloAck with the
+    /// negotiated (ANDed) set, then normal lobby traffic flows.
+    #[tokio::test]
+    async fn tcp_handshake_hello_then_lobby_created() {
+        let server = make_server().await;
+        let (mut client, handle) = spawn_tcp_server(server.clone()).await;
+
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: F_GRID_RLE | F_COMPACT_ENTITIES | F_AOI,
+        };
+        write_frame(&mut client, &cbor_bytes(&hello)).await.unwrap();
+
+        let ack =
+            read_until_match(&mut client, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+        match ack {
+            ServerMessage::HelloAck {
+                protocol_version,
+                features,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                // Nothing is supported yet: every requested bit is ANDed out.
+                assert_eq!(features, 0);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // The negotiated set is recorded for the connection.
+        {
+            let s = server.lock().await;
+            let feats = s.negotiated_features.lock().await;
+            assert_eq!(feats.len(), 1);
+            assert_eq!(feats.values().next().copied(), Some(0));
+        }
+
+        // Lobby traffic works after the handshake.
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("Wp3Test".to_string()),
+        });
+        write_frame(&mut client, &cbor_bytes(&create))
+            .await
+            .unwrap();
+        let created = read_until_match(&mut client, |m| {
+            matches!(m, ServerMessage::LobbyCreated { .. })
+        })
+        .await;
+        match created {
+            ServerMessage::LobbyCreated { lobby_code } => assert!(!lobby_code.is_empty()),
+            other => panic!("expected LobbyCreated, got {other:?}"),
+        }
+
+        // Disconnect: the negotiated-features entry is cleaned up.
+        drop(client);
+        let mut cleaned = false;
+        for _ in 0..100 {
+            if server
+                .lock()
+                .await
+                .negotiated_features
+                .lock()
+                .await
+                .is_empty()
+            {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(cleaned, "negotiated_features not cleaned up on disconnect");
+        handle.abort();
+    }
+
+    /// Scenario 2: first frame is not a Hello → Error, then the server closes.
+    #[tokio::test]
+    async fn tcp_rejects_non_hello_first_message() {
+        let server = make_server().await;
+        let (mut client, handle) = spawn_tcp_server(server).await;
+
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("Wp3Test".to_string()),
+        });
+        write_frame(&mut client, &cbor_bytes(&create))
+            .await
+            .unwrap();
+
+        let err = read_until_match(&mut client, |m| matches!(m, ServerMessage::Error { .. })).await;
+        match err {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("Hello"), "unexpected error: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // The handshake violation is fatal: the server closes the connection.
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("close in time")
+            .expect("read before EOF");
+        assert_eq!(n, 0, "server must close after a handshake violation");
+        handle.abort();
+    }
+
+    /// Scenario 3: Hello with an unsupported protocol version → Error + close.
+    #[tokio::test]
+    async fn tcp_rejects_wrong_protocol_version() {
+        let server = make_server().await;
+        let (mut client, handle) = spawn_tcp_server(server).await;
+
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION + 1,
+            features: 0,
+        };
+        write_frame(&mut client, &cbor_bytes(&hello)).await.unwrap();
+
+        let err = read_until_match(&mut client, |m| matches!(m, ServerMessage::Error { .. })).await;
+        match err {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("Hello"), "unexpected error: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("close in time")
+            .expect("read before EOF");
+        assert_eq!(n, 0, "server must close after a version mismatch");
+        handle.abort();
+    }
+
+    // ── WS path ────────────────────────────────────────────────────────────
+
+    /// Build a masked client→server WS binary frame (clients MUST mask).
+    fn mask_ws_binary(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x82u8]; // FIN + binary opcode
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8 | 0x80);
+        } else if payload.len() < 65536 {
+            frame.push(126 | 0x80);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127 | 0x80);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        let mask = [0xA1u8, 0xB2, 0xC3, 0xD4];
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        frame
+    }
+
+    /// Parse one server→client WS frame from the FRONT of `data`.
+    /// Returns (bytes consumed, payload); payload is empty for control
+    /// frames (ping/pong/close), which the caller skips or treats as EOF.
+    /// The egress loop sends one unfragmented binary frame per message, so
+    /// a single frame walk is all that is needed here.
+    fn take_ws_frame(data: &[u8]) -> Option<(usize, Vec<u8>)> {
+        if data.len() < 2 {
+            return None;
+        }
+        let opcode = data[0] & 0x0f;
+        let mut len = (data[1] & 0x7f) as usize;
+        let mut off = 2;
+        if len == 126 {
+            if off + 2 > data.len() {
+                return None;
+            }
+            len = u16::from_be_bytes([data[off], data[off + 1]]) as usize;
+            off += 2;
+        } else if len == 127 {
+            if off + 8 > data.len() {
+                return None;
+            }
+            let bytes: [u8; 8] = data[off..off + 8].try_into().ok()?;
+            len = u64::from_be_bytes(bytes) as usize;
+            off += 8;
+        }
+        if data[1] & 0x80 != 0 {
+            off += 4; // masked (tolerated; the server sends unmasked)
+        }
+        if off + len > data.len() {
+            return None; // frame not complete yet
+        }
+        if opcode <= 0x2 {
+            Some((off + len, data[off..off + len].to_vec()))
+        } else {
+            // ping/pong/close: consumed, no payload
+            Some((off + len, Vec::new()))
+        }
+    }
+
+    /// Read until one complete non-control WS frame is available; advances
+    /// `raw` past each frame it consumes (so frames are never re-delivered).
+    async fn read_ws_until(client: &mut TcpStream, raw: &mut Vec<u8>) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            if let Some((consumed, payload)) = take_ws_frame(raw) {
+                raw.drain(..consumed);
+                if !payload.is_empty() {
+                    return Some(payload);
+                }
+                continue; // control frame — keep going
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no WS frame in time"
+            );
+            let n = client.read(&mut buf).await.expect("ws client read");
+            if n == 0 {
+                return None;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Scenario 4 (WS): binary Hello → HelloAck, then lobby traffic — the
+    /// exact path the browser client takes.
+    #[tokio::test]
+    async fn ws_handshake_hello_then_lobby_created() {
+        let server = make_server().await;
+        let state = server.clone();
+        let app = axum::Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let state = state.clone();
+                async move { ws.on_upgrade(move |socket| handle_ws_game(socket, state)) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\
+                  \r\n",
+            )
+            .await
+            .unwrap();
+        // Consume the 101 upgrade response headers.
+        let mut raw = Vec::new();
+        loop {
+            if let Some(pos) = super::i7_egress_tests::find(&raw, b"\r\n\r\n") {
+                raw.drain(..=pos + 3);
+                break;
+            }
+            let mut buf = [0u8; 4096];
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "upgrade response closed");
+            raw.extend_from_slice(&buf[..n]);
+        }
+
+        // Hello as a masked binary frame.
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        client
+            .write_all(&mask_ws_binary(&cbor_bytes(&hello)))
+            .await
+            .unwrap();
+
+        // HelloAck back (server frames are unmasked).
+        let payload = read_ws_until(&mut client, &mut raw)
+            .await
+            .expect("HelloAck frame");
+        let ack: ServerMessage = ciborium::from_reader(&payload[..]).expect("HelloAck cbor");
+        match ack {
+            ServerMessage::HelloAck {
+                protocol_version,
+                features,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(features, 0);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // Lobby traffic after the handshake.
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("Wp3Ws".to_string()),
+        });
+        client
+            .write_all(&mask_ws_binary(&cbor_bytes(&create)))
+            .await
+            .unwrap();
+        let mut got_lobby_created = false;
+        for _ in 0..8 {
+            let payload = read_ws_until(&mut client, &mut raw)
+                .await
+                .expect("lobby frame");
+            if let Ok(msg) = ciborium::from_reader::<ServerMessage, _>(&payload[..]) {
+                if matches!(msg, ServerMessage::LobbyCreated { .. }) {
+                    got_lobby_created = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_lobby_created, "LobbyCreated never arrived over WS");
+        assert_eq!(
+            server.lock().await.negotiated_features.lock().await.len(),
+            1
+        );
+        drop(client);
     }
 }

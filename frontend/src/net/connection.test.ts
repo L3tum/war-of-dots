@@ -759,8 +759,15 @@ describe('Connection (real class, fake WebSocket)', () => {
     vi.unstubAllGlobals();
   });
 
-  it('connects to /ws and sends CBOR frames with undefined stripped', () => {
+  it('connects to /ws, handshakes, then sends CBOR frames with undefined stripped', () => {
     expect(h.ws.url).toBe('ws://localhost/ws');
+    // WP3: the first frame is always the Hello handshake.
+    expect(h.ws.sent).toHaveLength(1);
+    const hello = decode(h.ws.sent[0]) as Record<string, Record<string, unknown>>;
+    expect(hello.Hello.protocol_version).toBe(1);
+    expect(hello.Hello.features).toBe(0);
+
+    // Sends before HelloAck are queued, not dropped.
     h.conn.send({
       LobbyMessage: {
         CreateLobby: {
@@ -770,10 +777,28 @@ describe('Connection (real class, fake WebSocket)', () => {
       },
     } as Record<string, unknown>);
     expect(h.ws.sent).toHaveLength(1);
-    const decoded = decode(h.ws.sent[0]) as Record<string, Record<string, Record<string, unknown>>>;
+
+    // HelloAck releases the queued sends.
+    h.ws.feedServerMessage({ HelloAck: { protocol_version: 1, features: 0 } });
+    expect(h.ws.sent).toHaveLength(2);
+    const decoded = decode(h.ws.sent[1]) as Record<string, Record<string, Record<string, unknown>>>;
     const create = decoded.LobbyMessage.CreateLobby;
     expect(create.password).toBeUndefined();
     expect((create.settings as Record<string, unknown>).map).toBe('default');
+  });
+
+  it('treats a pre-HelloAck Error as fatal: no reconnect scheduled', async () => {
+    vi.useFakeTimers();
+    try {
+      h.ws.feedServerMessage({ Error: { message: 'Hello must be the first message' } });
+      h.ws.close(); // would normally schedule a reconnect
+      // Advance far beyond any retry backoff: a non-fatal failure would
+      // have spawned new WebSocket instances by now.
+      vi.advanceTimersByTime(60_000);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('spectator-mode connections never send frames', () => {
