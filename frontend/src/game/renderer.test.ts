@@ -144,7 +144,10 @@ function buffersOf(renderer: Renderer) {
     outlineColorBuffer: FakeGPUBuffer;
     uniformBuffer: FakeGPUBuffer;
     fogUniformBuffer: FakeGPUBuffer;
+    fogPositionsBuffer: FakeGPUBuffer;
     fogTexture: { width: number; height: number } | null;
+    symbolBindGroup: unknown;
+    fogBindGroup: unknown;
   };
 }
 
@@ -344,9 +347,10 @@ describe('Renderer geometry payloads (recorded writeBuffer)', () => {
   it('only ever calls WebGPU/2D methods the fake implements (no silent no-ops)', () => {
     const harness = setup();
     harness.renderer.render(makeGameState());
-    // The device proxy + symbol-canvas 2D proxy record any call to a method
-    // the fakes don't implement; a non-empty list means the renderer started
-    // using an un-faked API and the suite would otherwise stay green.
+    // The device proxy, canvas-context proxy, and symbol-canvas 2D proxy all
+    // record any call to a method the fakes don't implement; a non-empty list
+    // means the renderer started using an un-faked API and the suite would
+    // otherwise stay green.
     expect(harness.unknownGpuCalls, `un-faked device calls: ${harness.unknownGpuCalls}`).toEqual(
       [],
     );
@@ -823,16 +827,27 @@ describe('renderFrame draw sequence', () => {
       [fog, 4],
     ]);
 
-    // The recorded vertex-buffer / bind-group bindings (previously captured but
-    // never asserted) form a net against the "section binds nothing / wrong
-    // buffer" regression class. The symbol section is the regression-prone one
-    // (a missing bind = invisible glyphs), so assert its real buffers were
-    // bound AND a slot-1 bind group (the symbol texture attachment) was set.
+    // The recorded vertex-buffer / bind-group bindings (previously captured
+    // but never asserted) form a net against the "section binds nothing / wrong
+    // buffer" regression class. Identity assertions, not slot checks: a slot-
+    // only check (`some(g => g.index === 1)`) is satisfied by the fog section,
+    // which binds slot 1 AFTER symbols and would mask a missing symbol bind
+    // (blank glyphs in a real browser).
     const b = buffersOf(renderer);
     const boundBuffers = pass.vertexBuffers.map((v) => v.buffer);
     expect(boundBuffers).toContain(b.symbolPositionBuffer);
     expect(boundBuffers).toContain(b.symbolColorBuffer);
-    expect(pass.bindGroups.some((g) => g.index === 1)).toBe(true);
+    expect(boundBuffers).toContain(b.fogPositionsBuffer);
+    expect(b.symbolBindGroup, 'symbol bind group must exist when symbols draw').not.toBeNull();
+    expect(b.fogBindGroup, 'fog bind group must exist when fog draws').not.toBeNull();
+    expect(
+      pass.bindGroups.some((g) => g.index === 1 && g.group === b.symbolBindGroup),
+      'symbol texture/sampler bind group must be bound on slot 1',
+    ).toBe(true);
+    expect(
+      pass.bindGroups.some((g) => g.index === 1 && g.group === b.fogBindGroup),
+      'fog texture bind group must be bound on slot 1',
+    ).toBe(true);
   });
 });
 

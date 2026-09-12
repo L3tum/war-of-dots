@@ -6,12 +6,21 @@
  * `src/server/protocol.rs`) with plain cbor-x and asserts the same field
  * values as the Rust side.
  *
- * Every float in the fixture is a WHOLE number (1000, 100, 10, 20, …) on
- * purpose: cbor-x encodes those as CBOR *integers*, which plain ciborium
- * rejects for f32 fields — so this fixture byte-locks the `float_decoding`
- * path on the FullState (units) payload, not just the delta path. The single
- * non-whole float (`cost_per_item: 2.5`) is the control that real floats still
- * round-trip as f64.
+ * What this locks: the *server→client* wire form of the full-state
+ * (units_added) payload. The server encodes with ciborium (deterministic —
+ * the Rust test re-encodes and byte-compares), the client decodes with
+ * cbor-x — so any byte-level drift on either side fails exactly one of the
+ * two tests. Note the direction: this does NOT exercise the client→server
+ * `float_deser` integer-tolerance (that path is `LobbySettings` only and is
+ * locked by `float_deser_accepts_cbor_x_integer_form_of_whole_floats`).
+ *
+ * Wire types are imported from `generated/protocol.ts` (the schema-derived
+ * source of truth) rather than re-declared here, so a schema change that
+ * breaks this fixture fails at the type level too.
+ *
+ * Floats are whole numbers (1000, 100, 10, 20, …) for readable assertions;
+ * the single non-whole float (`cost_per_item: 2.5`) is the control that real
+ * floats still round-trip as f64.
  *
  * Regenerate the fixture (Rust side only):
  *
@@ -22,58 +31,21 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { decode } from 'cbor-x';
+import type { GameStateMessage, ServerMessage } from '../generated/protocol';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = readFileSync(join(here, '../../../tests/fixtures/protocol_fullstate_golden.bin'));
 
-interface EquipmentWire {
-  name: string;
-  count: number;
-  cost_per_item: number;
-}
-interface UnitWire {
-  id: string;
-  owner: string;
-  position: [number, number];
-  unit_type: string;
-  symbol: string;
-  men: number;
-  max_men: number;
-  organisation: number;
-  equipment: EquipmentWire[];
-  max_equipment: EquipmentWire[];
-  path: Array<[number, number]>;
-  healing: boolean;
-  resupply_enabled: boolean;
-  supply_percent: number;
-  encircled: boolean;
-  attacking: boolean;
-  on_water: boolean;
-  boat_supply_percent: number;
-  embarking: boolean;
-  disembarking: boolean;
-}
-interface CityWire {
-  id: string;
-  position: [number, number];
-  level: number;
-  manpower: number;
-  owner: string | null;
-}
-interface FullStateWire {
-  vision_grid?: boolean[][] | null;
-  border_grid?: number[][] | null;
-  terrain: string[][];
-  units: UnitWire[];
-  cities: CityWire[];
-  player: { funds: number; units_owned: number; player_id: string };
+function fullStateOf(msg: ServerMessage): GameStateMessage | undefined {
+  return typeof msg === 'object' && msg !== null && 'FullState' in msg ? msg.FullState : undefined;
 }
 
 describe('protocol_fullstate_golden.bin (Rust↔JS CBOR contract)', () => {
   it('decodes as a FullState with the locked fields', () => {
-    const msg = decode(fixture) as { FullState: FullStateWire };
-    const state = msg.FullState;
-    expect(state).toBeDefined();
+    const msg = decode(fixture) as ServerMessage;
+    const state = fullStateOf(msg);
+    expect(state, 'golden fixture must decode to a FullState envelope').toBeDefined();
+    if (!state) return;
 
     expect(state.terrain).toEqual([
       ['Plains', 'Forest'],
@@ -88,13 +60,13 @@ describe('protocol_fullstate_golden.bin (Rust↔JS CBOR contract)', () => {
       [2, 255],
     ]);
 
-    // Two units — the float_decoding canary (all-whole floats decode to numbers).
+    // Two units — whole floats decode to exact JS numbers.
     expect(state.units).toHaveLength(2);
     const [u1, u2] = state.units;
     expect(u1.id).toBe('u1');
     expect(u1.owner).toBe('player_0');
     expect(u1.position).toEqual([10, 20]);
-    expect(u1.men).toBe(1000); // whole float → CBOR integer → JS number
+    expect(u1.men).toBe(1000);
     expect(u1.max_men).toBe(1000);
     expect(u1.organisation).toBe(100);
     expect(u1.equipment).toHaveLength(1);

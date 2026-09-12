@@ -16,23 +16,25 @@ import { ReplayPlayer } from './replay_player';
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = join(here, '../../e2e/fixtures/replay_smoke.jsonl');
 
-describe('replay_smoke.jsonl fixture', () => {
-  beforeEach(() => {
-    const text = readFileSync(FIXTURE_PATH, 'utf8');
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string) => {
-        if (!url.startsWith('replays/')) throw new Error(`unexpected fetch: ${url}`);
-        return {
-          ok: true,
-          status: 200,
-          statusText: 'OK',
-          text: async () => text,
-        } as unknown as Response;
-      }),
-    );
-  });
+// File-scoped (not describe-scoped) so EVERY test — including the filename
+// validation block below — gets a FRESH fetch mock per test.
+beforeEach(() => {
+  const text = readFileSync(FIXTURE_PATH, 'utf8');
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (!url.startsWith('replays/')) throw new Error(`unexpected fetch: ${url}`);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        text: async () => text,
+      } as unknown as Response;
+    }),
+  );
+});
 
+describe('replay_smoke.jsonl fixture', () => {
   it('applies full_state + all three deltas through the real player', async () => {
     const canvas = document.createElement('canvas');
     const player = new ReplayPlayer(canvas);
@@ -106,5 +108,41 @@ describe('replay_smoke.jsonl fixture', () => {
     player.tick();
     player.tick();
     expect(gs.player.funds).toBe(fundsAfter);
+  });
+});
+
+// ============================================================================
+// loadReplay filename validation — `?replay=` is user-controlled (URL query
+// param), so the basename guard's REJECTION paths must be tested, not just
+// the happy path above.
+// ============================================================================
+
+describe('loadReplay filename validation (?replay= is user-controlled)', () => {
+  async function expectRejected(file: string): Promise<void> {
+    const canvas = document.createElement('canvas');
+    const player = new ReplayPlayer(canvas);
+    await expect(
+      player.loadReplay(file),
+      `loadReplay(${JSON.stringify(file)}) must reject`,
+    ).rejects.toThrow(/Invalid replay file name/);
+    // Rejected BEFORE any network access — the whole point of validating
+    // before fetch is that a hostile name never reaches the static server.
+    expect(fetch, `no fetch for rejected name ${JSON.stringify(file)}`).not.toHaveBeenCalled();
+  }
+
+  it('rejects parent-directory traversal', () => expectRejected('../secrets.jsonl'));
+  it('rejects double-dot traversal', () => expectRejected('../../etc/passwd.jsonl'));
+  it('rejects nested paths', () => expectRejected('a/b.jsonl'));
+  it('rejects URL-encoded traversal', () => expectRejected('%2e%2e/secrets.jsonl'));
+  it('rejects non-jsonl extensions', () => expectRejected('evil.json'));
+  it('rejects embedded spaces/control chars', () => expectRejected('bad name.jsonl'));
+  it('rejects NUL bytes', () => expectRejected('nul\0name.jsonl'));
+  it('rejects over-long names (>128 chars)', () => expectRejected(`${'a'.repeat(130)}.jsonl`));
+
+  it('accepts a plain basename (happy path)', async () => {
+    const canvas = document.createElement('canvas');
+    const player = new ReplayPlayer(canvas);
+    await player.loadReplay('replay_smoke.jsonl');
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

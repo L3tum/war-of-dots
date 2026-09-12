@@ -53,10 +53,17 @@ async function main() {
       await replay.start();
       // Small no-server test hook (read by frontend/e2e/webgpu.spec.ts) so the
       // replay path can assert renderer health without a game server: the last
-      // render error plus how many frames actually completed.
+      // render error, how many render passes were submitted, and how many
+      // replay events were applied (the settle polls frames >= events).
       (
-        window as unknown as { __replayStats?: () => { error: string | null; frames: number } }
-      ).__replayStats = () => ({ error: replay.renderError, frames: replay.framesRendered });
+        window as unknown as {
+          __replayStats?: () => { error: string | null; frames: number; events: number };
+        }
+      ).__replayStats = () => ({
+        error: replay.renderError,
+        frames: replay.framesSubmitted,
+        events: replay.eventsApplied,
+      });
     } catch (err) {
       showErrorMessage(
         `Failed to load replay: ${err instanceof Error ? err.message : 'Unknown error'}`,

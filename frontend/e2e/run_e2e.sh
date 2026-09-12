@@ -21,9 +21,21 @@ command -v python3 >/dev/null 2>&1 || skip "python3 not found (needed for the st
 [ -d "$FE_DIR/node_modules/@playwright/test" ] || skip "@playwright/test not installed (cd frontend && npm install)"
 # Gate on the ACTUAL chromium binary (not just the chromium-* directory): the
 # Playwright config drives this exact path via launchOptions.executablePath.
+# Keep the HIGHEST-versioned build, matching playwright.config.ts (which sorts
+# by version descending) — an alphabetical first-match could gate on one build
+# while the config launches another.
 CHROME_BIN=""
+CHROME_VER=0
 for d in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome; do
-  [ -x "$d" ] && CHROME_BIN="$d" && break
+  [ -x "$d" ] || continue
+  ver="${d%/*}"
+  ver="${ver%/*}"
+  ver="${ver##*/}"
+  ver="${ver#chromium-}"
+  if [ "$ver" -gt "$CHROME_VER" ] 2>/dev/null; then
+    CHROME_BIN="$d"
+    CHROME_VER="$ver"
+  fi
 done
 [ -n "$CHROME_BIN" ] || skip "Playwright Chromium not found (cd frontend && npx playwright install chromium)"
 

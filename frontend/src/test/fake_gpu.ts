@@ -88,7 +88,11 @@ export class FakeGPURenderPipeline {
 export class FakeGPURenderPassEncoder {
   draws: DrawCall[] = [];
   pipelines: FakeGPURenderPipeline[] = [];
-  bindGroups: Array<{ index: number }> = [];
+  // Records the bind-group IDENTITY (not just the slot) so tests can assert
+  // the exact group a section bound — `some(g => g.index === 1)` alone is
+  // satisfied by whichever section binds slot 1 last (the fog section renders
+  // after symbols, masking a missing symbol bind).
+  bindGroups: Array<{ index: number; group: unknown }> = [];
   vertexBuffers: Array<{ index: number; buffer: FakeGPUBuffer }> = [];
 
   constructor(readonly clearValue: { r: number; g: number; b: number; a: number }) {}
@@ -96,8 +100,8 @@ export class FakeGPURenderPassEncoder {
   setPipeline(pipeline: FakeGPURenderPipeline): void {
     this.pipelines.push(pipeline);
   }
-  setBindGroup(index: number, _bindGroup: unknown): void {
-    this.bindGroups.push({ index });
+  setBindGroup(index: number, bindGroup: unknown): void {
+    this.bindGroups.push({ index, group: bindGroup });
   }
   setVertexBuffer(index: number, buffer: FakeGPUBuffer): void {
     this.vertexBuffers.push({ index, buffer });
@@ -391,7 +395,7 @@ export function trapUnknownCalls<T extends object>(
       ) {
         unknownCalls.push(`${kind}.${prop}()`);
         throw new Error(
-          `Fake WebGPU ${kind}: method '${prop}' is not implemented — the ` +
+          `Fake ${kind}: method '${prop}' is not implemented — the ` +
             `Renderer now calls it. Add a recording fake to fake_gpu.ts rather ` +
             `than leaving this trap to fail the suite.`,
         );
@@ -421,14 +425,18 @@ export function createFakeGpu(
   canvas.width = width;
   canvas.height = height;
 
-  const context = new FakeGPUCanvasContext(width, height, 'bgra8unorm');
+  const rawContext = new FakeGPUCanvasContext(width, height, 'bgra8unorm');
   (canvas as unknown as { getContext: (kind: string) => unknown }).getContext = (kind: string) => {
-    if (kind === 'webgpu') return context;
+    if (kind === 'webgpu') return rawContext;
     return null;
   };
 
   const rawDevice = new FakeGPUDevice();
   const unknownGpuCalls: string[] = [];
   const device = trapUnknownCalls(rawDevice, unknownGpuCalls, 'device');
+  // Trap the canvas context too — the one remaining surface where an
+  // un-faked WebGPU call (e.g. a future configure/getCurrentTexture variant)
+  // would have silently no-oped. Shares the harness's unknownGpuCalls list.
+  const context = trapUnknownCalls(rawContext, unknownGpuCalls, 'canvas context');
   return { device, context, canvas, unknownGpuCalls };
 }

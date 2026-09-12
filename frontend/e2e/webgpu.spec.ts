@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-export type ReplayStats = { error: string | null; frames: number };
+type ReplayStats = { error: string | null; frames: number; events: number };
 
 /**
  * No-server WebGPU smoke test (Layer 2).
@@ -12,19 +12,20 @@ export type ReplayStats = { error: string | null; frames: number };
  * statically (see the `frontend-e2e` make target).
  *
  * Asserts only render health: no error overlay, a clean
- * `renderer.lastRenderError`, at least a few *completed* frames (polled via
- * the `__replayStats` hook — stronger than a fixed timeout, which could pass
- * with zero frames rendered), and no uncaught page errors.
+ * `renderer.lastRenderError`, and the frames >= events invariant polled via
+ * the `__replayStats` hook — every applied replay event marks the data dirty
+ * and drives at least one render-pass submission, so reaching all 4 fixture
+ * events with >= 4 submitted frames proves the ticks applied AND full render
+ * passes ran (a fixed timeout could elapse with zero frames, and a flat
+ * frame minimum could be met by the pre-replay idle frame).
  * Deliberately no pixel baseline (flake factory).
  */
 
 // The fixture has 4 events; each applied event unconditionally bumps the data
-// version, which changes the frame key and drives exactly one rendered frame.
-// So a correct replay renders >= 4 frames on the software GPU. Polling for 4
-// proves the replay ticks applied AND full render passes ran — a fixed timeout
-// could elapse with zero frames, and the count can't be faked by the idle
-// frame. (SwiftShader is slow, so the poll timeout is generous.)
-const MIN_RENDERED_FRAMES = 4;
+// version, which changes the frame key and drives at least one submitted
+// frame. The settle waits for events >= 4 AND frames >= events. (SwiftShader
+// is slow, so the poll timeout is generous.)
+const MIN_EXPECTED_EVENTS = 4;
 const FRAME_POLL_MS = 60_000;
 const HOOK_WAIT_MS = 30_000;
 
@@ -44,30 +45,39 @@ test('replay renders with no WebGPU render errors', async ({ page }) => {
     { timeout: HOOK_WAIT_MS, polling: 500 },
   );
 
-  // 2) Poll for frames that actually completed on the software GPU — the
+  // 2) Poll for the frames >= events invariant on the software GPU — the
   //    render loop only advances when a replay event bumps the data version,
-  //    so reaching MIN_RENDERED_FRAMES proves the replay ticks applied AND
-  //    full render passes ran (a fixed timeout could elapse with zero frames).
-  //    The predicate returns the frame count once the threshold is met (so
-  //    jsonValue() yields the real number) and false until then.
-  const frames = await page
+  //    so events reaching MIN_EXPECTED_EVENTS with that many (or more)
+  //    submitted frames proves the ticks applied AND full render passes ran.
+  //    The predicate returns the stats once the invariant holds (so
+  //    jsonValue() yields the real numbers) and false until then.
+  const stats = await page
     .waitForFunction(
-      (min: number) => {
-        const n = (window as unknown as { __replayStats: () => ReplayStats }).__replayStats()
-          .frames;
-        return n >= min ? n : false;
+      (minEvents: number) => {
+        const s = (window as unknown as { __replayStats: () => ReplayStats }).__replayStats();
+        return s.events >= minEvents && s.frames >= s.events ? s : false;
       },
-      MIN_RENDERED_FRAMES,
+      MIN_EXPECTED_EVENTS,
       { timeout: FRAME_POLL_MS, polling: 250 },
     )
-    .then((h) => h.jsonValue() as number);
-  expect(frames).toBeGreaterThanOrEqual(MIN_RENDERED_FRAMES);
+    .then((h) => h.jsonValue() as ReplayStats);
+  expect(stats.events, 'all fixture events must have been applied').toBeGreaterThanOrEqual(
+    MIN_EXPECTED_EVENTS,
+  );
+  expect(stats.frames, 'every applied event must have driven a render pass').toBeGreaterThanOrEqual(
+    stats.events,
+  );
 
-  // 3) No error overlay — showErrorMessage() creates #error-overlay on any
-  //    init/load/render-setup failure (missing adapter, shader compile,
-  //    fetch). Poll it for a short window after the frames landed so a late
-  //    failure during the replayed ticks is still caught.
-  await expect.poll(() => page.locator('#error-overlay').count(), { timeout: 5_000 }).toBe(0);
+  // 3) No error overlay — one-shot check, not a poll: init/load failures
+  //    surface before the hook is installed (step 1) and render errors are
+  //    asserted via __replayStats().error (step 4), so there is no race a
+  //    poll would catch here — and on failure this surfaces the overlay text
+  //    in the message (a poll timeout would drop it).
+  const overlayCount = await page.locator('#error-overlay').count();
+  if (overlayCount > 0) {
+    const overlayText = await page.locator('#error-overlay').innerText();
+    throw new Error(`error overlay appeared during replay: ${overlayText}`);
+  }
 
   // 4) Clean render error across the replayed frames.
   const lastRenderError = await page.evaluate(

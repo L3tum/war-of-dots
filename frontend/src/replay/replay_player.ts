@@ -19,6 +19,7 @@ export class ReplayPlayer {
   private renderer: Renderer | null = null;
   private events: GameEvent[] = [];
   private currentIndex: number = 0;
+  private appliedEvents: number = 0;
   private loaded: boolean = false;
   private paused: boolean = false;
 
@@ -102,15 +103,26 @@ export class ReplayPlayer {
   }
 
   /**
-   * Test hook (frontend/e2e/webgpu.spec.ts): frames completed by the active
-   * renderer. Lets the E2E settle poll for real rendered frames instead of a
-   * fixed timeout that could elapse with zero frames drawn.
+   * Test hook (frontend/e2e/webgpu.spec.ts): render-pass submissions by the
+   * active renderer. Lets the E2E settle poll for real work instead of a fixed
+   * timeout that could elapse with zero frames submitted.
    */
-  get framesRendered(): number {
-    return this.renderer?.framesRendered ?? 0;
+  get framesSubmitted(): number {
+    return this.renderer?.framesSubmitted ?? 0;
+  }
+
+  /**
+   * Test hook (frontend/e2e/webgpu.spec.ts): replay events applied so far.
+   * Each applied event marks the data dirty and therefore drives at least one
+   * rendered frame — the E2E asserts frames >= events, which is the exact
+   * invariant (a flat frame minimum could be met by the pre-replay frame).
+   */
+  get eventsApplied(): number {
+    return this.appliedEvents;
   }
 
   private applyEvent(event: GameEvent): void {
+    this.appliedEvents++;
     // Bump the renderer's data version so the frame dirty gate keeps the
     // render loop advancing while replay events are still being applied.
     this.renderer?.markDataDirty();

@@ -2107,12 +2107,17 @@ mod tests {
     // Golden-CBOR contract fixture #2 — FullState
     //
     // `tests/fixtures/protocol_fullstate_golden.bin` is one canonical
-    // `ServerMessage::FullState`, mirroring the delta fixture. Every float in
-    // it is a WHOLE number (1000.0, 100.0, 10.0, 20.0) on purpose: cbor-x
-    // encodes those as CBOR integers, so the fixture byte-locks the
-    // `float_deser` acceptance path on the full-state (units_added) payload
-    // too — not just on the delta path. `cost_per_item: 2.5` stays
-    // non-whole as the control that real floats still go out as f64.
+    // `ServerMessage::FullState`, mirroring the delta fixture. It byte-locks
+    // the *server→client* wire form of the full-state (units_added) payload:
+    // ciborium's encoding is deterministic, so the committed bytes pin exactly
+    // what the server emits (floats go out as CBOR f32/f64 markers — note the
+    // asymmetry: the client→server `float_deser` integer-tolerance is NOT on
+    // this path, and this fixture does not exercise it). The frontend test
+    // `protocol_fullstate_golden.test.ts` decodes the same bytes with cbor-x
+    // and asserts the same field values, locking both halves of the round trip.
+    // Floats are whole numbers (1000.0, 100.0, 10.0, 20.0) for readable
+    // assertions; `cost_per_item: 2.5` is the non-whole control that real
+    // floats still go out as f64.
     //
     // Regenerate after an intentional protocol change:
     //   cargo test --lib dump_protocol_fullstate_golden -- --ignored
@@ -2217,11 +2222,10 @@ mod tests {
         assert_eq!(
             to_cbor_bytes(&golden_full_state()),
             golden,
-            "protocol_fullstate_golden.bin is stale — regenerate: \n             cargo test --lib dump_protocol_fullstate_golden -- --ignored"
+            "protocol_fullstate_golden.bin is stale — regenerate: cargo test --lib dump_protocol_fullstate_golden -- --ignored"
         );
         // Decode with plain ciborium and check the fields the frontend locks
-        // in `protocol_fullstate_golden.test.ts`. The all-whole floats are the
-        // float_deser acceptance check on the FullState payload.
+        // in `protocol_fullstate_golden.test.ts`.
         let decoded: ServerMessage = ciborium::from_reader(golden).unwrap();
         let ServerMessage::FullState(state) = decoded else {
             panic!("expected FullState in golden fixture");
