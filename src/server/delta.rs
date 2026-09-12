@@ -773,8 +773,10 @@ pub(crate) struct NetworkBaselines {
 /// bits) guarding id reuse — the exact mechanism of
 /// `TickContext.owner_at`/`owner_gen` (`game.rs:318–323`; hecs bumps the
 /// generation on id reuse, so a stale slot never matches). The `alive` list
-/// holds the entities with a live baseline; `touched` is a scratch set (bucket
-/// capacity reused across ticks) marking entity ids seen by the current pass.
+/// holds the entities with a live baseline; `touched` is a dense per-id
+/// `(pass, gen)` stamp marking the incarnations confirmed alive by the
+/// current pass (the previous scratch `HashSet<Entity>` hashed every entity
+/// every tick; a dense stamp is an O(1) write/read with no hashing).
 ///
 /// Slot reuse ⇒ same `unit_N` id, new incarnation ⇒ the gen check misses, so
 /// the pass emits `removed` (tombstone) + `added` (fresh baseline) for it.
@@ -786,10 +788,14 @@ pub(crate) struct UnitBaselineStore {
     slots: Vec<Option<UnitState>>,
     gens: Vec<u32>,
     alive: Vec<Entity>,
-    /// Full (id, gen) entities seen by the current pass — id+gen, not id
-    /// only, so a same-tick death→respawn on the same slot can't keep the
-    /// stale incarnation alive.
-    touched: HashSet<Entity>,
+    /// Last pass in which an incarnation of this id was confirmed alive:
+    /// `(pass, gen)` — id+gen, not id only, so a same-tick death→respawn on
+    /// the same slot can't keep the stale incarnation alive. `(0, 0)` marks
+    /// untouched (hecs generations are NonZeroU32, so a real stamp is never
+    /// `(0, 0)`).
+    touched: Vec<(u32, u32)>,
+    /// Pass counter feeding the `touched` stamps; bumped by `commit`.
+    pass: u32,
     /// Fresh incarnations `insert`ed during the current pass (scratch;
     /// appended to `alive` at `commit`).
     new: Vec<Entity>,
@@ -852,11 +858,13 @@ impl UnitBaselineStore {
         if id >= UNIT_STORE_MAX_ID {
             return;
         }
-        self.touched.insert(e);
+        let gen = (bits >> 32) as u32;
         if self.slots.len() <= id {
             self.slots.resize(id + 1, None);
             self.gens.resize(id + 1, 0);
+            self.touched.resize(id + 1, (0, 0));
         }
+        self.touched[id] = (self.pass, gen);
     }
 
     /// Take a STALE baseline out of `e`'s slot: the slot holds a different
@@ -893,6 +901,7 @@ impl UnitBaselineStore {
         if self.slots.len() <= id {
             self.slots.resize(id + 1, None);
             self.gens.resize(id + 1, 0);
+            self.touched.resize(id + 1, (0, 0));
         }
         self.slots[id] = Some(state);
         self.gens[id] = (bits >> 32) as u32;
@@ -915,7 +924,7 @@ impl UnitBaselineStore {
             let bits = e.to_bits().get();
             let id = (bits & 0xFFFF_FFFF) as usize;
             let gen = (bits >> 32) as u32;
-            if self.touched.contains(&e) {
+            if self.touched.get(id) == Some(&(self.pass, gen)) {
                 keep += 1;
                 continue;
             }
@@ -932,7 +941,15 @@ impl UnitBaselineStore {
             n -= 1; // swapped-in tail entry is unprocessed; `keep` stays put
         }
         self.alive.append(&mut self.new);
-        self.touched.clear();
+        // Advance the pass. On u32 wrap, clear the stamps so no stale pass-0
+        // stamp (from the very first pass) can match; 2^32 commits away.
+        self.pass = self.pass.wrapping_add(1);
+        if self.pass == 0 {
+            for s in self.touched.iter_mut() {
+                *s = (0, 0);
+            }
+            self.pass = 1;
+        }
     }
 }
 
@@ -2575,5 +2592,97 @@ mod tests {
         let (sparse, changed) = diff_grid(&prev, &big);
         assert!(sparse.is_none());
         assert_eq!(changed, 62_500);
+    }
+
+    // ── UnitBaselineStore touch/commit (dense (pass, gen) stamps) ───────────
+
+    fn entity(id: u32, gen: u32) -> Entity {
+        Entity::from_bits(((gen as u64) << 32) | id as u64).unwrap()
+    }
+
+    #[test]
+    fn baseline_store_touch_commit_keeps_and_prunes() {
+        let mut store = UnitBaselineStore::default();
+        let e1 = entity(1, 1);
+        let e2 = entity(2, 1);
+
+        // Pass 1: both spawn.
+        store.touch(e1);
+        store.insert(e1, unit("u1", "p0", 0.0, 0.0));
+        store.touch(e2);
+        store.insert(e2, unit("u2", "p0", 1.0, 1.0));
+        let mut removed = Vec::new();
+        store.commit(&mut removed);
+        assert!(removed.is_empty());
+        assert_eq!(store.alive.len(), 2);
+
+        // Pass 2: e2 dies (not touched), e1 survives. The game path hands
+        // commit a FRESH vec each pass; so do we.
+        store.touch(e1);
+        let mut removed = Vec::new();
+        store.commit(&mut removed);
+        assert_eq!(removed, vec!["u2".to_string()]);
+        assert_eq!(store.alive, vec![e1]);
+        // The pruned slot no longer resolves (prev_owner_counts can't see it).
+        assert!(store.resolve(e2).is_none());
+
+        // Pass 3: e1 dies too.
+        let mut removed = Vec::new();
+        store.commit(&mut removed);
+        assert_eq!(removed, vec!["u1".to_string()]);
+        assert!(store.alive.is_empty());
+    }
+
+    #[test]
+    fn baseline_store_same_tick_death_respawn_prunes_stale_incarnation() {
+        let mut store = UnitBaselineStore::default();
+        let old = entity(7, 1);
+        let fresh = entity(7, 2); // id reuse after death, bumped generation
+
+        // Pass 1: spawn the old incarnation.
+        store.touch(old);
+        store.insert(old, unit("u7", "p0", 0.0, 0.0));
+        let mut removed = Vec::new();
+        store.commit(&mut removed);
+        assert_eq!(store.alive, vec![old]);
+
+        // Pass 2: old dies and the id respawns in the SAME pass. The game
+        // pass calls take_stale (emits the old id), then touch+insert.
+        store.take_stale(fresh);
+        store.touch(fresh);
+        store.insert(fresh, unit("u7", "p0", 9.0, 9.0));
+        let mut removed = Vec::new();
+        store.commit(&mut removed);
+
+        // Exactly one tombstone (from take_stale at the game-pass level;
+        // commit must not double-emit), and the stale incarnation is gone
+        // from `alive` — the pass-2 stamp for id 7 belongs to gen 2.
+        assert_eq!(store.alive, vec![fresh]);
+        assert!(store.resolve(old).is_none(), "stale gen must not resolve");
+        assert!(store.resolve(fresh).is_some());
+    }
+
+    #[test]
+    fn baseline_store_owner_counts_follow_pruning() {
+        let mut store = UnitBaselineStore::default();
+        let e1 = entity(3, 1);
+        let e2 = entity(4, 1);
+        store.touch(e1);
+        store.insert(e1, unit("u3", "p0", 0.0, 0.0));
+        store.touch(e2);
+        store.insert(e2, unit("u4", "p1", 0.0, 0.0));
+        let mut removed = Vec::new();
+        store.commit(&mut removed);
+
+        let counts = store.prev_owner_counts();
+        assert_eq!(counts.get("p0"), Some(&1));
+        assert_eq!(counts.get("p1"), Some(&1));
+
+        // e1 dies → p0's count drops with the pruning.
+        store.touch(e2);
+        store.commit(&mut removed);
+        let counts = store.prev_owner_counts();
+        assert_eq!(counts.get("p0"), None);
+        assert_eq!(counts.get("p1"), Some(&1));
     }
 }
