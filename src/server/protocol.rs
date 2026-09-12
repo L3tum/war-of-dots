@@ -2230,7 +2230,10 @@ mod tests {
         let ServerMessage::FullState(state) = decoded else {
             panic!("expected FullState in golden fixture");
         };
-        assert_eq!(state.terrain, vec![vec!["Plains".to_string(), "Forest".to_string()]; 2]);
+        assert_eq!(
+            state.terrain,
+            vec![vec!["Plains".to_string(), "Forest".to_string()]; 2]
+        );
         assert_eq!(
             state.vision_grid.as_deref(),
             Some(&[vec![true, true], vec![true, false]][..])

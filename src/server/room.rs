@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 
 /// I7: keep-latest ring depth for per-tick delta payloads. A stale delta is
@@ -23,7 +24,7 @@ pub const DELTA_RING_DEPTH: usize = 3;
 /// messages are always queued and never dropped.
 pub enum EgressMessage {
     Delta(u64),
-    Reliable(Vec<u8>),
+    Reliable(Bytes),
 }
 
 /// I7: bounded keep-latest ring of encoded delta payloads.
@@ -115,12 +116,28 @@ impl TcpEgress {
     }
 }
 
-/// Resolve one egress envelope into wire bytes. `None` = a stale delta whose
-/// ring entry was evicted by a newer delta — skip it.
-pub fn egress_bytes(msg: EgressMessage, ring: &DeltaRing) -> Option<Vec<u8>> {
+/// Resolve one egress envelope into wire bytes for the raw-TCP drain.
+/// `None` = a stale delta whose ring entry was evicted by a newer delta — skip
+/// it. Returns `Bytes`: the TCP path writes the slice directly and the
+/// `Reliable` arm hands out the shared broadcast allocation without copying.
+pub fn egress_bytes(msg: EgressMessage, ring: &DeltaRing) -> Option<Bytes> {
+    match msg {
+        EgressMessage::Delta(seq) => ring.take(seq).map(Bytes::from),
+        EgressMessage::Reliable(data) => Some(data),
+    }
+}
+
+/// WS variant of [`egress_bytes`]: axum 0.7's `Message::Binary` takes
+/// `Vec<u8>`, and the delta path recovers the ring's owned `Vec` without a
+/// copy (same behavior as pre-`Bytes`). Only `Reliable` broadcasts pay one
+/// `to_vec` here — the per-player clones earlier in the tick loop are
+/// refcount bumps, so the copies leave the tick task and happen at most once
+/// per delivered frame, right before WS framing copies into the socket
+/// buffer anyway.
+pub fn egress_vec(msg: EgressMessage, ring: &DeltaRing) -> Option<Vec<u8>> {
     match msg {
         EgressMessage::Delta(seq) => ring.take(seq),
-        EgressMessage::Reliable(data) => Some(data),
+        EgressMessage::Reliable(data) => Some(data.to_vec()),
     }
 }
 
@@ -188,7 +205,7 @@ impl PlayerConnection {
 pub enum PlayerSender {
     Tcp(TcpEgress),
     #[allow(dead_code)]
-    Websocket(Arc<dyn Fn(Vec<u8>) -> Result<(), ()> + Send + Sync>),
+    Websocket(Arc<dyn Fn(Bytes) -> Result<(), ()> + Send + Sync>),
     /// No connection (LLM-only player)
     None,
 }
@@ -221,13 +238,13 @@ impl PlayerSender {
                 let seq = e.ring.push(data);
                 e.tx.send(EgressMessage::Delta(seq)).map_err(|_| ())
             }
-            PlayerSender::Websocket(f) => f(data),
+            PlayerSender::Websocket(f) => f(data.into()),
             PlayerSender::None => Ok(()), // No connection, silently ignore
         }
     }
 
     /// I7: reliable egress (FullState, GameOver, lobby, errors) — never dropped.
-    fn push_reliable(&self, data: Vec<u8>) -> Result<(), ()> {
+    fn push_reliable(&self, data: Bytes) -> Result<(), ()> {
         match self {
             PlayerSender::Tcp(e) => e.tx.send(EgressMessage::Reliable(data)).map_err(|_| ()),
             PlayerSender::Websocket(f) => f(data),
@@ -239,12 +256,12 @@ impl PlayerSender {
         self.push_delta(data)
     }
 
-    pub async fn send_reliable(&self, data: Vec<u8>) -> Result<(), ()> {
+    pub async fn send_reliable(&self, data: Bytes) -> Result<(), ()> {
         self.push_reliable(data)
     }
 
     #[allow(clippy::result_unit_err)]
-    pub fn blocking_send_reliable(&self, data: Vec<u8>) -> Result<(), ()> {
+    pub fn blocking_send_reliable(&self, data: Bytes) -> Result<(), ()> {
         self.push_reliable(data)
     }
 }

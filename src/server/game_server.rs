@@ -1,5 +1,6 @@
 //! Server: HTTP + raw TCP for game state
 
+use bytes::Bytes;
 use sqlite::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,8 +37,8 @@ use crate::server::protocol::{
 
 // Re-export types from room module for use throughout game_server
 pub use crate::server::room::{
-    egress_bytes, Command, DebugGameStats, DeltaRing, EgressMessage, GameRoom, LlmPlayerConfig,
-    PlayerConnection, PlayerSender, TcpEgress,
+    egress_bytes, egress_vec, Command, DebugGameStats, DeltaRing, EgressMessage, GameRoom,
+    LlmPlayerConfig, PlayerConnection, PlayerSender, TcpEgress,
 };
 
 // Re-export delta functions
@@ -244,7 +245,7 @@ impl GameRoom {
             let initial_state = game.full_state_with_player_id(&player_id);
             let initial_msg = ServerMessage::FullState(initial_state);
             let encoded = encode_message(&initial_msg);
-            let _ = player.tx().blocking_send_reliable(encoded);
+            let _ = player.tx().blocking_send_reliable(encoded.into());
         }
 
         // Create LLM agents from configs
@@ -500,18 +501,18 @@ impl GameRoom {
                             let encoded = encode_message(&msg);
                             for player in &players {
                                 if player.id().is_some_and(|id| *id == pid) {
-                                    let _ = player.tx().send_reliable(encoded.clone()).await;
+                                    let _ = player.tx().send_reliable(encoded.clone().into()).await;
                                 }
                             }
                         }
 
                         // --- Process reason log entries (non-blocking) ---
                         while let Ok((name, action, reason)) = reason_rx.try_recv() {
-                            let encoded = encode_message(&ServerMessage::LlmReasonLog {
+                            let encoded = Bytes::from(encode_message(&ServerMessage::LlmReasonLog {
                                 player_name: name,
                                 action,
                                 reason,
-                            });
+                            }));
                             for player in &players {
                                 let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
@@ -549,7 +550,7 @@ impl GameRoom {
                                     let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
                                     let full_state = game.full_state_with_vision(vision_grid, border_grid);
                                     let encoded = encode_message(&ServerMessage::FullState(full_state));
-                                    let _ = sender.send_reliable(encoded).await;
+                                    let _ = sender.send_reliable(encoded.into()).await;
                                     players.push(PlayerConnection::Spectator { tx: sender });
                                 }
                                 Command::EmbarkUnit(unit_id, pid) => {
@@ -655,7 +656,7 @@ impl GameRoom {
                                 game_id: room_id.clone(),
                                 message: "⚖️ Draw — all players eliminated".to_string(),
                             };
-                            let encoded = encode_message(&msg);
+                            let encoded = Bytes::from(encode_message(&msg));
                             for player in &players {
                                 let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
@@ -686,7 +687,7 @@ impl GameRoom {
                                 game_id: room_id.clone(),
                                 message: "Game over — last player standing wins".to_string(),
                             };
-                            let encoded = encode_message(&msg);
+                            let encoded = Bytes::from(encode_message(&msg));
                             for player in &players {
                                 let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
@@ -835,7 +836,7 @@ impl GameRoom {
                                 game_id: room_id.clone(),
                                 message: "Game abandoned — no human players remaining".to_string(),
                             };
-                            let encoded = encode_message(&msg);
+                            let encoded = Bytes::from(encode_message(&msg));
                             for player in &players {
                                 let _ = player.tx().send_reliable(encoded.clone()).await;
                             }
@@ -906,7 +907,7 @@ impl GameRoom {
                                 let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
                                 let full_state = game.full_state_with_vision(vision_grid, border_grid);
                                 let encoded = encode_message(&ServerMessage::FullState(full_state));
-                                let _ = sender.send_reliable(encoded).await;
+                                let _ = sender.send_reliable(encoded.into()).await;
                                 players.push(PlayerConnection::Spectator { tx: sender });
                             }
                             Some(Command::EmbarkUnit(unit_id, pid)) => {
@@ -1219,7 +1220,7 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
     tokio::spawn(async move {
         let mut ws_sink = ws_sink;
         while let Some(msg) = rx.recv().await {
-            let data = match egress_bytes(msg, &ring) {
+            let data = match egress_vec(msg, &ring) {
                 Some(data) => data,
                 None => continue, // stale delta superseded by a newer ring entry
             };
@@ -1508,7 +1509,7 @@ pub(crate) async fn ws_egress_loop<S>(
     S: futures::Sink<Message> + Unpin,
 {
     while let Some(msg) = rx.recv().await {
-        let data = match egress_bytes(msg, &ring) {
+        let data = match egress_vec(msg, &ring) {
             Some(data) => data,
             None => continue, // stale delta superseded by a newer ring entry
         };
@@ -1519,11 +1520,21 @@ pub(crate) async fn ws_egress_loop<S>(
     }
 }
 
+/// Nagle off for game traffic: deltas are small frames sent at up to 10 Hz,
+/// so the kernel's Nagle coalescing delay (~up to 40 ms, or one RTT when an
+/// ACK is outstanding) would ride on top of every small frame. The WS path
+/// frames its own messages and is unaffected; this is the raw-TCP game
+/// transport only.
+pub(crate) fn configure_game_tcp_stream(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+}
+
 pub(crate) async fn handle_tcp_client(
     stream: tokio::net::TcpStream,
     server_state: Arc<Mutex<GameServer>>,
 ) {
     let conn_id = Uuid::new_v4();
+    configure_game_tcp_stream(&stream);
     let (reader, writer) = tokio::io::split(stream);
     // I7: channel carries tagged envelopes; the ring bounds delta memory
     let (tx, rx) = mpsc::unbounded_channel::<EgressMessage>();
@@ -1634,7 +1645,7 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
                             message: "Invalid message format".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = actual_player_sender.send_reliable(encoded).await;
+                        let _ = actual_player_sender.send_reliable(encoded.into()).await;
                     }
                 }
             }
@@ -1733,7 +1744,7 @@ pub(crate) async fn handle_client_message(
                         lobby_code: code.clone(),
                     };
                     let encoded = encode_message(&resp);
-                    let _ = player_sender.send_reliable(encoded).await;
+                    let _ = player_sender.send_reliable(encoded.into()).await;
 
                     // Broadcast LobbyUpdate so the creator sees themselves in the list
                     {
@@ -1752,7 +1763,7 @@ pub(crate) async fn handle_client_message(
                                 .collect();
                             let settings = lobby.settings.clone();
                             let update = ServerMessage::LobbyUpdate { players, settings };
-                            let update_encoded = encode_message(&update);
+                            let update_encoded = Bytes::from(encode_message(&update));
                             for p in &lobby.players {
                                 let _ = p.connection.send_reliable(update_encoded.clone()).await;
                             }
@@ -1830,16 +1841,17 @@ pub(crate) async fn handle_client_message(
                                 lobby_code: lobby_code_inner.clone(),
                             };
                             let join_encoded = encode_message(&join_resp);
-                            let _ = player_sender.send_reliable(join_encoded).await;
+                            let _ = player_sender.send_reliable(join_encoded.into()).await;
 
                             // Broadcast LobbyUpdate to all players in the lobby
                             let server = server_state.lock().await;
                             let lobby_manager = server.lobby_manager.lock().await;
                             if let Some(l) = lobby_manager.get_lobby(&lobby_code_inner) {
-                                let encoded = encode_message(&ServerMessage::LobbyUpdate {
-                                    players: players.clone(),
-                                    settings: settings.clone(),
-                                });
+                                let encoded =
+                                    Bytes::from(encode_message(&ServerMessage::LobbyUpdate {
+                                        players: players.clone(),
+                                        settings: settings.clone(),
+                                    }));
                                 for p in &l.players {
                                     let _ = p.connection.send_reliable(encoded.clone()).await;
                                 }
@@ -1848,7 +1860,7 @@ pub(crate) async fn handle_client_message(
                         Err(e) => {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     }
                 }
@@ -1873,7 +1885,7 @@ pub(crate) async fn handle_client_message(
                                     .to_string(),
                             };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                             return;
                         }
                         let result = {
@@ -1884,7 +1896,7 @@ pub(crate) async fn handle_client_message(
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         } else {
                             let (players, settings) = {
                                 let server = server_state.lock().await;
@@ -1905,14 +1917,14 @@ pub(crate) async fn handle_client_message(
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send_reliable(encoded).await;
+                        let _ = player_sender.send_reliable(encoded.into()).await;
                     }
                 }
                 LobbyMessage::SetSlotLlmConfig { slot, model } => {
@@ -1936,7 +1948,7 @@ pub(crate) async fn handle_client_message(
                                     .to_string(),
                             };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                             return;
                         }
 
@@ -1975,7 +1987,7 @@ pub(crate) async fn handle_client_message(
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         } else {
                             // Also update the player's llm_provider for display (idempotent
                             // when the provider was already selected via SetSlotLlm).
@@ -2010,14 +2022,14 @@ pub(crate) async fn handle_client_message(
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send_reliable(encoded).await;
+                        let _ = player_sender.send_reliable(encoded.into()).await;
                     }
                 }
                 LobbyMessage::AddLlmPlayer { name, llm_provider } => {
@@ -2041,7 +2053,7 @@ pub(crate) async fn handle_client_message(
                                     .to_string(),
                             };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                             return;
                         }
                         let result = {
@@ -2056,7 +2068,7 @@ pub(crate) async fn handle_client_message(
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         } else {
                             // Broadcast LobbyUpdate
                             let (players, settings) = {
@@ -2078,14 +2090,14 @@ pub(crate) async fn handle_client_message(
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
                             let encoded = encode_message(&resp);
-                            let _ = player_sender.send_reliable(encoded).await;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send_reliable(encoded).await;
+                        let _ = player_sender.send_reliable(encoded.into()).await;
                     }
                 }
                 LobbyMessage::StartGame => {
@@ -2100,7 +2112,7 @@ pub(crate) async fn handle_client_message(
                             message: "Not in a lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send_reliable(encoded).await;
+                        let _ = player_sender.send_reliable(encoded.into()).await;
                         return;
                     };
                     let is_creator = {
@@ -2120,7 +2132,7 @@ pub(crate) async fn handle_client_message(
                             message: "Only the lobby creator can start the game".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send_reliable(encoded).await;
+                        let _ = player_sender.send_reliable(encoded.into()).await;
                         return;
                     }
 
@@ -2144,7 +2156,7 @@ pub(crate) async fn handle_client_message(
                                     message: "Lobby not found".to_string(),
                                 };
                                 let encoded = encode_message(&resp);
-                                let _ = player_sender.send_reliable(encoded).await;
+                                let _ = player_sender.send_reliable(encoded.into()).await;
                                 return;
                             }
                         };
@@ -2154,7 +2166,7 @@ pub(crate) async fn handle_client_message(
                                 if let Some(err) = validate_custom_settings(&lobby.settings) {
                                     let resp = ServerMessage::Error { message: err };
                                     let encoded = encode_message(&resp);
-                                    let _ = player_sender.send_reliable(encoded).await;
+                                    let _ = player_sender.send_reliable(encoded.into()).await;
                                     return;
                                 }
                             }
@@ -2308,7 +2320,7 @@ pub(crate) async fn handle_client_message(
                             message: "A game is already running for this lobby".to_string(),
                         };
                         let encoded = encode_message(&resp);
-                        let _ = player_sender.send_reliable(encoded).await;
+                        let _ = player_sender.send_reliable(encoded.into()).await;
                         return;
                     }
                     // Spawn the game with human and LLM players
@@ -2446,12 +2458,12 @@ pub(crate) async fn handle_client_message(
                     };
                     // Broadcast ClearSpectator then LobbyUpdate
                     let clear_resp = ServerMessage::ClearSpectator;
-                    let clear_encoded = encode_message(&clear_resp);
+                    let clear_encoded = Bytes::from(encode_message(&clear_resp));
                     let lobby_update_resp = ServerMessage::LobbyUpdate {
                         players: all_players.clone(),
                         settings: settings.clone(),
                     };
-                    let lobby_encoded = encode_message(&lobby_update_resp);
+                    let lobby_encoded = Bytes::from(encode_message(&lobby_update_resp));
                     for sender in &lobby_player_senders {
                         let _ = sender.send_reliable(clear_encoded.clone()).await;
                         let _ = sender.send_reliable(lobby_encoded.clone()).await;
@@ -2627,7 +2639,7 @@ pub(crate) async fn handle_client_message(
                 .collect();
             let resp = ServerMessage::Leaderboard { entries };
             let encoded = encode_message(&resp);
-            let _ = player_sender.send_reliable(encoded).await;
+            let _ = player_sender.send_reliable(encoded.into()).await;
         }
         ClientMessage::EmbarkUnit { unit_id } => {
             let server = server_state.lock().await;
@@ -3204,8 +3216,14 @@ mod i7_egress_tests {
             message: "i7 soak game over".to_string(),
         });
         // Reliable: always queued, never dropped.
-        sender.send_reliable(error_msg.clone()).await.unwrap();
-        sender.send_reliable(game_over.clone()).await.unwrap();
+        sender
+            .send_reliable(error_msg.clone().into())
+            .await
+            .unwrap();
+        sender
+            .send_reliable(game_over.clone().into())
+            .await
+            .unwrap();
         (last_delta, error_msg, game_over)
     }
 
@@ -3295,11 +3313,50 @@ mod i7_egress_tests {
         assert!(egress_bytes(EgressMessage::Delta(first), &ring).is_none());
         assert_eq!(
             egress_bytes(EgressMessage::Delta(last), &ring),
-            Some(vec![9u8; 8])
+            Some(vec![9u8; 8].into())
         );
         assert_eq!(
-            egress_bytes(EgressMessage::Reliable(vec![7u8]), &ring),
-            Some(vec![7u8])
+            egress_bytes(EgressMessage::Reliable(vec![7u8].into()), &ring),
+            Some(vec![7u8].into())
+        );
+    }
+
+    /// Nagle must be off on the raw-TCP game transport: small delta frames at
+    /// up to 10 Hz would otherwise eat the kernel's ~40 ms coalescing delay.
+    /// (Invisible to the headless benchmark, which models no socket — this is
+    /// the acceptance gate.)
+    #[tokio::test]
+    async fn tcp_game_stream_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        configure_game_tcp_stream(&stream);
+        assert!(
+            stream.nodelay().unwrap(),
+            "game TCP stream must disable Nagle"
+        );
+    }
+
+    /// A broadcast frame must reach every player as a REF of one allocation,
+    /// not a per-player copy: `send_reliable(Bytes)` clones are refcount
+    /// bumps, so every queued envelope shares the same underlying bytes.
+    #[tokio::test]
+    async fn reliable_broadcast_shares_one_allocation() {
+        let frame = Bytes::from(encode_message(&ServerMessage::ClearSpectator));
+        let mut chunk_ptrs = Vec::new();
+        for _ in 0..3 {
+            let (tx, mut rx) = mpsc::unbounded_channel::<EgressMessage>();
+            let sender = PlayerSender::Tcp(TcpEgress::new(tx));
+            sender.send_reliable(frame.clone()).await.unwrap();
+            let EgressMessage::Reliable(received) = rx.try_recv().unwrap() else {
+                panic!("expected a Reliable envelope");
+            };
+            chunk_ptrs.push(received.as_ptr());
+        }
+        assert!(
+            chunk_ptrs.iter().all(|p| *p == chunk_ptrs[0]),
+            "broadcast clones must share the frame's allocation, got {chunk_ptrs:?}"
         );
     }
 

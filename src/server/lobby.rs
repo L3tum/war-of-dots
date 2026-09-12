@@ -74,7 +74,7 @@ impl<'de> serde::Deserialize<'de> for LobbyPlayer {
 }
 
 use super::game_server::PlayerSender;
-use super::protocol::{LobbySettings, ServerMessage};
+use super::protocol::LobbySettings;
 use crate::llm::agent::LlmAgentConfig;
 
 pub struct LobbyManager {
@@ -155,21 +155,6 @@ impl LobbyManager {
             connection,
         });
         Ok(lobby)
-    }
-
-    #[allow(dead_code)]
-    pub fn broadcast_lobby_update(&self, code: &str, msg: &ServerMessage) {
-        use super::protocol::encode_message;
-        let encoded = encode_message(msg);
-        if let Some(lobby) = self.lobbies.get(code) {
-            for player in &lobby.players {
-                let encoded_clone = encoded.clone();
-                let sender = player.connection.clone();
-                tokio::spawn(async move {
-                    let _ = sender.send_reliable(encoded_clone).await;
-                });
-            }
-        }
     }
 
     pub fn set_slot_llm(&mut self, code: &str, slot: u32, provider: String) -> Result<(), String> {
