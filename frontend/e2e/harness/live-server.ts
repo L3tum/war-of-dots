@@ -3,7 +3,7 @@
  *
  * Spawns the actual `war-of-dots` binary — the one that serves the embedded
  * frontend (include_dir!) and the real `/ws` game socket — on a free port
- * with an isolated config (temp-dir storage, no LLM advisor). Specs get a
+ * with an isolated config (temp-dir storage, no LLM wiring). Specs get a
  * ready, version-locked server via:
  *
  *   import { test, expect } from '../harness/live-server';
@@ -44,8 +44,9 @@ type LiveServerFixture = {
  * Derive the E2E config from the real repo config.toml so the server runs
  * the production ruleset/unit types, with two changes:
  *  - storage paths → temp dir (E2E must never touch the dev database);
- *  - advisor_provider removed (no LLM calls; the advisor is a manual in-game
- *    toggle and the lobby is human-only).
+ *  - all LLM wiring removed: advisor_provider and the whole providers table
+ *    (which carries the api_key entries). The [llm] header stays — Config.llm
+ *    has no serde default — but an empty table parses to "no LLM at all".
  */
 function writeE2eConfig(baseConfigPath: string, tmpDir: string): string {
   const cfg = fs.readFileSync(baseConfigPath, 'utf8');
@@ -54,11 +55,14 @@ function writeE2eConfig(baseConfigPath: string, tmpDir: string): string {
   const e2e = cfg
     .replace(/^database_path\s*=.*$/m, `database_path = "${dbPath}"`)
     .replace(/^replay_path\s*=.*$/m, `replay_path = "${replayPath}"`)
-    .replace(/^advisor_provider\s*=.*$/m, '');
+    .replace(/^advisor_provider\s*=.*$/m, '')
+    // providers = [...] is a multi-line TOML array of inline tables; the
+    // entries contain no ']' so a non-greedy match ends at the array close.
+    .replace(/^providers\s*=\s*\[[\s\S]*?\],?\s*$/m, '');
   // The rewrites are regex best-effort over an unvalidated TOML: if a key is
   // ever renamed or reformatted, a replace silently no-ops and the live server
   // (spawned with cwd = repo root) would write its database straight into the
-  // repo, and/or keep the LLM advisor live. Fail loudly instead of running green.
+  // repo, and/or keep the LLM backend live. Fail loudly instead of running green.
   if (
     !e2e.includes(`database_path = "${dbPath}"`) ||
     !e2e.includes(`replay_path = "${replayPath}"`)
@@ -68,9 +72,14 @@ function writeE2eConfig(baseConfigPath: string, tmpDir: string): string {
         'longer match config.toml. Refusing to run (would clobber the dev database).',
     );
   }
-  if (/^\s*advisor_provider\s*=/m.test(e2e)) {
+  if (
+    /api_key/.test(e2e) ||
+    /^\s*advisor_provider\s*=/m.test(e2e) ||
+    /^\s*providers\s*=/m.test(e2e)
+  ) {
     throw new Error(
-      'E2E config rewrite failed to remove advisor_provider: the live E2E server must never be able to fire real LLM calls.',
+      'E2E config rewrite left LLM wiring in place: the live E2E server must have no providers ' +
+        'table, no advisor, and no api_key — it must be unable to fire real LLM calls.',
     );
   }
   const configPath = path.join(tmpDir, 'e2e-config.toml');
