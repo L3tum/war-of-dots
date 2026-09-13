@@ -1,7 +1,7 @@
 # llm-benchmark-runner — Quality & Development Makefile
 # Run with `make` or `make <target>`
 
-.PHONY: check fmt clippy test miri deny all build-release swebench-harness-image docs run run-no-resume report mock-report mock-report-official frontend-typecheck frontend-lint frontend-lint-fix frontend-fmt frontend-fmt-check frontend-check frontend-build frontend-test frontend-e2e
+.PHONY: check fmt clippy test miri deny all build-release swebench-harness-image docs run run-no-resume report mock-report mock-report-official frontend-typecheck frontend-typecheck-e2e frontend-lint frontend-lint-e2e frontend-lint-fix frontend-fmt frontend-fmt-check frontend-check frontend-build frontend-test frontend-e2e
 
 # Quick pre-commit checks
 check:
@@ -93,9 +93,18 @@ FE := frontend
 frontend-typecheck:
 	cd $(FE) && npm run typecheck
 
+# E2E harness type check (separate tsconfig — node/ESM Playwright fixtures,
+# not the browser bundle)
+frontend-typecheck-e2e:
+	cd $(FE) && npm run typecheck:e2e
+
 # ESLint — static analysis / code smells
 frontend-lint:
 	cd $(FE) && npm run lint
+
+# ESLint — the E2E harness (Playwright fixtures + specs), outside the src/ scope
+frontend-lint-e2e:
+	cd $(FE) && npm run lint:e2e
 
 # ESLint — auto-fix where possible
 frontend-lint-fix:
@@ -110,7 +119,7 @@ frontend-fmt-check:
 	cd $(FE) && npm run fmt:check
 
 # Full frontend quality gate (format check + lint + typecheck)
-frontend-check: frontend-fmt-check frontend-lint frontend-typecheck
+frontend-check: frontend-fmt-check frontend-lint frontend-typecheck frontend-typecheck-e2e frontend-lint-e2e
 
 # Build the frontend bundle into frontend/dist (served via include_dir and baked
 # into the binary at compile time). Run this BEFORE cargo run/build so the server

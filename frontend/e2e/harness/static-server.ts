@@ -32,9 +32,12 @@ type StaticServerFixture = {
 };
 
 // staticUrl is worker-scoped (one server per worker), so it is declared in
-// the second type parameter of extend.
-export const test = base.extend<{}, { staticUrl: string }>({
+// the second type parameter of extend. The empty first (test-args) param is a
+// Playwright idiom — hence the targeted disable.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export const test = base.extend<{}, StaticServerFixture>({
   staticUrl: [
+    // eslint-disable-next-line no-empty-pattern
     async ({}, use) => {
       const port = await freePort();
 

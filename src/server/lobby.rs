@@ -105,15 +105,19 @@ impl LobbyManager {
         connection: PlayerSender,
         custom_unit_types: Vec<super::protocol::CustomUnitType>,
     ) -> String {
-        // A `max_players` of 0 means "unspecified": standard-ruleset clients
-        // omit the field entirely (their form section is hidden) and serde
-        // fills in 0. Without normalizing it, the lobby would be join-proof —
-        // the full check `players.len() >= max_players` is immediately true
-        // (1 >= 0) and every JoinLobby fails with "Lobby full". The default
-        // map puts city clusters at the four corners, so four is the natural
-        // cap for an unspecified lobby.
+        // Normalize the player cap. The hard server cap is 16 (see
+        // validate_custom_settings); anything outside 1..=16 is treated as
+        // "unspecified" and defaulted to 4. The 0 case is the real one:
+        // standard-ruleset clients omit `max_players` entirely (their form
+        // section is hidden) and serde fills in 0, which used to make the
+        // lobby join-proof — the full check `players.len() >= max_players`
+        // was immediately true (1 >= 0) and every join failed with "Lobby
+        // full". Four is the natural default (the default map puts city
+        // clusters at the four corners), and clamping also drops hostile
+        // out-of-range values (e.g. u32::MAX) that previously slipped through
+        // unvalidated on the standard-ruleset path.
         let mut settings = settings;
-        if settings.max_players == 0 {
+        if !(1..=16).contains(&settings.max_players) {
             settings.max_players = 4;
         }
         let code = Uuid::new_v4().to_string()[..12].to_string();
@@ -239,5 +243,100 @@ impl LobbyManager {
     /// duplicate StartGame.
     pub fn remove_lobby(&mut self, code: &str) -> Option<Lobby> {
         self.lobbies.remove(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lobby settings with the required fields and a chosen player cap. `0`
+    /// is the "unspecified" shape standard-ruleset clients actually send
+    /// (they omit the field, serde fills in 0).
+    fn settings_with_max_players(max: u32) -> LobbySettings {
+        let mut s: LobbySettings = toml::from_str(
+            r#"
+            map = "default"
+            use_standard_ruleset = true
+            llm_thinking_delay = 0.0
+            "#,
+        )
+        .expect("lobby settings parse");
+        s.max_players = max;
+        s
+    }
+
+    /// Regression (the original E2E-caught bug): an unspecified (0) cap must
+    /// normalize to a playable default rather than leave the lobby join-proof.
+    #[test]
+    fn create_lobby_normalizes_unspecified_cap() {
+        let mut mgr = LobbyManager::new();
+        let code = mgr.create_lobby(
+            "host".into(),
+            "Host".into(),
+            settings_with_max_players(0),
+            None,
+            PlayerSender::None,
+            vec![],
+        );
+        let lobby = mgr.get_lobby(&code).expect("lobby exists");
+        assert_eq!(
+            lobby.settings.max_players, 4,
+            "an unspecified (0) cap must become the default"
+        );
+    }
+
+    /// A hostile out-of-range cap (e.g. u32::MAX) is clamped to the default
+    /// instead of being stored verbatim and passing unvalidated.
+    #[test]
+    fn create_lobby_clamps_out_of_range_cap() {
+        let mut mgr = LobbyManager::new();
+        let code = mgr.create_lobby(
+            "host".into(),
+            "Host".into(),
+            settings_with_max_players(u32::MAX),
+            None,
+            PlayerSender::None,
+            vec![],
+        );
+        let lobby = mgr.get_lobby(&code).expect("lobby exists");
+        assert_eq!(
+            lobby.settings.max_players, 4,
+            "u32::MAX must clamp to the default cap, not be stored"
+        );
+    }
+
+    /// The mirror of the original bug: the normalized cap must actually bite.
+    /// A cap-4 lobby fills at four players and rejects the fifth — proving
+    /// the fix enforces a real ceiling, not just a permissive one.
+    #[test]
+    fn normalized_cap_bites_on_the_fifth_join() {
+        let mut mgr = LobbyManager::new();
+        let code = mgr.create_lobby(
+            "host".into(),
+            "Host".into(),
+            settings_with_max_players(0),
+            None,
+            PlayerSender::None,
+            vec![],
+        );
+        // Host (already in the lobby) + 3 guests = 4 players = the cap.
+        for i in 0..3 {
+            mgr.join_lobby(
+                &code,
+                format!("p{i}"),
+                format!("p{i}"),
+                None,
+                PlayerSender::None,
+            )
+            .expect("join within the cap must succeed");
+        }
+        assert_eq!(mgr.get_lobby(&code).unwrap().players.len(), 4);
+
+        // The 5th join is now full.
+        let err = mgr
+            .join_lobby(&code, "p4".into(), "p4".into(), None, PlayerSender::None)
+            .expect_err("fifth join must fail on a normalized cap-4 lobby");
+        assert_eq!(err, "Lobby full");
     }
 }

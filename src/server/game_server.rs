@@ -50,6 +50,10 @@ static FRONTEND: Dir = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 pub struct GameServer {
     pub(crate) port: u16,
+    /// Interface to bind listeners on. Defaults to 0.0.0.0 (all interfaces);
+    /// the CLI --bind flag overrides it (e.g. 127.0.0.1 for the E2E harness so
+    /// the test server is never LAN-reachable).
+    pub(crate) bind: String,
     pub(crate) config: Config,
     pub(crate) lobby_manager: Mutex<LobbyManager>,
     pub(crate) games: Mutex<HashMap<String, Arc<Mutex<GameRoom>>>>,
@@ -70,6 +74,7 @@ impl GameServer {
         map_registry::init();
         Ok(GameServer {
             port,
+            bind: "0.0.0.0".to_string(),
             config,
             lobby_manager: Mutex::new(LobbyManager::new()),
             games: Mutex::new(HashMap::new()),
@@ -81,6 +86,7 @@ impl GameServer {
 
     pub async fn run(self) -> anyhow::Result<()> {
         let port = self.port;
+        let bind = self.bind.clone();
         let state = Arc::new(Mutex::new(self));
         let state_ws = state.clone();
 
@@ -114,16 +120,18 @@ impl GameServer {
             router.layer(cors).with_state(state.clone())
         };
 
-        let listener_http = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        let listener_ws = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port + 1)).await?;
+        let listener_http = tokio::net::TcpListener::bind(format!("{}:{}", bind, port)).await?;
+        let listener_ws = tokio::net::TcpListener::bind(format!("{}:{}", bind, port + 1)).await?;
 
         tokio::spawn(async move {
             axum::serve(listener_http, app).await.ok();
         });
 
         tracing::info!(
-            "HTTP server on port {}, TCP game on port {}",
+            "HTTP server on {}:{}, TCP game on {}:{}",
+            bind,
             port,
+            bind,
             port + 1
         );
 

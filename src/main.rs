@@ -32,6 +32,11 @@ struct Cli {
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
+    /// Interface to bind listeners on (default 0.0.0.0 = all interfaces).
+    /// Use 127.0.0.1 to restrict to localhost, e.g. for the E2E harness.
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: String,
+
     /// Path to config file
     #[arg(short, long, default_value = "config.toml")]
     config: String,
@@ -183,7 +188,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = config::load(&cli.config)?;
-    let game_server = server::GameServer::new(cfg, cli.port).await?;
+    let mut game_server = server::GameServer::new(cfg, cli.port).await?;
+    game_server.bind = cli.bind;
     game_server.run().await?;
 
     Ok(())

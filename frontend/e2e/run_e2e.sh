@@ -65,6 +65,12 @@ elif [ ! -x "$BIN" ]; then
   echo "      the live layer will skip itself (no-server layer still runs)."
 fi
 
+echo "==> Type-checking + linting the E2E harness"
+# Gate on the harness's own code quality before running it: a broken or
+# untypechecked fixture is a false green, same as a stale dist/.
+(cd "$FE_DIR" && npx tsc --noEmit -p tsconfig.e2e.json \
+  && npx eslint e2e/ playwright.config.ts --max-warnings=0) || exit 1
+
 echo "==> Running Playwright (headless:false under xvfb-run, SwiftShader CPU rendering)"
 cd "$FE_DIR"
 # The exit status of the suite is this script's exit status — do NOT swallow it

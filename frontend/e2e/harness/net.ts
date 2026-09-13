@@ -44,6 +44,8 @@ export function waitForTcp(port: number, timeoutMs: number): Promise<void> {
         await new Promise((r) => setTimeout(r, 100));
       }
     }
-    throw new Error(`nothing listening on 127.0.0.1:${port} after ${timeoutMs}ms (${String(lastErr)})`);
+    throw new Error(
+      `nothing listening on 127.0.0.1:${port} after ${timeoutMs}ms (${String(lastErr)})`,
+    );
   })();
 }

@@ -49,10 +49,30 @@ type LiveServerFixture = {
  */
 function writeE2eConfig(baseConfigPath: string, tmpDir: string): string {
   const cfg = fs.readFileSync(baseConfigPath, 'utf8');
+  const dbPath = path.join(tmpDir, 'e2e.sqlite');
+  const replayPath = path.join(tmpDir, 'replays');
   const e2e = cfg
-    .replace(/^database_path\s*=.*$/m, `database_path = "${path.join(tmpDir, 'e2e.sqlite')}"`)
-    .replace(/^replay_path\s*=.*$/m, `replay_path = "${path.join(tmpDir, 'replays')}"`)
+    .replace(/^database_path\s*=.*$/m, `database_path = "${dbPath}"`)
+    .replace(/^replay_path\s*=.*$/m, `replay_path = "${replayPath}"`)
     .replace(/^advisor_provider\s*=.*$/m, '');
+  // The rewrites are regex best-effort over an unvalidated TOML: if a key is
+  // ever renamed or reformatted, a replace silently no-ops and the live server
+  // (spawned with cwd = repo root) would write its database straight into the
+  // repo, and/or keep the LLM advisor live. Fail loudly instead of running green.
+  if (
+    !e2e.includes(`database_path = "${dbPath}"`) ||
+    !e2e.includes(`replay_path = "${replayPath}"`)
+  ) {
+    throw new Error(
+      `E2E config rewrite failed to redirect storage into ${tmpDir}: database_path/replay_path no ` +
+        'longer match config.toml. Refusing to run (would clobber the dev database).',
+    );
+  }
+  if (/^\s*advisor_provider\s*=/m.test(e2e)) {
+    throw new Error(
+      'E2E config rewrite failed to remove advisor_provider: the live E2E server must never be able to fire real LLM calls.',
+    );
+  }
   const configPath = path.join(tmpDir, 'e2e-config.toml');
   fs.writeFileSync(configPath, e2e);
   return configPath;
@@ -75,13 +95,19 @@ async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
 }
 
 // liveServer is worker-scoped (one binary per worker), so it is declared in
-// the second type parameter of extend.
+// the second type parameter of extend. The empty first (test-args) param is a
+// Playwright idiom — hence the targeted disable.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export const test = base.extend<{}, { liveServer: LiveServerFixture }>({
   liveServer: [
+    // eslint-disable-next-line no-empty-pattern
     async ({}, use) => {
       const bin = process.env.WOZ_E2E_SERVER_BIN ?? DEFAULT_BIN;
       if (!fs.existsSync(bin)) {
-        test.skip(true, `live E2E skipped: server binary not found at ${bin} (run \`cargo build\`)`);
+        test.skip(
+          true,
+          `live E2E skipped: server binary not found at ${bin} (run \`cargo build\`)`,
+        );
       }
       const baseConfig = process.env.WOZ_E2E_CONFIG ?? DEFAULT_CONFIG;
 
@@ -91,7 +117,10 @@ export const test = base.extend<{}, { liveServer: LiveServerFixture }>({
 
       const proc = child.spawn(
         bin,
-        ['--port', String(port), '--config', configPath],
+        // --bind 127.0.0.1 keeps the test server loopback-only: no LAN
+        // exposure of /ws, /replays, /maps, or the debug-build /debug/*
+        // endpoints for the whole (unauthenticated) run.
+        ['--port', String(port), '--bind', '127.0.0.1', '--config', configPath],
         // cwd = repo root: the map registry scans a cwd-relative `maps/`
         // directory (the built-in "default" map does not depend on it).
         { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
@@ -114,12 +143,9 @@ export const test = base.extend<{}, { liveServer: LiveServerFixture }>({
       await use({ url, port });
 
       // Teardown: SIGTERM, brief grace, then SIGKILL; drop the temp config dir.
-      let exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+      const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
       if (proc.exitCode === null) proc.kill('SIGTERM');
-      await Promise.race([
-        exited,
-        new Promise((r) => setTimeout(r, 5_000)),
-      ]);
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 5_000))]);
       if (proc.exitCode === null) proc.kill('SIGKILL');
       fs.rmSync(tmpDir, { recursive: true, force: true });
     },

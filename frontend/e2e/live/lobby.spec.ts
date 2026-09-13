@@ -15,15 +15,16 @@ type GameStats = { error: string | null; frames: number };
 
 function gameStats(p: Page): Promise<GameStats> {
   return p.evaluate(
-    () => (window as unknown as { __gameStats?: () => GameStats }).__gameStats?.() ??
-      { error: '__gameStats hook missing — server binary predates the E2E hook', frames: 0 },
+    () =>
+      (window as unknown as { __gameStats?: () => GameStats }).__gameStats?.() ?? {
+        error: '__gameStats hook missing — server binary predates the E2E hook',
+        frames: 0,
+      },
   );
 }
 
 test.describe('live lobby: two humans, one server', () => {
-  test('create → join → start: both clients receive state and render frames', async ({
-    page,
-  }) => {
+  test('create → join → start: both clients receive state and render frames', async ({ page }) => {
     // ── 1) Host: open the page (Hello handshake happens on WS open) ────────
     await page.goto('/');
 
