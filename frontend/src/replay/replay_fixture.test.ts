@@ -112,6 +112,105 @@ describe('replay_smoke.jsonl fixture', () => {
 });
 
 // ============================================================================
+// Live-recorded replay shape — the server writes the wire messages
+// (GameStateMessage / GameDeltaMessage) as JSONL. Terrain there is the plain
+// enum-string wire shape (no { type, height } objects), and the file ends
+// with a `{ "event": "game_end" }` marker that the player must ignore
+// gracefully. This block pins that the player accepts BOTH shapes.
+// ============================================================================
+
+describe('live-recorded replay shape (server-written JSONL)', () => {
+  const text = [
+    JSON.stringify({
+      full_state: {
+        terrain: [
+          ['Forest', 'Plains'],
+          ['Water', 'Hill'],
+        ],
+        units: [],
+        cities: [],
+        player: { funds: 100, units_owned: 0 },
+      },
+    }),
+    JSON.stringify({
+      delta: {
+        units_added: [],
+        units_removed: [],
+        unit_updates: [],
+        city_updates: [],
+        player: { funds: 110, units_owned: 1 },
+      },
+    }),
+    JSON.stringify({ event: 'game_end', time: 1789000000 }),
+  ].join('\n');
+
+  // Serve the given text for whatever `replays/` URL is requested, replacing
+  // the file-scoped fixture stub.
+  function serveText(body: string): void {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (!url.startsWith('replays/')) throw new Error(`unexpected fetch: ${url}`);
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          text: async () => body,
+        } as unknown as Response;
+      }),
+    );
+  }
+
+  it('applies string-terrain full_state + wire-shape delta, ignores game_end', async () => {
+    serveText(text);
+    const canvas = document.createElement('canvas');
+    const player = new ReplayPlayer(canvas);
+    await player.loadReplay('live_recorded.jsonl');
+    player.tick(); // full_state
+    player.tick(); // delta
+    player.tick(); // game_end marker — must be a no-op, not a crash
+
+    const gs = (
+      player as unknown as { gameState: { terrain: string[][]; player: { funds: number } } }
+    ).gameState;
+    expect(gs.terrain).toEqual([
+      ['Forest', 'Plains'],
+      ['Water', 'Hill'],
+    ]);
+    expect(gs.player.funds).toBe(110);
+    // All three lines counted as applied (the marker is a valid no-op event).
+    expect(player.eventsApplied).toBe(3);
+  });
+
+  it('still parses the legacy { type, height } object terrain', async () => {
+    const legacy = [
+      JSON.stringify({
+        full_state: {
+          terrain: [
+            [
+              { type: 'Forest', height: 1 },
+              { type: 'Plains', height: 0 },
+            ],
+          ],
+          units: [],
+          cities: [],
+        },
+      }),
+    ].join('\n');
+    serveText(legacy);
+    const canvas = document.createElement('canvas');
+    const player = new ReplayPlayer(canvas);
+    await player.loadReplay('legacy_fixture.jsonl');
+    player.tick();
+
+    const gs = (
+      player as unknown as { gameState: { terrain: string[][] } }
+    ).gameState;
+    expect(gs.terrain).toEqual([['Forest', 'Plains']]);
+  });
+});
+
+// ============================================================================
 // loadReplay filename validation — `?replay=` is user-controlled (URL query
 // param), so the basename guard's REJECTION paths must be tested, not just
 // the happy path above.

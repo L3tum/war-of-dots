@@ -968,6 +968,13 @@ pub(crate) struct NetworkPhaseResult {
     /// benchmark harness, hence the allow.
     #[allow(dead_code)]
     pub unit_updates: u32,
+    /// Replay recording: when `run_network_phase` was called with a
+    /// `record_pid`, the (still-decodable) `GameDeltaMessage` built for that
+    /// player is retained here so the game loop can append it to the replay
+    /// JSONL in the frontend's `{"delta": ...}` wire shape. `None` on idle
+    /// ticks (no delta was built) and when no pid is being recorded — the
+    /// clone cost is one per tick, for exactly one player.
+    pub recorded_delta: Option<crate::server::protocol::GameDeltaMessage>,
     /// B0: sub-phase timing — shared compute (`compute_shared_deltas` +
     /// `SpliceShared::build`) plus the per-player `build_delta_inner` calls,
     /// in ms. Feature-gated so a production build pays zero timing cost (the
@@ -1009,6 +1016,7 @@ pub(crate) fn run_network_phase(
     unit_diff: UnitDiff,
     current_cities: Vec<CityState>,
     spliced: bool,
+    record_pid: Option<&str>,
 ) -> NetworkPhaseResult {
     let all_funds = game.all_player_funds();
     // N1: flat Arc grids (no 2-D allocation)
@@ -1080,6 +1088,7 @@ pub(crate) fn run_network_phase(
         shared,
         grid_width,
         unit_updates,
+        recorded_delta: None,
         // B0: sub-phase fields (feature-gated; see the struct definition).
         #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
         delta_ms,
@@ -1124,6 +1133,11 @@ pub(crate) fn run_network_phase(
                 ServerMessage::DeltaState(d) => d,
                 _ => unreachable!(),
             };
+            // Replay recording: retain this player's delta (before it is
+            // moved into the encoder) so the game loop can log it as JSON.
+            if record_pid == Some(*pid) {
+                result.recorded_delta = Some(delta_ref.clone());
+            }
             #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
             {
                 if delta_ref.vision_grid_shipped() {
@@ -1265,6 +1279,7 @@ mod tests {
     /// (any positive dims work; positions are cell coords).
     const TEST_MAP: (u32, u32) = (1000, 1000);
     use super::*;
+    use crate::game::economy::UnitType;
 
     fn unit(id: &str, owner: &str, x: f32, y: f32) -> UnitState {
         UnitState {
@@ -2684,5 +2699,161 @@ mod tests {
         let counts = store.prev_owner_counts();
         assert_eq!(counts.get("p0"), None);
         assert_eq!(counts.get("p1"), Some(&1));
+    }
+
+    // ---------------------------------------------------------------------
+    // Replay recording hook: `run_network_phase` retains the recording
+    // viewpoint's wire delta (and only when asked to).
+    // ---------------------------------------------------------------------
+
+    fn two_city_map() -> crate::map::map::Map {
+        use crate::map::map::MapConfig;
+        crate::map::map::Map::from_config(&MapConfig {
+            width: 20,
+            height: 20,
+            cities: vec![(3.0, 3.0), (16.0, 3.0)],
+            terrain_data: None,
+        })
+    }
+
+    fn two_player_game() -> (Game, UnitType) {
+        use crate::config::CityUpgradeSettings;
+        use crate::game::game::{GameSettings, InfluenceSettings};
+        use crate::game::unit::Equipment;
+
+        let unit_type = UnitType {
+            name: "infantry".to_string(),
+            symbol: "I".to_string(),
+            men: 100,
+            equipment: vec![Equipment {
+                name: "rifle".to_string(),
+                count: 100,
+                max_count: 100,
+                cost_per_item: 2.5,
+            }],
+            soft_attack: 5.0,
+            soft_defense: 5.5,
+            hard_attack: 3.0,
+            hard_defense: 2.0,
+            recruitment_cost: 200,
+            max_organisation: 100.0,
+            reinforcement_rate: 5.0,
+            speed: 1.0,
+            base_attrition: 0.5,
+            fighting_attrition: 1.0,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
+            max_supply: 200,
+        };
+        let settings = GameSettings {
+            starting_funds: 1000,
+            initial_manpower: 10_000,
+            funds_per_city: 1.0,
+            recruitment_rate: 1.0,
+            game_speed: 1.0,
+            use_standard_ruleset: true,
+            unit_types: vec![unit_type.clone()],
+            city_upgrade_settings: CityUpgradeSettings::default(),
+            water_speed: 0.5,
+            influence: InfluenceSettings::default(),
+        };
+        let mut game = Game::new(two_city_map(), settings, 2);
+        game.start();
+        // Mirror GameRoom::new: round-robin city ownership + starting funds,
+        // so both players' funds change per tick (city income) and a delta
+        // is always built.
+        let cities: Vec<String> = game.query_cities().iter().map(|c| c.id.clone()).collect();
+        for (i, city_id) in cities.iter().enumerate() {
+            let pid = if i % 2 == 0 { "player_0" } else { "player_1" };
+            game.assign_city_owner(city_id, pid);
+        }
+        (game, unit_type)
+    }
+
+    fn seeded_baselines(game: &Game) -> NetworkBaselines {
+        let mut baselines = NetworkBaselines {
+            prev_units: UnitBaselineStore::default(),
+            prev_cities: game
+                .query_cities()
+                .iter()
+                .map(|c| (c.id.clone(), c.into()))
+                .collect(),
+            prev_funds: game.all_player_funds(),
+            prev_vision: HashMap::new(),
+            prev_border: game.territory_grid_flat(),
+        };
+        game.init_unit_baselines(&mut baselines.prev_units);
+        baselines
+    }
+
+    #[test]
+    fn run_network_phase_records_delta_for_record_pid_only() {
+        let (mut game, unit_type) = two_player_game();
+        let mut baselines = seeded_baselines(&game);
+        let pids = ["player_0", "player_1"];
+
+        // Recruit a unit for the viewpoint AFTER seeding the baselines, so
+        // the first tick produces a guaranteed non-idle delta (units_added).
+        game.recruit_unit("city_0", &unit_type, "player_0");
+
+        // Tick 1, recording player_0: the viewpoint's wire delta is retained
+        // and its payload carries the player's live funds.
+        game.tick_game();
+        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
+        let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
+        let phase = run_network_phase(
+            &game,
+            &mut baselines,
+            &pids,
+            unit_diff,
+            current_cities,
+            false,
+            Some("player_0"),
+        );
+        let recorded = phase
+            .recorded_delta
+            .expect("record_pid's delta must be retained");
+        assert_eq!(
+            recorded.player.funds,
+            game.player_funds("player_0"),
+            "viewpoint delta must carry the player's live funds (1000 - 200 recruit)"
+        );
+
+        // Tick 2, recording disabled: nothing retained.
+        game.tick_game();
+        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
+        let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
+        let phase = run_network_phase(
+            &game,
+            &mut baselines,
+            &pids,
+            unit_diff,
+            current_cities,
+            false,
+            None,
+        );
+        assert!(phase.recorded_delta.is_none());
+
+        // Tick 3, recording player_1: the other viewpoint's delta.
+        game.tick_game();
+        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
+        let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
+        let phase = run_network_phase(
+            &game,
+            &mut baselines,
+            &pids,
+            unit_diff,
+            current_cities,
+            false,
+            Some("player_1"),
+        );
+        let recorded = phase
+            .recorded_delta
+            .expect("record_pid's delta must be retained");
+        assert_eq!(
+            recorded.player.funds,
+            game.player_funds("player_1"),
+            "viewpoint delta must carry the player's live funds"
+        );
     }
 }

@@ -714,6 +714,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 unit_diff,
                 current_cities,
                 config.bench_splice,
+                None, // no replay recording in the benchmark
             );
             if config.bench_spectator {
                 bench_spectator_delta(
@@ -793,6 +794,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                             unit_diff,
                             current_cities,
                             config.bench_splice,
+                            None, // no replay recording in the benchmark
                         ),
                         snapshot_ms,
                     )

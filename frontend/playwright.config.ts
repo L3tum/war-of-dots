@@ -18,7 +18,12 @@ import * as path from 'node:path';
  *   - `no-server` (webgpu.spec.ts): static file server over dist/ — the fast
  *     render-pipeline smoke layer (replay mode, no Rust, no WebSocket).
  *   - `live` (live/*.spec.ts): the real war-of-dots binary — full E2E with
- *     the baked-in frontend, real /ws traffic, and the WP3 handshake.
+ *     the baked-in frontend, real /ws traffic, and the WP3 handshake:
+ *     lobby.spec.ts (create/join/start, roster convergence, render on two
+ *     clients) and replay-loop.spec.ts (played game → server-recorded
+ *     JSONL → /replays lists it, /replays/{id}.jsonl serves it → replayed
+ *     in a fresh page).
+ *     Skipped, not failed, when the binary is absent.
  */
 
 /**

@@ -11,6 +11,11 @@ pub use crate::game::game::PlayerGameStats;
 pub struct Storage {
     pub db: Arc<Mutex<sqlite::Connection>>,
     pub path: String,
+    /// Directory where replay JSONL files are written (mirrors
+    /// `config.storage.replay_path`). Kept here so `record_game_end` stores
+    /// the real on-disk location in `game_metadata.replay_path` instead of a
+    /// cwd-relative guess.
+    pub replay_path: String,
 }
 
 impl Clone for Storage {
@@ -18,12 +23,13 @@ impl Clone for Storage {
         Storage {
             db: Arc::clone(&self.db),
             path: self.path.clone(),
+            replay_path: self.replay_path.clone(),
         }
     }
 }
 
 impl Storage {
-    pub fn new(path: &str) -> Result<Self, crate::errors::StorageError> {
+    pub fn new(path: &str, replay_path: &str) -> Result<Self, crate::errors::StorageError> {
         fs::create_dir_all(
             std::path::Path::new(path)
                 .parent()
@@ -54,6 +60,7 @@ impl Storage {
         Ok(Storage {
             db: Arc::new(Mutex::new(db)),
             path: path.to_string(),
+            replay_path: replay_path.to_string(),
         })
     }
 
@@ -66,7 +73,7 @@ impl Storage {
         player_stats: &HashMap<String, PlayerGameStats>,
         is_standard_ruleset: bool,
     ) {
-        let replay_path = format!("replays/{}.jsonl", game_id);
+        let replay_path = format!("{}/{}.jsonl", self.replay_path, game_id);
         let players_json = serde_json::to_string(players).unwrap();
         let winner = serde_json::to_string(winners.first().unwrap_or(&"")).unwrap();
 

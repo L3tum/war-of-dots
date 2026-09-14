@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use sqlite::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
@@ -70,7 +71,10 @@ pub struct GameServer {
 #[allow(dead_code)]
 impl GameServer {
     pub async fn new(config: Config, port: u16) -> anyhow::Result<Self> {
-        let storage = crate::storage::Storage::new(&config.storage.database_path)?;
+        let storage = crate::storage::Storage::new(
+            &config.storage.database_path,
+            &config.storage.replay_path,
+        )?;
         map_registry::init();
         Ok(GameServer {
             port,
@@ -98,6 +102,7 @@ impl GameServer {
                 .route("/ws/replay", get(replay_ws_handler))
                 .route("/ws/spectator", get(spectator_ws_handler))
                 .route("/replays", get(list_replays))
+                .route("/replays/:name", get(serve_replay))
                 .route("/maps", get(list_maps_handler))
                 .fallback(serve_static);
 
@@ -253,9 +258,48 @@ impl GameRoom {
         let game_speed = game.settings().game_speed;
         let interval_ms = (1000.0 / game_speed).ceil() as u64;
 
+        // --- Replay recording (best-effort) ---
+        // Every game is written to `{replay_path}/{room_id}.jsonl` in exactly
+        // the shape the frontend's ReplayPlayer consumes: one
+        // `{"full_state": ...}` line, then one `{"delta": ...}` line per tick
+        // that produces a delta for the recording viewpoint, and a final
+        // `{"event":"game_end"}` marker (written when the loop exits). The
+        // viewpoint is the first game player: per-pid deltas are
+        // vision-scoped, so the replay shows that player's view of the game —
+        // the same stream their client received over the wire. Recording is
+        // deliberately non-fatal: a disk failure degrades to "no replay",
+        // never a broken game.
+        // Viewpoint = the first human connection: `run_network_phase` only
+        // builds deltas for human pids (`regular_pids`), so a pure-LLM
+        // viewpoint would yield an empty file. Pure-LLM games (no human
+        // connections) simply aren't recorded.
+        let record_pid: Option<String> = players.iter().find_map(|p| p.id().cloned());
+        let mut replay_recorder: Option<std::io::BufWriter<std::fs::File>> = None;
+        if record_pid.is_some() {
+            let dir = config.storage.replay_path.clone();
+            let _ = std::fs::create_dir_all(&dir);
+            match std::fs::File::create(
+                std::path::Path::new(&dir).join(format!("{}.jsonl", room_id)),
+            ) {
+                Ok(f) => replay_recorder = Some(std::io::BufWriter::new(f)),
+                Err(e) => tracing::warn!("replay: cannot create file for game {}: {}", room_id, e),
+            }
+        }
+
         for player in &players {
             let player_id = player.id().cloned().unwrap_or_default();
             let initial_state = game.full_state_with_player_id(&player_id);
+            // Replay: log the viewpoint's initial full state (the same
+            // payload about to be sent on the wire), flushed immediately so
+            // the file is playable even if the process dies mid-game.
+            if record_pid.as_deref() == Some(player_id.as_str()) {
+                if let Some(rec) = replay_recorder.as_mut() {
+                    if let Ok(v) = serde_json::to_value(&initial_state) {
+                        let _ = writeln!(rec, "{{\"full_state\":{}}}", v);
+                        let _ = rec.flush();
+                    }
+                }
+            }
             let initial_msg = ServerMessage::FullState(initial_state);
             let encoded = encode_message(&initial_msg);
             let _ = player.tx().blocking_send_reliable(encoded.into());
@@ -723,14 +767,28 @@ impl GameRoom {
                             })
                             .collect();
 
-                        let phase: NetworkPhaseResult = run_network_phase(
+                        let mut phase: NetworkPhaseResult = run_network_phase(
                             &game,
                             &mut baselines,
                             &regular_pids,
                             unit_diff,
                             current_cities,
                             true, // W9 splice path: on — A/B confirmed ~1.5% off the network phase (byte-for-byte verified encoder)
+                            record_pid.as_deref(),
                         );
+
+                        // Replay: log the recording viewpoint's delta for this
+                        // tick (idle ticks build no delta — nothing was sent
+                        // on the wire either, so nothing is logged).
+                        let recorded_delta = phase.recorded_delta.take();
+                        if let Some(rec) = replay_recorder.as_mut() {
+                            if let Some(d) = &recorded_delta {
+                                if let Ok(v) = serde_json::to_value(d) {
+                                    let _ = writeln!(rec, "{{\"delta\":{}}}", v);
+                                    let _ = rec.flush();
+                                }
+                            }
+                        }
 
                         // W4: outbox by move — the send loop takes ownership of each
                         // payload, so a tick doesn't memcpy the (up to 200 KB) encoded
@@ -933,6 +991,17 @@ impl GameRoom {
                         }
                     }
                 }
+            }
+
+            // Replay: terminal marker (best-effort — the game is over either
+            // way; the loop has already aborted all spawned tasks).
+            if let Some(rec) = replay_recorder.as_mut() {
+                let end_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = writeln!(rec, "{{\"event\":\"game_end\",\"time\":{}}}", end_time);
+                let _ = rec.flush();
             }
         });
 
@@ -1154,6 +1223,44 @@ pub(crate) async fn list_replays(
         });
     }
     axum::Json(replays)
+}
+
+/// Serve a recorded replay JSONL from the runtime replay directory.
+///
+/// The embedded `FRONTEND` static fallback (include_dir) only knows about
+/// files that existed at compile time, so runtime-recorded games need this
+/// dedicated route. The frontend's `ReplayPlayer` fetches `replays/{file}`
+/// and this is what resolves it for live-recorded games.
+///
+/// NOTE: this axum/matchit version (0.7.9 / 0.7.3) uses the `:param` path
+/// syntax — the `{param}` form does not match. See
+/// `path_param_routes_use_colon_syntax` for the regression guard.
+///
+/// Security: the same basename-only rule as the frontend's `?replay=` guard —
+/// no path separators, alphanumeric/dot/dash/underscore, `.jsonl` suffix —
+/// otherwise the route could read arbitrary files
+/// (`/replays/../../config.toml`).
+pub(crate) async fn serve_replay(
+    State(state): State<Arc<Mutex<GameServer>>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    if name.len() > 128
+        || name.contains('/')
+        || name.contains('\\')
+        || !name.ends_with(".jsonl")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+    let dir = state.lock().await.config.storage.replay_path.clone();
+    let content = std::fs::read(std::path::Path::new(&dir).join(&name))
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(axum::body::Body::from(content))
+        .unwrap())
 }
 
 #[derive(serde::Serialize)]
@@ -4089,5 +4196,59 @@ replay_path = "{replay}"
             1
         );
         drop(client);
+    }
+
+    /// Guards path-param routing in this dependency set (axum 0.7.9 +
+    /// matchit 0.7.3). This matchit version only matches the `:param`
+    /// syntax — `{param}` (the axum 0.8 / matchit 0.8 form) does not match
+    /// and silently 404s. The live replay loop hit exactly that: the
+    /// `/replays/{name}` route never matched, so `serve_replay` was never
+    /// called. If a lockfile change alters matchit's path semantics, fail
+    /// here in CI rather than silently breaking routes in production.
+    #[tokio::test]
+    async fn path_param_routes_use_colon_syntax() {
+        use axum::extract::Path;
+        use axum::routing::get;
+
+        let app = axum::Router::new()
+            .route("/static", get(|| async { "static-ok" }))
+            .route(
+                "/tp2/:name",
+                get(|Path(n): Path<String>| async move { format!("hi {n}") }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        // Give the accept loop a head start.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        let static_body = client
+            .get(format!("http://127.0.0.1:{port}/static"))
+            .send()
+            .await
+            .expect("request static")
+            .text()
+            .await
+            .expect("body static");
+        assert_eq!(static_body, "static-ok", "static control route must match");
+
+        let b = client
+            .get(format!("http://127.0.0.1:{port}/tp2/nodot"))
+            .send()
+            .await
+            .expect("request B")
+            .text()
+            .await
+            .expect("body B");
+        assert_eq!(
+            b, "hi nodot",
+            "`:name` route must match — this matchit version does NOT support `{{name}}`"
+        );
     }
 }

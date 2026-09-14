@@ -45,6 +45,8 @@ export class ReplayPlayer {
       throw new Error(`Invalid replay file name: ${file}`);
     }
     try {
+      // Served by the server's `/replays/:name` route (live-recorded games)
+      // or statically by the no-server E2E harness (committed fixtures).
       const response = await fetch(`replays/${file}`);
       if (!response.ok) {
         throw new Error(`Failed to load replay: ${response.status} ${response.statusText}`);
@@ -130,9 +132,11 @@ export class ReplayPlayer {
     if (isFullStateEvent(event)) {
       const fs = event.full_state;
       if (fs.terrain) {
-        // Legacy JSONL replays store { type, height } per cell; keep only the enum string.
-        this.gameState.terrain = fs.terrain.map((row: { type: string; height: number }[]) =>
-          row.map((t) => t.type as TerrainType),
+        // Legacy JSONL replays store { type, height } per cell; live-recorded
+        // replays (written by the server) carry the wire shape — plain enum-
+        // name strings. Only `type` is used either way.
+        this.gameState.terrain = (fs.terrain as (string | { type: string })[][]).map((row) =>
+          row.map((t) => (typeof t === 'string' ? (t as TerrainType) : (t.type as TerrainType))),
         );
       }
       if (fs.vision_grid) {
@@ -262,7 +266,9 @@ export class ReplayPlayer {
 
 interface FullStateEvent {
   full_state: {
-    terrain?: { type: string; height: number }[][];
+    // Live-recorded files carry plain enum strings (wire shape); legacy
+    // fixtures carry { type, height } objects — both accepted (see applyEvent).
+    terrain?: (string | { type: string; height?: number })[][];
     vision_grid?: boolean[][];
     border_grid?: number[][];
     units?: unknown[];
