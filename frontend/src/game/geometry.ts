@@ -47,3 +47,60 @@ export function detectBorderEdges(displayGrid: number[][]): BorderEdge[] {
 
   return edges;
 }
+
+/**
+ * Reusable edge storage for `detectBorderEdgesFlat`. All five arrays must
+ * share the same length ≥ 2*rows*cols (a cell contributes at most two edges:
+ * to the right neighbour and to the lower neighbour).
+ */
+export interface EdgeBuffers {
+  x: Int32Array;
+  y: Int32Array;
+  /** 0 = 'h' (edge to the LOWER neighbour), 1 = 'v' (edge to the RIGHT neighbour) */
+  dir: Uint8Array;
+  ownerA: Uint8Array;
+  ownerB: Uint8Array;
+}
+
+/**
+ * Allocation-free variant of `detectBorderEdges` for the renderer hot path
+ * (Perf #3): scans a flat row-major display grid (the output of
+ * `TerritoryFiller`) and writes edges into caller-provided buffers, in the
+ * same order as the 2-D variant (row-major; per cell the 'v' edge is written
+ * before the 'h' edge). Returns the edge count.
+ */
+export function detectBorderEdgesFlat(
+  grid: Uint8Array,
+  rows: number,
+  cols: number,
+  buf: EdgeBuffers,
+): number {
+  let n = 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      const p1 = grid[i];
+      const p2 = x + 1 < cols ? grid[i + 1] : TERRITORY_NONE;
+      const p3 = y + 1 < rows ? grid[i + cols] : TERRITORY_NONE;
+      // Draw borders between two different players.
+      // 'v' = right neighbour (vertical line), 'h' = lower neighbour (horizontal line)
+      if (p1 !== p2 && p1 !== TERRITORY_NONE && p2 !== TERRITORY_NONE) {
+        buf.x[n] = x;
+        buf.y[n] = y;
+        buf.dir[n] = 1;
+        buf.ownerA[n] = p1;
+        buf.ownerB[n] = p2;
+        n++;
+      }
+      if (p1 !== p3 && p1 !== TERRITORY_NONE && p3 !== TERRITORY_NONE) {
+        buf.x[n] = x;
+        buf.y[n] = y;
+        buf.dir[n] = 0;
+        buf.ownerA[n] = p1;
+        buf.ownerB[n] = p3;
+        n++;
+      }
+    }
+  }
+  return n;
+}

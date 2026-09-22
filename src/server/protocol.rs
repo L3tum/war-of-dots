@@ -501,26 +501,95 @@ pub struct LobbyPlayer {
     pub llm_provider: Option<String>,
 }
 
+/// M3/W7: the CBOR serializer's error when writing into a `&mut Vec<u8>`.
+/// Under the `std` feature the writer's error type is `std::io::Error`, so
+/// the encode errors surface as `ciborium::ser::Error<std::io::Error>` (an
+/// `Io` variant for write failures, a `Value` variant for unserializable
+/// data — the latter is what a real mid-stream encode fault looks like).
+pub type CborEncodeError = ciborium::ser::Error<std::io::Error>;
+
+/// M3/W7: fallible core of the encoder. A failed CBOR encode leaves a
+/// TRUNCATED/partial buffer behind — returning it (the old release behavior)
+/// or the 0-byte `unwrap_or_default()` (the original bug) would send a
+/// half-frame and desync the peer. Callers must handle `Err` explicitly:
+/// log + close the connection where they own the socket, or drop the frame
+/// where close is impractical at that layer (tick-task broadcasts). The
+/// success path is allocation-identical to the old code: one
+/// `Vec::with_capacity(hint.max(64))` + in-place ciborium write, so the hot
+/// path is unchanged.
+#[allow(dead_code)]
+pub fn encode_message_result(msg: &ServerMessage) -> Result<Vec<u8>, CborEncodeError> {
+    let mut buf = Vec::with_capacity(64);
+    ciborium::into_writer(msg, &mut buf)?;
+    #[cfg(test)]
+    if test_encode_fault_active() && matches!(msg, ServerMessage::HelloAck { .. }) {
+        // Simulated mid-stream encode failure: the successfully-written
+        // partial buffer is DISCARDED — the caller sees Err and never
+        // receives partial bytes (M3 contract).
+        return Err(CborEncodeError::Io(std::io::Error::other(
+            "injected test encode failure",
+        )));
+    }
+    Ok(buf)
+}
+
+/// M3 test hook: while this mutex is locked — only from the encode-failure
+/// unit tests (protocol) and the WS close test (game_server) — encoding a
+/// `HelloAck` fails, simulating a mid-stream CBOR failure on the live
+/// handshake path. The arm window is a handful of microseconds, and only
+/// `HelloAck` encodes are affected, so concurrent tests are unaffected in
+/// practice. Production code never references it.
+#[cfg(test)]
+pub(crate) static TEST_ENCODE_FAULT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// M3 test hook serialization: the fault switch above is PROCESS-GLOBAL, and
+/// the tests that arm it run in parallel. The protocol-level tests hold it
+/// for microseconds, but the WS close test (game_server) holds it across a
+/// network round-trip (milliseconds) — long enough to overlap a parallel
+/// test's "disarmed" encode and flake it. Every test that touches
+/// `TEST_ENCODE_FAULT` must hold THIS lock for its whole body.
+#[cfg(test)]
+pub(crate) static TEST_FAULT_EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) fn test_encode_fault_active() -> bool {
+    TEST_ENCODE_FAULT.try_lock().is_err()
+}
+
+/// Encode a server message (no capacity hint).
+///
+/// W7/M3 contract: a failed encode NEVER returns a partial/truncated buffer.
+/// The fallible core is [`encode_message_result`]; this legacy wrapper is
+/// for callers with no explicit close to issue (replay stream, tick-task
+/// broadcasts, tests). On failure it logs and panics: inside a per-connection
+/// task the abort closes that connection without a half-frame, and a CBOR
+/// failure means the wire contract is broken beyond a single frame anyway.
 #[allow(dead_code)]
 pub fn encode_message(msg: &ServerMessage) -> Vec<u8> {
-    encode_message_with_hint(msg, 0)
+    match encode_message_result(msg) {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::error!("CBOR encode failed for ServerMessage: {e}");
+            panic!("CBOR encode failed for ServerMessage: {e}");
+        }
+    }
 }
 
 /// Encode with a capacity hint to avoid geometric buffer growth (N5).
 /// Pass a rough byte estimate so `Vec::with_capacity` allocates once.
+///
+/// M3/W7: fallible — see [`encode_message_result`]. The old code panicked in
+/// debug and, in release, logged and RETURNED THE TRUNCATED buffer; both
+/// failure modes are gone (this path is only reached by the
+/// benchmark/bench-alloc feature builds that keep the hint-optimized call
+/// shape).
 #[allow(dead_code)]
-pub fn encode_message_with_hint(msg: &ServerMessage, capacity_hint: usize) -> Vec<u8> {
+pub fn encode_message_with_hint(
+    msg: &ServerMessage,
+    capacity_hint: usize,
+) -> Result<Vec<u8>, CborEncodeError> {
     let mut buf = Vec::with_capacity(capacity_hint.max(64));
-    if let Err(e) = ciborium::into_writer(msg, &mut buf) {
-        // W7: a failed encode leaves `buf` holding a TRUNCATED/partial CBOR
-        // message — sending that frame would desync the client. The old code
-        // did `unwrap_or_default()`, silently emitting this partial (or, if
-        // nothing was written yet, 0-byte) frame.
-        log::error!("CBOR encode failed for ServerMessage: {e}");
-        #[cfg(debug_assertions)]
-        panic!("CBOR encode failed for ServerMessage: {e}");
-    }
-    buf
+    ciborium::into_writer(msg, &mut buf)?;
+    Ok(buf)
 }
 
 /// Estimate the encoded CBOR size of a delta message for buffer pre-sizing.
@@ -804,6 +873,106 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::into_writer(msg, &mut buf).unwrap();
         buf
+    }
+
+    // ---------------------------------------------------------------------------
+    // M3/W7: the encode-failure contract (no partial bytes, ever)
+    // ---------------------------------------------------------------------------
+
+    fn hello_ack() -> ServerMessage {
+        ServerMessage::HelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        }
+    }
+
+    /// With the test fault armed, the fallible core returns `Err` — the
+    /// successfully-written partial buffer is discarded, so no caller can
+    /// ever receive partial bytes from the encoder.
+    #[tokio::test]
+    async fn failing_encode_returns_err_not_partial_bytes() {
+        // Serialize with the other fault-hook users (process-global switch).
+        let _exclusive = TEST_FAULT_EXCLUSIVE.lock().await;
+        let fault = TEST_ENCODE_FAULT.lock().await;
+        let err =
+            encode_message_result(&hello_ack()).expect_err("armed fault must fail the encode");
+        assert!(
+            matches!(err, CborEncodeError::Io(_)),
+            "the injected failure surfaces as a cbor error, got {err:?}"
+        );
+        drop(fault);
+        // Disarmed, the same message encodes cleanly (hot path intact).
+        let bytes = encode_message_result(&hello_ack()).expect("disarmed encode must succeed");
+        let decoded: ServerMessage = ciborium::from_reader(&bytes[..]).unwrap();
+        assert!(matches!(decoded, ServerMessage::HelloAck { .. }));
+    }
+
+    /// The legacy non-fallible wrapper (replay stream, tick-task broadcasts,
+    /// tests) must never return a partial buffer either: on a failing encode
+    /// it logs and panics — a per-connection task abort closes the
+    /// connection without sending a half-frame.
+    #[test]
+    fn encode_message_panics_instead_of_returning_partial_bytes() {
+        // `catch_unwind` needs a Send future-safe scope; arm the fault via
+        // blocking_lock on a dedicated runtime-free path (the mutex is only
+        // held for the duration of the encode call).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Serialize with the other fault-hook users (process-global switch).
+        let _exclusive = runtime.block_on(TEST_FAULT_EXCLUSIVE.lock());
+        let fault = runtime.block_on(TEST_ENCODE_FAULT.lock());
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || encode_message(&hello_ack()),
+            ));
+        assert!(
+            result.is_err(),
+            "legacy wrapper must panic on encode failure"
+        );
+        drop(fault);
+    }
+
+    /// Success path byte-for-byte: the fallible core and the legacy wrapper
+    /// must produce identical bytes for the same message (hot path unchanged
+    /// on success — same capacity heuristic, same in-place write).
+    #[test]
+    fn fallible_encode_matches_legacy_wrapper_bytes() {
+        // Encodes a HelloAck: serialize with the encode-fault tests.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _exclusive = runtime.block_on(TEST_FAULT_EXCLUSIVE.lock());
+        let messages: Vec<ServerMessage> = vec![
+            hello_ack(),
+            ServerMessage::Error {
+                message: "boom".to_string(),
+            },
+            ServerMessage::LobbyCreated {
+                lobby_code: "abc123".to_string(),
+            },
+            ServerMessage::FullState(GameStateMessage {
+                vision_grid: Some(vec![vec![true; 2]; 2]),
+                border_grid: Some(vec![vec![1u32; 2]; 2]),
+                terrain: vec![vec!["Plains".to_string(); 2]; 2],
+                units: vec![],
+                cities: vec![],
+                player: PlayerState {
+                    funds: 1000,
+                    units_owned: 0,
+                    player_id: "p".to_string(),
+                },
+            }),
+        ];
+        for msg in &messages {
+            assert_eq!(
+                encode_message_result(msg).unwrap(),
+                encode_message(msg),
+                "fallible core and legacy wrapper must be byte-identical"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -2377,6 +2546,13 @@ mod tests {
 
     #[test]
     fn helloack_encodes_with_negotiated_features() {
+        // Encodes a HelloAck: serialize with the encode-fault tests (their
+        // global fault switch would otherwise flake this encode).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _exclusive = runtime.block_on(TEST_FAULT_EXCLUSIVE.lock());
         let msg = ServerMessage::HelloAck {
             protocol_version: PROTOCOL_VERSION,
             features: negotiate_features(F_COMPACT_ENTITIES | F_AOI | 0xF0),
@@ -2404,5 +2580,110 @@ mod tests {
             negotiate_features(F_GRID_RLE | F_COMPACT_ENTITIES | F_AOI),
             0
         );
+    }
+
+    /// Schema-drift guard for the TRACKED schema file:
+    /// `frontend/schema/protocol.schema.json` (checked in so the schema can
+    /// be inspected without building) must match the schema generated from
+    /// the CURRENT wire types. The CI `schema` job additionally regenerates
+    /// the file and the TS types; this test gives the same guarantee to a
+    /// plain `cargo test` run (and to any CI step that compiles the lib).
+    #[test]
+    fn tracked_schema_file_matches_current_wire_types() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("frontend/schema/protocol.schema.json");
+        let file = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("tracked schema file missing at {:?}: {e}", path));
+        let tracked: serde_json::Value =
+            serde_json::from_str(&file).expect("tracked schema file must be valid JSON");
+        let current = serde_json::to_value(schemars::schema_for!(ServerMessage))
+            .expect("serialize current schema");
+        if tracked != current {
+            // Point at the exact divergence so the fix is "run
+            // `cargo run --bin generate_schema` and commit the file".
+            let tracked_s = serde_json::to_string_pretty(&tracked).unwrap();
+            let current_s = serde_json::to_string_pretty(&current).unwrap();
+            let first_diff = tracked_s
+                .chars()
+                .zip(current_s.chars())
+                .position(|(a, b)| a != b)
+                .map(|i| format!("(first divergence at char {i})"))
+                .unwrap_or_else(|| "(files differ only in length)".to_string());
+            panic!(
+                "frontend/schema/protocol.schema.json is stale relative to the \
+                 ServerMessage wire types {first_diff}.\n\
+                 Regenerate with: cargo run --bin generate_schema\n\n\
+                 --- tracked (first 2 KB) ---\n{}\n--- current (first 2 KB) ---\n{}",
+                &tracked_s[..tracked_s.len().min(2048)],
+                &current_s[..current_s.len().min(2048)]
+            );
+        }
+    }
+
+    /// Schema-coverage guard: every ClientMessage / ServerMessage variant
+    /// must appear in the generated JSON schema (the source of
+    /// `frontend/src/generated/protocol.ts`). Two failure modes are caught:
+    ///  1. A new variant whose payload type lacks a `JsonSchema` derive —
+    ///     `schema_for!` below then fails to COMPILE (build-breaking, by
+    ///     design: the generated types must never silently drift).
+    ///  2. A variant dropped/renamed/`schemars(skip)`'d — its wire name
+    ///     disappears from the schema JSON and the assertion fails.
+    ///
+    /// When you add a variant to either enum, add its wire name to the list
+    /// below in the same commit.
+    #[test]
+    fn all_message_variants_present_in_json_schema() {
+        let client_schema = serde_json::to_string(&schemars::schema_for!(ClientMessage)).unwrap();
+        let server_schema = serde_json::to_string(&schemars::schema_for!(ServerMessage)).unwrap();
+
+        const CLIENT_VARIANTS: &[&str] = &[
+            "Hello",
+            "MoveTroop",
+            "MoveUnit",
+            "RecruitUnit",
+            "ToggleHealing",
+            "ToggleResupply",
+            "UpgradeCity",
+            "ToggleAdvisor",
+            "EmbarkUnit",
+            "DisembarkUnit",
+            "GetLeaderboard",
+            "LobbyMessage",
+        ];
+        const SERVER_VARIANTS: &[&str] = &[
+            "HelloAck",
+            "FullState",
+            "DeltaState",
+            "LobbyCreated",
+            "LobbyJoined",
+            "LobbyUpdate",
+            "Error",
+            "LlmReasonLog",
+            "Advice",
+            "ClearSpectator",
+            "Leaderboard",
+            "GameOver",
+        ];
+
+        for v in CLIENT_VARIANTS {
+            assert!(
+                client_schema.contains(v),
+                "ClientMessage variant `{v}` missing from the JSON schema — add a \
+                 JsonSchema derive to its payload type or update this test"
+            );
+        }
+        for v in SERVER_VARIANTS {
+            assert!(
+                server_schema.contains(v),
+                "ServerMessage variant `{v}` missing from the JSON schema — add a \
+                 JsonSchema derive to its payload type or update this test"
+            );
+        }
+
+        // Sanity: the schemas are real enum schemas, not a bare fallback
+        // (guards against a silent derive regression on the enum). Schemars
+        // 0.8 emits externally-tagged enums as `oneOf`.
+        assert!(client_schema.contains("oneOf"));
+        assert!(server_schema.contains("oneOf"));
     }
 }

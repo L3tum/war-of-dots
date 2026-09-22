@@ -1,23 +1,8 @@
 //! Lobby UI — lobby creation, joining, and leaderboard display.
 
 import { Connection } from '../net/connection';
-import { LeaderboardEntry } from '../generated/protocol';
+import { CustomUnitType, LeaderboardEntry, LobbySettings } from '../generated/protocol';
 import { escapeHtml } from './html';
-
-interface UnitTypeConfig {
-  name: string;
-  symbol: string;
-  men: number;
-  equipment: [string, number][];
-  soft_attack: number;
-  soft_defense: number;
-  hard_attack: number;
-  hard_defense: number;
-  speed: number;
-  max_organisation: number;
-  reinforcement_rate: number;
-  recruitment_cost: number;
-}
 
 type LobbyTab = 'create' | 'join' | 'leaderboard' | 'info';
 
@@ -156,8 +141,7 @@ export class LobbyUI {
     const useStandard = (document.getElementById('use-standard-ruleset') as HTMLInputElement)
       .checked;
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const settings: any = {
+    const settings: LobbySettings = {
       map: (document.getElementById('map-select') as HTMLSelectElement).value,
       use_standard_ruleset: useStandard,
       llm_thinking_delay: 3.0,
@@ -315,7 +299,7 @@ export class LobbyUI {
     editor.appendChild(div);
   }
 
-  private collectUnitTypes(): UnitTypeConfig[] {
+  private collectUnitTypes(): CustomUnitType[] {
     const rows = document.querySelectorAll('.unit-type-row');
     return Array.from(rows).map((row) => ({
       name: (row.querySelector('.ut-name') as HTMLInputElement).value,
@@ -401,7 +385,7 @@ export class LobbyUI {
           .map(
             (p, i) => `
         <div class="slot-row">
-          <span>${p.name}</span>
+          <span>${escapeHtml(p.name)}</span>
           <select class="slot-type-select" data-slot="${i}">
             ${providerOptions
               .map(

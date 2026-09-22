@@ -3,27 +3,19 @@
 //! A LAN multiplayer RTS where 2-6 players control troops to capture cities,
 //! build armies, and expand territory. Serves a WebGPU-powered HTML frontend
 //! and supports LLM agents.
-
-use war_of_dots::benchmark;
-// Re-export the counting allocator into this binary's crate root so the
-// `tick_system!` macro (compiled into the bin via `mod game`) can resolve
-// `crate::bench_alloc`. A `use` re-export does NOT duplicate the
-// `#[global_allocator]` static — the allocator still lives in the lib.
-#[cfg(feature = "bench-alloc")]
-pub use war_of_dots::bench_alloc;
-mod config;
-mod debug;
-mod errors;
-mod frontend;
-mod game;
-mod llm;
-mod map;
-mod replay;
-mod server;
-mod storage;
+//!
+//! Thin binary over the `war_of_dots` library: this file owns ONLY the CLI
+//! surface and the server bootstrap. It declares no modules of its own —
+//! every module (config/debug/errors/game/llm/map/server/storage) compiles
+//! exactly once, into the library (`src/lib.rs`), so the binary can never
+//! drift from the library's module tree.
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "microbenchmarks")]
+use war_of_dots::benchmark;
+use war_of_dots::config;
+use war_of_dots::server::GameServer;
 
 #[derive(Parser, Debug)]
 #[command(name = "war-of-dots", about = "A LAN RTS war game with LLM agents")]
@@ -42,43 +34,53 @@ struct Cli {
     config: String,
 
     /// Run benchmark instead of starting server
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long)]
     benchmark: bool,
 
     /// Number of units per player for benchmark (default: 20)
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value = "20")]
     bench_units: u32,
 
     /// Number of players for benchmark (default: 4)
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value = "4")]
     bench_players: u32,
 
     /// Number of ticks for benchmark (default: 500)
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value = "500")]
     bench_ticks: u64,
 
     /// Output benchmark results to HTML file (path, default: benchmark.html)
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long)]
     bench_html: Option<String>,
 
     /// Random seed for benchmark reproducibility (0 = random)
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value = "0")]
     bench_seed: u64,
 
     /// Enable detailed sub-part timing for specific systems (comma-separated, e.g. "encirclement,combat,vision,border")
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value = "")]
     bench_detailed: String,
 
     /// Previous HTML report file for comparison (adds green/red deltas to current report)
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long)]
     bench_prev: Option<String>,
 
     /// Total initial units to recruit (stress test). Overrides --bench-units and scales
     /// the starting budget so N units actually spawn.
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long)]
     bench_initial_units: Option<u32>,
 
     /// Map size (width × height in tiles). City positions scale to fill it.
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value_t = 200)]
     bench_map_size: u32,
 
@@ -87,6 +89,7 @@ struct Cli {
     /// per-player city income can keep up with the army's supply drain (the
     /// default 12:10000 city:unit ratio leaves funds pools chronically exhausted,
     /// which is not representative of a real game).
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value_t = 12)]
     bench_cities: u32,
 
@@ -95,11 +98,13 @@ struct Cli {
     /// spread evenly across cities. Default 2000 — raise for heavier
     /// recruitment pressure (ECS spawn/churn load), lower to keep the
     /// population roughly stable.
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long, default_value_t = 2000)]
     bench_recruiting: u32,
 
     /// Run the network phase with a synthetic spectator each tick (mirrors the
     /// game_server `spectator_vision` path) to measure the spectator delta cost.
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long)]
     bench_spectator: bool,
 
@@ -107,6 +112,7 @@ struct Cli {
     /// (shared segments encoded once, spliced per player). Pass this for
     /// production parity — `game_server` always runs the splice path, and
     /// `run-stresstest.sh` passes it by default.
+    #[cfg(feature = "microbenchmarks")]
     #[arg(long)]
     bench_splice: bool,
 }
@@ -121,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Detect bench args provided without --benchmark to prevent silent hangs.
+    #[cfg(feature = "microbenchmarks")]
     if !cli.benchmark {
         let has_bench_args = cli.bench_units != 20
             || cli.bench_players != 4
@@ -147,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Run benchmark if requested (no config needed)
+    #[cfg(feature = "microbenchmarks")]
     if cli.benchmark {
         let detailed_systems: Vec<String> = if cli.bench_detailed.is_empty() {
             Vec::new()
@@ -188,8 +196,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = config::load(&cli.config)?;
-    let mut game_server = server::GameServer::new(cfg, cli.port).await?;
-    game_server.bind = cli.bind;
+    let mut game_server = GameServer::new(cfg, cli.port).await?;
+    game_server.set_bind(cli.bind);
     game_server.run().await?;
 
     Ok(())

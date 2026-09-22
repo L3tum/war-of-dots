@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::agent::{Action, GameState, Tool, ToolCall};
+use super::build_http_client;
+use crate::llm::agent::{GameState, Tool, ToolCall};
 
 #[derive(Clone)]
 pub struct OpenAiClient {
@@ -65,12 +66,24 @@ struct FunctionCall {
 }
 
 impl OpenAiClient {
+    /// Create a client with the default 30 s request timeout.
     pub fn new(api_key: String, model: String, base_url: String) -> Self {
+        Self::with_timeout(api_key, model, base_url, None)
+    }
+
+    /// Create a client with an explicit total request timeout.
+    /// Pass `None` for the default (30 s); the connect timeout is always 10 s.
+    pub fn with_timeout(
+        api_key: String,
+        model: String,
+        base_url: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
         OpenAiClient {
             api_key,
             model,
             base_url,
-            http: reqwest::Client::new(),
+            http: build_http_client(timeout),
         }
     }
 }
@@ -130,27 +143,99 @@ impl OpenAiClient {
         }
         Ok(calls)
     }
+}
 
-    pub async fn query(
-        &self,
-        state: &GameState,
-        system_prompt: &str,
-    ) -> anyhow::Result<Vec<Action>> {
-        let calls = self.call(state, system_prompt, Vec::new()).await?;
-        Ok(calls
-            .into_iter()
-            .map(|tc| {
-                let reason = tc
-                    .arguments
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                Action {
-                    action_type: tc.name,
-                    params: tc.arguments,
-                    reason,
-                }
-            })
-            .collect())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::agent::GameState;
+
+    fn test_state() -> GameState {
+        GameState {
+            vision_grid: vec![vec![true, false]],
+            border_grid: vec![vec![0, 255]],
+            units: Vec::new(),
+            cities: Vec::new(),
+            funds: 100,
+            player_id: "p1".into(),
+        }
+    }
+
+    /// Spin up an axum router on a random loopback port; returns the base URL.
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        // Give the accept loop a head start.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn call_parses_tool_calls_from_mock_server() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "upgrade_city",
+                                    "arguments": "{\"city_id\":\"c1\",\"reason\":\"grow\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            }),
+        );
+        let base = serve(app).await;
+        let client = OpenAiClient::new("key".into(), "gpt-test".into(), base);
+        let calls = client
+            .call(&test_state(), "system prompt", Vec::new())
+            .await
+            .expect("call should succeed against mock server");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "upgrade_city");
+        assert_eq!(calls[0].arguments["city_id"], "c1");
+        assert_eq!(calls[0].arguments["reason"], "grow");
+    }
+
+    #[tokio::test]
+    async fn call_times_out_on_hanging_endpoint() {
+        // Accepts the request and then never responds.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                std::future::pending::<()>().await;
+                axum::Json(serde_json::json!({}))
+            }),
+        );
+        let base = serve(app).await;
+        let client = OpenAiClient::with_timeout(
+            "key".into(),
+            "gpt-test".into(),
+            base,
+            Some(std::time::Duration::from_millis(800)),
+        );
+        let start = std::time::Instant::now();
+        let res = client
+            .call(&test_state(), "system prompt", Vec::new())
+            .await;
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "hanging endpoint must error, got {res:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "call should error quickly, took {elapsed:?}"
+        );
     }
 }

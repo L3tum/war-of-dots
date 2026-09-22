@@ -4,14 +4,15 @@ use bytes::Bytes;
 use sqlite::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
-use axum::response::Html;
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use include_dir::{include_dir, Dir};
@@ -19,21 +20,24 @@ use include_dir::{include_dir, Dir};
 use crate::config::{Config, EquipmentConfig, UnitTypeConfig as ConfigUnitType};
 use crate::game::economy::UnitType;
 use crate::game::game::{Game, GameSettings};
+// H5: engine-neutral network baselines (engine module, plain engine types).
 use crate::game::unit::Equipment;
+use crate::game::NetworkBaselines;
 
 use crate::map::map::Map;
 use crate::map::map_config::load_default_map;
 use crate::map::map_registry;
-use crate::replay::replay::ReplayEvent;
 use crate::server::delta::{
-    run_network_phase, NetworkBaselines, NetworkPhaseResult, UnitBaselineStore,
+    init_unit_baselines, run_network_phase, update_unit_baselines, wire_unit_states,
+    NetworkPhaseResult, TickDiffs, UnitBaselineStore,
 };
 use crate::server::framing;
-use crate::server::lobby::LobbyManager;
+use crate::server::lobby::{LobbyManager, LOBBY_IDLE_TTL};
 use crate::server::protocol::{
-    decode_client_message, encode_message, encode_message_with_hint, estimate_delta_size,
-    negotiate_features, CityState, ClientMessage, GameStateMessage, LobbyMessage, LobbySettings,
-    PlayerState, ServerMessage, UnitState, PROTOCOL_VERSION,
+    decode_client_message, encode_message, encode_message_result, encode_message_with_hint,
+    estimate_delta_size, negotiate_features, CborEncodeError, CityState, ClientMessage,
+    GameStateMessage, LobbyMessage, LobbySettings, PlayerState, ServerMessage, UnitState,
+    PROTOCOL_VERSION,
 };
 
 // Re-export types from room module for use throughout game_server
@@ -43,9 +47,7 @@ pub use crate::server::room::{
 };
 
 // Re-export delta functions
-use crate::server::delta::{
-    build_delta_inner, build_llm_state, compute_shared_deltas, count_units_by_owner,
-};
+use crate::server::delta::{build_delta_inner, build_llm_state};
 
 static FRONTEND: Dir = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -64,6 +66,14 @@ pub struct GameServer {
     /// Inserted at handshake, removed on disconnect. Future work packages
     /// (grid RLE, compact entities, AoI) read this to pick the wire format.
     pub(crate) negotiated_features: Mutex<HashMap<Uuid, u32>>,
+    /// Sec L2: live WebSocket connection count (`/ws` + `/ws/spectator`).
+    /// Reserved at accept (see `handle_ws_game` / `handle_spectator_ws`),
+    /// released when the connection ends. Enforces
+    /// `config.network.max_ws_connections`.
+    pub(crate) ws_connections: AtomicUsize,
+    /// Sec L1: request-time gate for the /debug/* HTTP endpoints, set from
+    /// `config.debug.endpoints` in `new()` (see `debug_endpoints_enabled`).
+    pub(crate) debug_endpoints: bool,
     /// Shared storage for statistics and leaderboards
     pub(crate) storage: crate::storage::Storage,
 }
@@ -76,6 +86,7 @@ impl GameServer {
             &config.storage.replay_path,
         )?;
         map_registry::init();
+        let debug_endpoints = config.debug.endpoints;
         Ok(GameServer {
             port,
             bind: "0.0.0.0".to_string(),
@@ -84,8 +95,84 @@ impl GameServer {
             games: Mutex::new(HashMap::new()),
             player_map: Mutex::new(HashMap::new()),
             negotiated_features: Mutex::new(HashMap::new()),
+            ws_connections: AtomicUsize::new(0),
+            debug_endpoints,
             storage,
         })
+    }
+
+    /// Override the listener interface (CLI `--bind`). Default is 0.0.0.0
+    /// (all interfaces); the E2E harness uses 127.0.0.1 so the test server
+    /// is never LAN-reachable.
+    pub fn set_bind(&mut self, bind: impl Into<String>) {
+        self.bind = bind.into();
+    }
+
+    /// Sec L1: request-time gate for the /debug/* HTTP endpoints — the
+    /// single source of truth the debug handlers re-check at request time.
+    /// Both halves must hold:
+    /// - the same cfg condition `build_router` uses to register the routes
+    ///   (debug builds / `debug-overlay` feature), and
+    /// - the `debug.endpoints` config flag (runtime; lets an operator
+    ///   disable the endpoints in a debug build, and lets a test prove the
+    ///   gate holds even when the routes are registered).
+    ///
+    /// An exposed route (misconfigured proxy, feature-flag slip, a test app
+    /// registering the route unconditionally) must 404 here — in particular
+    /// the CPU-heavy benchmark must never run in a non-debug deployment.
+    pub(crate) fn debug_endpoints_enabled(&self) -> bool {
+        cfg!(any(debug_assertions, feature = "debug-overlay")) && self.debug_endpoints
+    }
+
+    /// Assemble the production HTTP route table (SPA pages + game WS +
+    /// replay endpoints). A method so tests can serve the EXACT same routes
+    /// on an ephemeral port (see the `replay_*` tests) instead of a copy
+    /// that could drift from production.
+    pub(crate) fn build_router(state: Arc<Mutex<GameServer>>) -> axum::Router {
+        // `mut` is only needed in debug_assertions / debug-overlay builds (the
+        // cfg'd block below reassigns `router`); plain release never mutates it.
+        #[allow(unused_mut)]
+        let mut router = axum::Router::new()
+            .route("/", get(index_handler))
+            .route("/watch", get(watch_handler))
+            .route("/ws", get(ws_handler))
+            // SPA route for the replay list viewer page (the same
+            // index.html; main.ts routes on `location.pathname` —
+            // without this, /replay fell through to serve_static and
+            // 404'd on the real server). Both slash variants: the list page
+            // links `/replay?game_id=…`, but `/replay/` must not 404 either.
+            .route("/replay", get(index_handler))
+            .route("/replay/", get(index_handler))
+            .route("/ws/replay", get(gated_replay_ws_handler))
+            .route("/ws/spectator", get(spectator_ws_handler))
+            .route("/replays", get(list_replays))
+            .route("/replays/:name", get(serve_replay))
+            .route("/maps", get(list_maps_handler))
+            .fallback(serve_static);
+
+        #[cfg(any(debug_assertions, feature = "debug-overlay"))]
+        {
+            // Route-level gate (compile time). The handlers re-check
+            // `debug_endpoints_enabled` at request time — a route that is
+            // ever exposed must not execute debug logic (Sec L1).
+            router = router.route("/debug/stats", get(crate::debug::debug_stats_handler));
+            // The benchmark route (and handler) only exist when the
+            // benchmark module is compiled in.
+            #[cfg(feature = "microbenchmarks")]
+            {
+                router = router.route(
+                    "/debug/benchmark",
+                    get(crate::debug::debug_benchmark_handler),
+                );
+            }
+        }
+
+        let cors = tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any);
+
+        router.layer(cors).with_state(state)
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -94,43 +181,73 @@ impl GameServer {
         let state = Arc::new(Mutex::new(self));
         let state_ws = state.clone();
 
-        let app = {
-            let mut router = axum::Router::new()
-                .route("/", get(index_handler))
-                .route("/watch", get(watch_handler))
-                .route("/ws", get(ws_handler))
-                .route("/ws/replay", get(replay_ws_handler))
-                .route("/ws/spectator", get(spectator_ws_handler))
-                .route("/replays", get(list_replays))
-                .route("/replays/:name", get(serve_replay))
-                .route("/maps", get(list_maps_handler))
-                .fallback(serve_static);
-
-            #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-            {
-                router = router
-                    .route("/debug/stats", get(crate::debug::debug_stats_handler))
-                    .route("/debug/tick", get(crate::debug::debug_tick_handler))
-                    .route(
-                        "/debug/benchmark",
-                        get(crate::debug::debug_benchmark_handler),
-                    );
-            }
-
-            let cors = tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any);
-
-            router.layer(cors).with_state(state.clone())
-        };
+        let app = Self::build_router(state.clone());
 
         let listener_http = tokio::net::TcpListener::bind(format!("{}:{}", bind, port)).await?;
-        let listener_ws = tokio::net::TcpListener::bind(format!("{}:{}", bind, port + 1)).await?;
+        // M5: a failed bind here used to surface as a bare io::Error with no
+        // context. Make it loud and consistent with the HTTP bind above (both
+        // abort startup): a server whose raw-TCP game port is dead would run
+        // with half its client paths missing, which is a misconfiguration, not
+        // a degraded mode worth continuing in.
+        let listener_ws =
+            match tokio::net::TcpListener::bind(format!("{}:{}", bind, port + 1)).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::error!(
+                        http_port = port,
+                        tcp_game_port = port + 1,
+                        error = %e,
+                        "Failed to bind the TCP game listener on {}:{} (config port is {}; the \
+                         TCP game port is always config port + 1). Consequence if we continued: \
+                         raw-TCP clients could not join, while WebSocket clients on port {} would \
+                         still work. Aborting — free port {} or start with a different `port`.",
+                        bind,
+                        port + 1,
+                        port,
+                        port,
+                        port + 1
+                    );
+                    return Err(anyhow::anyhow!(
+                        "bind TCP game listener on {}:{} (config port {} + 1): {}",
+                        bind,
+                        port + 1,
+                        port,
+                        e
+                    ));
+                }
+            };
 
         tokio::spawn(async move {
             axum::serve(listener_http, app).await.ok();
         });
+
+        // M2: periodic sweep of idle lobbies (LOBBY_IDLE_TTL = 30 min). A
+        // lobby with no join activity for that long — including lobbies
+        // whose creator vanished without a clean disconnect (crash, network
+        // cut) — is removed, bounding the memory footprint of
+        // client-controlled custom unit types (up to ~1 MB per lobby). The
+        // creator-disconnect cleanup in the read loops is the fast path;
+        // this sweep is the backstop.
+        {
+            let sweep_state = state.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(LOBBY_IDLE_TTL / 2);
+                interval.tick().await; // the first tick completes immediately
+                loop {
+                    interval.tick().await;
+                    let server = sweep_state.lock().await;
+                    let mut lobby_manager = server.lobby_manager.lock().await;
+                    let reaped = lobby_manager.reap_idle_lobbies(LOBBY_IDLE_TTL);
+                    if !reaped.is_empty() {
+                        tracing::info!(
+                            reaped = ?reaped,
+                            ttl_secs = LOBBY_IDLE_TTL.as_secs(),
+                            "Reaped idle lobbies (no join activity within TTL)"
+                        );
+                    }
+                }
+            });
+        }
 
         tracing::info!(
             "HTTP server on {}:{}, TCP game on {}:{}",
@@ -169,11 +286,49 @@ impl GameServer {
     }
 }
 
+/// Sec L2: spectator join with the per-game cap (config
+/// `network.max_spectators_per_game`). The check and the `players.push`
+/// both happen in the tick task — the sole owner of `players` and the sole
+/// consumer of the command channel — so concurrent joins cannot race past
+/// the cap. Over-cap joins receive a clear Error message (their dropped
+/// sender then ends the spectator's forward task and closes the
+/// connection); earlier spectators are unaffected.
+async fn add_spectator_capped(
+    cap: usize,
+    players: &mut Vec<PlayerConnection>,
+    game: &Game,
+    sender: PlayerSender,
+) {
+    let cap = cap.max(1);
+    let spec_count = players
+        .iter()
+        .filter(|p| matches!(p, PlayerConnection::Spectator { .. }))
+        .count();
+    if spec_count >= cap {
+        let err = encode_message(&ServerMessage::Error {
+            message: format!("Spectator limit reached ({cap})"),
+        });
+        let _ = sender.send_reliable(err.into()).await;
+        return;
+    }
+    let all_pids: Vec<String> = game.players().keys().cloned().collect();
+    let vision_grid = game.union_vision_grids(&all_pids);
+    let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
+    let full_state = game.full_state_with_vision(vision_grid, border_grid);
+    let encoded = encode_message(&ServerMessage::FullState(full_state));
+    let _ = sender.send_reliable(encoded.into()).await;
+    players.push(PlayerConnection::Spectator { tx: sender });
+}
+
 impl GameRoom {
     #[allow(clippy::too_many_arguments)]
     fn new(
         game_id: String,
         map: Map,
+        // Map name as chosen in the lobby (e.g. "default", a custom-map id)
+        // — persisted into `game_metadata.settings` at game end so the
+        // replay list can show which map the game ran on.
+        map_name: String,
         settings: GameSettings,
         players: Vec<PlayerConnection>,
         llm_configs: Vec<LlmPlayerConfig>,
@@ -184,6 +339,15 @@ impl GameRoom {
         spectator_vision: bool,
     ) -> Self {
         let starting_funds = settings.starting_funds;
+
+        // Real wall-clock game start (UNIX seconds). `record_game_end`
+        // persists it so the replay list's `end_time - start_time` duration
+        // is the actual game length (the old start_time=0 sentinel rendered
+        // as ~54-year games).
+        let game_start_time: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         // Build the list of controlled player IDs (human or LLM) BEFORE creating the game
         let controlled_player_ids: Vec<String> = players
@@ -249,7 +413,7 @@ impl GameRoom {
         }
         // Initialize prev_unit_owners for stats tracking
         let mut prev_owners = std::collections::HashMap::new();
-        for unit in game.unit_states() {
+        for unit in game.query_all_units() {
             *prev_owners.entry(unit.owner.clone()).or_insert(0) += 1;
         }
         // prev_unit_owners removed in ECS refactor = prev_owners;
@@ -285,6 +449,11 @@ impl GameRoom {
                 Err(e) => tracing::warn!("replay: cannot create file for game {}: {}", room_id, e),
             }
         }
+
+        // Settings payload for the game_metadata row written at game end:
+        // the ACTUAL in-play settings + map name (record_game_end persists
+        // it verbatim; the replay list UI shows it).
+        let settings_json = game_metadata_settings_json(&game, &map_name);
 
         for player in &players {
             let player_id = player.id().cloned().unwrap_or_default();
@@ -451,7 +620,7 @@ impl GameRoom {
                                         }
                                     }
                                     Err(e) => {
-                                        log::warn!("LLM agent {} step failed: {}", agent_name, e);
+                                        tracing::warn!("LLM agent {} step failed: {}", agent_name, e);
                                     }
                                 }
                             }
@@ -509,19 +678,20 @@ impl GameRoom {
         // A second Arc so the loop-use and the final GameRoom placement don't conflict
         // (the coroutine would otherwise move `game_stats` and reject the later use).
         let game_stats_room = game_stats.clone();
+        // Sec L2: per-game spectator cap (config.network.max_spectators_per_game),
+        // enforced in the tick task — the sole owner of `players` (see
+        // `add_spectator_capped`).
+        let spectator_cap = config.network.max_spectators_per_game;
 
         tokio::spawn(async move {
             let mut game = game;
-            let mut baselines: NetworkBaselines = NetworkBaselines {
-                prev_units: UnitBaselineStore::default(),
-                prev_cities: game
-                    .query_cities()
-                    .iter()
-                    .map(|c| (c.id.clone(), c.into()))
-                    .collect(),
-                prev_funds: game.all_player_funds(),
-                prev_border: game.territory_grid_flat(),
-                prev_vision: {
+            // H5: engine-neutral baselines live in the ENGINE module (plain
+            // engine types, single commit step); the wire-typed unit baseline
+            // store stays server-side (Arch H2) and is seeded alongside.
+            let mut baselines = NetworkBaselines::from_snapshot(
+                game.query_cities(),
+                game.all_player_funds(),
+                {
                     let mut m = std::collections::HashMap::new();
                     for pid in game.players().keys() {
                         if let Some(v) = game.vision_grid_flat(pid) {
@@ -530,10 +700,12 @@ impl GameRoom {
                     }
                     m
                 },
-            };
+                game.territory_grid_flat(),
+            );
             // I1: seed the entity-indexed unit baseline store ONCE per game
             // (replaces the per-tick `prev_units` HashMap rebuild).
-            game.init_unit_baselines(&mut baselines.prev_units);
+            let mut unit_baselines = UnitBaselineStore::default();
+            init_unit_baselines(&game, &mut unit_baselines);
             let mut players = players;
             let mut advisors = advisors;
             // I8: lazy cache for the spectator union vision grid — recomputed
@@ -602,13 +774,10 @@ impl GameRoom {
                                     }
                                 }
                                 Command::AddSpectator(sender) => {
-                                    let all_pids: Vec<String> = game.players().keys().cloned().collect();
-                                    let vision_grid = game.union_vision_grids(&all_pids);
-                                    let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
-                                    let full_state = game.full_state_with_vision(vision_grid, border_grid);
-                                    let encoded = encode_message(&ServerMessage::FullState(full_state));
-                                    let _ = sender.send_reliable(encoded.into()).await;
-                                    players.push(PlayerConnection::Spectator { tx: sender });
+                                    // Sec L2: per-game spectator cap (the tick
+                                    // task is the sole owner of `players`).
+                                    add_spectator_capped(spectator_cap, &mut players, &game, sender)
+                                        .await;
                                 }
                                 Command::EmbarkUnit(unit_id, pid) => {
                                     game.embark_unit(&unit_id, &pid);
@@ -623,18 +792,19 @@ impl GameRoom {
                         game.tick_game();
 
                         // I1: single in-place ECS pass replacing the per-tick
-                        // full `unit_states_direct()` snapshot — diffs every
-                        // live unit against the PRE-COMMIT baseline, emits
-                        // only changed units into `unit_diff`, and commits
-                        // the baseline store. `unit_diff` feeds both the
+                        // full unit snapshot — the server-side
+                        // `update_unit_baselines` (Arch H2 seam: the engine
+                        // only yields plain `UnitView`s) diffs every live
+                        // unit against the PRE-COMMIT baseline, emits only
+                        // changed units into `unit_diff`, and commits the
+                        // baseline store. `unit_diff` feeds both the
                         // active-player check (per-owner counts) and the
                         // per-player delta build below.
-                        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
-                        // W7: convert City → CityState while the world guard is
-                        // alive (no redundant full Vec<City> clone; the CityState
-                        // Vec is the allocation we actually need).
-                        let current_cities: Vec<CityState> =
-                            game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
+                        let unit_diff = update_unit_baselines(&game, &mut unit_baselines);
+                        // H5: plain engine city snapshot (engine-owned data —
+                        // the server converts to wire types only inside the
+                        // diff/commit).
+                        let current_cities: Vec<crate::game::economy::City> = game.query_cities();
 
                         // Update live debug stats (read by /debug/stats)
                         {
@@ -647,6 +817,17 @@ impl GameRoom {
                         // --- Broadcast state snapshots every 60 ticks (~1 sec) ---
                         if tick_count.is_multiple_of(60) {
                             for (player_id, tx) in &state_broadcasts {
+                                // Perf #1: no subscribers means the build is
+                                // pure waste — a full clone of every unit's
+                                // strings/vecs plus ~80k grid cells for a
+                                // channel nobody reads (humans have no LLM
+                                // agent/advisor attached). LLM agents and
+                                // advisors subscribe at game start, so a
+                                // late-attaching receiver still gets a fresh
+                                // snapshot within one second of subscribing.
+                                if tx.receiver_count() == 0 {
+                                    continue;
+                                }
                                 let state = build_llm_state(&game, player_id);
                                 let _ = tx.send(state);
                             }
@@ -665,19 +846,25 @@ impl GameRoom {
                         // (P archetype + P city scans) is skipped entirely.
                         // I1: the per-owner counts come straight from the
                         // in-place pass (`unit_diff`) instead of a second
-                        // O(N) `count_units_by_owner` scan — the map only
-                        // exists twice (this clone + the one moved into the
-                        // network phase) and has ≤ one key per player.
-                        let units_by_owner = unit_diff.current_owner_counts.clone();
+                        // O(N) `count_units_by_owner` scan — and borrowed,
+                        // not cloned (Perf #4: the per-tick `HashMap` clone
+                        // was pure waste — the active check only reads it,
+                        // and `unit_diff` is moved into the network phase
+                        // below, where the map lives on as `SharedDeltas`).
+                        let units_by_owner = &unit_diff.current_owner_counts;
                         let city_owners: HashSet<&str> = current_cities
                             .iter()
                             .filter_map(|c| c.owner.as_deref())
                             .collect();
-                        let player_ids: Vec<String> = game.players().keys().cloned().collect();
+                        // M4: borrowed pids — `Vec<String>` cloned every tick
+                        // (N string allocations) is unnecessary: the game map
+                        // outlives this tick, so `&str` borrows are free.
+                        let player_ids: Vec<&str> =
+                            game.players().keys().map(|s| s.as_str()).collect();
                         let total_players = player_ids.len();
                         let active_count = player_ids.iter().filter(|pid| {
-                            units_by_owner.get(pid.as_str()).copied().unwrap_or(0) > 0
-                                || city_owners.contains(pid.as_str())
+                            units_by_owner.get(**pid).copied().unwrap_or(0) > 0
+                                || city_owners.contains(**pid)
                         }).count();
                         // I5: the winner, when the game ends, is the sole
                         // active player (predicate-identical to the old
@@ -687,26 +874,23 @@ impl GameRoom {
                                 .iter()
                                 .find(|pid| {
                                     units_by_owner
-                                        .get(pid.as_str())
+                                        .get(**pid)
                                         .copied()
                                         .unwrap_or(0)
                                         > 0
-                                        || city_owners.contains(pid.as_str())
+                                        || city_owners.contains(**pid)
                                 })
-                                .cloned()
+                                .copied()
                         }).flatten();
                         if active_count == 0 {
-                            let end_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            storage_clone.record_game_end(
+                            persist_game_end(
+                                &storage_clone,
                                 &room_id,
-                                end_time,
+                                game_start_time,
+                                &settings_json,
                                 &[""],
-                                &player_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                                game.player_stats(),
-                                game.settings().use_standard_ruleset,
+                                &player_ids,
+                                &game,
                             );
                             let msg = ServerMessage::GameOver {
                                 winner: "Draw".to_string(),
@@ -724,20 +908,17 @@ impl GameRoom {
                         }
                         if total_players > 1 && active_count == 1 {
                             let winner_id = sole_active.unwrap_or_default();
-                            let winner_name = game.players().get(&winner_id)
+                            let winner_name = game.players().get(winner_id)
                                 .map(|p| p.name.clone())
-                                .unwrap_or_else(|| winner_id.clone());
-                            let end_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            storage_clone.record_game_end(
+                                .unwrap_or_else(|| winner_id.to_string());
+                            persist_game_end(
+                                &storage_clone,
                                 &room_id,
-                                end_time,
-                                &[winner_id.as_str()],
-                                &player_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                                game.player_stats(),
-                                game.settings().use_standard_ruleset,
+                                game_start_time,
+                                &settings_json,
+                                &[winner_id],
+                                &player_ids,
+                                &game,
                             );
                             let msg = ServerMessage::GameOver {
                                 winner: winner_name,
@@ -767,12 +948,19 @@ impl GameRoom {
                             })
                             .collect();
 
+                        // H3: the per-tick shared diff inputs flow as one
+                        // structured value (unit diff + city snapshot +
+                        // border grid) instead of parallel parameters.
+                        let tick_diffs = TickDiffs {
+                            units: unit_diff,
+                            cities: current_cities,
+                            border_grid: game.territory_grid_flat(),
+                        };
                         let mut phase: NetworkPhaseResult = run_network_phase(
                             &game,
                             &mut baselines,
                             &regular_pids,
-                            unit_diff,
-                            current_cities,
+                            tick_diffs,
                             true, // W9 splice path: on — A/B confirmed ~1.5% off the network phase (byte-for-byte verified encoder)
                             record_pid.as_deref(),
                         );
@@ -780,13 +968,23 @@ impl GameRoom {
                         // Replay: log the recording viewpoint's delta for this
                         // tick (idle ticks build no delta — nothing was sent
                         // on the wire either, so nothing is logged).
+                        // Perf #2: NO per-tick flush — the BufWriter buffers in
+                        // userspace and we flush on a cadence below (~1 s,
+                        // aligned with the state-snapshot ticks), at game end,
+                        // and on drop. Crash durability: the last <1 s of
+                        // deltas may be lost; the replay viewer tolerates a
+                        // missing terminal marker, and the JSONL shape is
+                        // unchanged (frontend replay paths are byte-pinned).
                         let recorded_delta = phase.recorded_delta.take();
                         if let Some(rec) = replay_recorder.as_mut() {
                             if let Some(d) = &recorded_delta {
                                 if let Ok(v) = serde_json::to_value(d) {
                                     let _ = writeln!(rec, "{{\"delta\":{}}}", v);
-                                    let _ = rec.flush();
                                 }
+                            }
+                            // Perf #2: cadence flush (every 60 ticks ≈ 1 s).
+                            if tick_count.is_multiple_of(60) {
+                                let _ = rec.flush();
                             }
                         }
 
@@ -848,13 +1046,27 @@ impl GameRoom {
                                     ServerMessage::DeltaState(d) => d,
                                     _ => unreachable!(),
                                 };
-                                let encoded = encode_message_with_hint(&delta, estimate_delta_size(dref));
-                                if let Some(v) = &spec_vision {
-                                    baselines.prev_vision.insert(spec_pid.clone(), Arc::clone(v));
+                                match encode_message_with_hint(&delta, estimate_delta_size(dref)) {
+                                    Ok(encoded) => {
+                                        if let Some(v) = &spec_vision {
+                                            baselines.commit_vision(spec_pid.clone(), Arc::clone(v));
+                                        }
+                                        outbox.push((spec_pid, encoded));
+                                    }
+                                    Err(e) => {
+                                        // M3/W7: the spectator's delta encode failed —
+                                        // drop the frame (never send the truncated
+                                        // bytes) and close the connection.
+                                        tracing::error!(error = %e, "spectator delta encode failed — closing connection");
+                                        for p in &players {
+                                            if matches!(p, PlayerConnection::Spectator { .. }) {
+                                                p.tx().close();
+                                            }
+                                        }
+                                    }
                                 }
-                                outbox.push((spec_pid, encoded));
                             } else if let Some(v) = &spec_vision {
-                                baselines.prev_vision.insert(spec_pid, Arc::clone(v));
+                                baselines.commit_vision(spec_pid, Arc::clone(v));
                             }
                         }
 
@@ -862,9 +1074,39 @@ impl GameRoom {
                         // W4: take-by-move via a linear scan (players ≤ 16); the
                         // is_ok() check is the sole drop condition (send failed →
                         // the player is dropped), same semantics as before.
+                        // M3/W7: players whose delta encode FAILED this tick are
+                        // not in the outbox (the frame was dropped, never sent);
+                        // the shared unit/city/funds baselines advanced without
+                        // delivery, so their stream is unrecoverable — close the
+                        // connection and stop sending to them.
+                        let encode_failed: std::collections::HashSet<&str> = phase
+                            .encode_failures
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect();
+                        if !encode_failed.is_empty() {
+                            for player in &players {
+                                if let Some(pid) = player.id() {
+                                    if encode_failed.contains(pid.as_str()) {
+                                        player.tx().close();
+                                    }
+                                }
+                            }
+                            for pid in &phase.encode_failures {
+                                tracing::error!(
+                                    player_id = %pid,
+                                    "delta encode failure — frame dropped, connection closed"
+                                );
+                            }
+                        }
                         let mut alive = Vec::new();
                         for player in players {
                             let pid = player.id().cloned().unwrap_or_default();
+                            if encode_failed.contains(pid.as_str()) {
+                                // M3/W7: encode failed this tick — connection closed
+                                // above; drop the player from the tick loop.
+                                continue;
+                            }
                             if let Some(pos) = outbox.iter().position(|(p, _)| p.as_str() == pid) {
                                 let (_, bytes) = outbox.swap_remove(pos);
                                 // I7: tick deltas go through the bounded keep-latest
@@ -890,17 +1132,14 @@ impl GameRoom {
                         if human_count == 0 {
                             let winner_id = game.determine_winner();
                             let player_ids: Vec<&str> = game.players().keys().map(|s| s.as_str()).collect();
-                            let end_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            storage_clone.record_game_end(
+                            persist_game_end(
+                                &storage_clone,
                                 &room_id,
-                                end_time,
+                                game_start_time,
+                                &settings_json,
                                 &[winner_id.as_deref().unwrap_or("")],
                                 &player_ids,
-                                game.player_stats(),
-                                game.settings().use_standard_ruleset,
+                                &game,
                             );
                             let msg = ServerMessage::GameOver {
                                 winner: "Abandoned".to_string(),
@@ -925,17 +1164,14 @@ impl GameRoom {
                         if players.is_empty() {
                             let winner_id = game.determine_winner();
                             let player_ids: Vec<&str> = game.players().keys().map(|s| s.as_str()).collect();
-                            let end_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            storage_clone.record_game_end(
+                            persist_game_end(
+                                &storage_clone,
                                 &room_id,
-                                end_time,
+                                game_start_time,
+                                &settings_json,
                                 &[winner_id.as_deref().unwrap_or("")],
                                 &player_ids,
-                                game.player_stats(),
-                                game.settings().use_standard_ruleset,
+                                &game,
                             );
                             let server = server_state.lock().await;
                             let mut games = server.games.lock().await;
@@ -973,13 +1209,10 @@ impl GameRoom {
                                 }
                             }
                             Some(Command::AddSpectator(sender)) => {
-                                let all_pids: Vec<String> = game.players().keys().cloned().collect();
-                                let vision_grid = game.union_vision_grids(&all_pids);
-                                let border_grid = all_pids.first().and_then(|p| game.border_grid_2d(p));
-                                let full_state = game.full_state_with_vision(vision_grid, border_grid);
-                                let encoded = encode_message(&ServerMessage::FullState(full_state));
-                                let _ = sender.send_reliable(encoded.into()).await;
-                                players.push(PlayerConnection::Spectator { tx: sender });
+                                // Sec L2: per-game spectator cap (the tick
+                                // task is the sole owner of `players`).
+                                add_spectator_capped(spectator_cap, &mut players, &game, sender)
+                                    .await;
                             }
                             Some(Command::EmbarkUnit(unit_id, pid)) => {
                                 game.embark_unit(&unit_id, &pid);
@@ -1064,7 +1297,10 @@ impl Game {
         border_grid: Option<Vec<Vec<u32>>>,
         player_id: Option<&str>,
     ) -> GameStateMessage {
-        let units: Vec<UnitState> = self.unit_states().to_vec();
+        // Perf #5: `wire_unit_states` already builds a fresh Vec — the old
+        // `.to_vec()` here made a gratuitous second full copy (every unit's
+        // strings + equipment Vecs) on every full-state build.
+        let units: Vec<UnitState> = wire_unit_states(self);
         let cities: Vec<CityState> = self.query_cities().iter().map(|c| c.into()).collect();
         let terrain = self.terrain_grid_2d();
         // Per-player funds/units for the viewing player, matching the delta system.
@@ -1184,6 +1420,56 @@ pub(crate) async fn list_maps_handler() -> axum::Json<Vec<String>> {
     axum::Json(map_registry::list_maps())
 }
 
+/// Serialize the in-play settings + map name for the `game_metadata.settings`
+/// column (persisted by `record_game_end` at game end). `GameSettings` is
+/// not `Serialize` (nor is `UnitType`), so project the fields the replay
+/// list UI cares about here rather than deriving across modules.
+fn game_metadata_settings_json(game: &Game, map_name: &str) -> String {
+    let s = game.settings();
+    serde_json::json!({
+        "map": map_name,
+        "settings": {
+            "starting_funds": s.starting_funds,
+            "initial_manpower": s.initial_manpower,
+            "funds_per_city": s.funds_per_city,
+            "recruitment_rate": s.recruitment_rate,
+            "game_speed": s.game_speed,
+            "use_standard_ruleset": s.use_standard_ruleset,
+            "unit_types": s.unit_types.iter().map(|u| u.name.clone()).collect::<Vec<_>>(),
+            "water_speed": s.water_speed,
+        },
+    })
+    .to_string()
+}
+
+/// Persist the game-end record (wall-clock start/end + the in-play settings
+/// JSON) when a game terminates. All four end paths — draw, last player
+/// standing, abandoned (no humans left), and room empty — share this.
+fn persist_game_end(
+    storage: &crate::storage::Storage,
+    room_id: &str,
+    game_start_time: u64,
+    settings_json: &str,
+    winners: &[&str],
+    player_ids: &[&str],
+    game: &Game,
+) {
+    let end_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    storage.record_game_end(
+        room_id,
+        game_start_time,
+        end_time,
+        settings_json,
+        winners,
+        player_ids,
+        game.player_stats(),
+        game.settings().use_standard_ruleset,
+    );
+}
+
 /// List all available replays
 pub(crate) async fn list_replays(
     State(state): State<Arc<Mutex<GameServer>>>,
@@ -1236,22 +1522,15 @@ pub(crate) async fn list_replays(
 /// syntax — the `{param}` form does not match. See
 /// `path_param_routes_use_colon_syntax` for the regression guard.
 ///
-/// Security: the same basename-only rule as the frontend's `?replay=` guard —
-/// no path separators, alphanumeric/dot/dash/underscore, `.jsonl` suffix —
-/// otherwise the route could read arbitrary files
-/// (`/replays/../../config.toml`).
+/// Security: the shared basename-only rule
+/// (`crate::server::handlers::replay::is_safe_replay_file_name`) — no path
+/// separators, no `..` sequences, no null bytes, `.jsonl` suffix — otherwise
+/// the route could read arbitrary files (`/replays/../../config.toml`).
 pub(crate) async fn serve_replay(
     State(state): State<Arc<Mutex<GameServer>>>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
-    if name.len() > 128
-        || name.contains('/')
-        || name.contains('\\')
-        || !name.ends_with(".jsonl")
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
+    if !crate::server::handlers::replay::is_safe_replay_file_name(&name) {
         return Err(axum::http::StatusCode::NOT_FOUND);
     }
     let dir = state.lock().await.config.storage.replay_path.clone();
@@ -1273,17 +1552,6 @@ pub(crate) struct ReplayInfo {
     duration: i64,
 }
 
-/// WebSocket handler for replay spectator
-pub(crate) async fn replay_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<Mutex<GameServer>>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl axum::response::IntoResponse {
-    let game_id = params.get("game_id").cloned();
-    let server_state = state.clone();
-    ws.on_upgrade(move |socket| handle_replay_ws(socket, server_state, game_id))
-}
-
 /// WebSocket handler for live spectator — joins the active game as a spectator
 pub(crate) async fn spectator_ws_handler(
     ws: WebSocketUpgrade,
@@ -1293,7 +1561,48 @@ pub(crate) async fn spectator_ws_handler(
     ws.on_upgrade(move |socket| handle_spectator_ws(socket, server_state))
 }
 
-pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mutex<GameServer>>) {
+pub(crate) async fn handle_spectator_ws(
+    mut socket: WebSocket,
+    server_state: Arc<Mutex<GameServer>>,
+) {
+    // Sec L2: reserve a connection slot (config.network.max_ws_connections,
+    // shared with /ws). Over-cap connections are rejected with a clear
+    // Error message + WS close code 1013 ("Try Again Later") before any
+    // per-connection task is spawned. Every path after a successful reserve
+    // releases the slot exactly once (see the releases below).
+    {
+        let server = server_state.lock().await;
+        let cap = server.config.network.max_ws_connections.max(1);
+        if server.ws_connections.fetch_add(1, Ordering::Relaxed) >= cap {
+            server.ws_connections.fetch_sub(1, Ordering::Relaxed);
+            let err = match encode_message_result(&ServerMessage::Error {
+                message: "Server at maximum connections — try again later".to_string(),
+            }) {
+                Ok(e) => e,
+                Err(e) => {
+                    // M3: encode failure — nothing to send; just close.
+                    tracing::error!(error = %e, "encode failed at spectator capacity reject — closing connection");
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1011,
+                            reason: "internal error".into(),
+                        })))
+                        .await;
+                    return;
+                }
+            };
+            let _ = socket.send(Message::Binary(err)).await;
+            // axum 0.7: close() takes no frame — send an explicit Close
+            // message with 1013 (Try Again Later) instead.
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1013,
+                    reason: "at capacity".into(),
+                })))
+                .await;
+            return;
+        }
+    }
     let (mut ws_sink, _ws_stream) = socket.split();
     // Drop ws_stream — spectator only receives
 
@@ -1311,6 +1620,12 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
                 message: "No active game".to_string(),
             });
             let _ = ws_sink.send(Message::Binary(err)).await;
+            // Release the slot (early return — no forward task runs).
+            server_state
+                .lock()
+                .await
+                .ws_connections
+                .fetch_sub(1, Ordering::Relaxed);
             return;
         }
     };
@@ -1328,6 +1643,12 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
                 message: "Game not found".to_string(),
             });
             let _ = ws_sink.send(Message::Binary(err)).await;
+            // Release the slot (early return — no forward task runs).
+            server_state
+                .lock()
+                .await
+                .ws_connections
+                .fetch_sub(1, Ordering::Relaxed);
             return;
         }
     };
@@ -1348,6 +1669,13 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
                 break;
             }
         }
+        // Sec L2: the connection is done (the room dropped the spectator's
+        // sender, or the sink failed) — release the slot reserved at accept.
+        server_state
+            .lock()
+            .await
+            .ws_connections
+            .fetch_sub(1, Ordering::Relaxed);
     });
 
     // Send the AddSpectator command via the room's command_tx
@@ -1365,238 +1693,40 @@ pub(crate) async fn handle_spectator_ws(socket: WebSocket, server_state: Arc<Mut
         .ok();
 }
 
-pub(crate) async fn handle_replay_ws(
-    socket: WebSocket,
-    server_state: Arc<Mutex<GameServer>>,
-    game_id: Option<String>,
-) {
-    // Run the entire replay logic on a blocking thread
-    let rt = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        rt.block_on(async {
-            let (mut ws_sink, ws_stream) = socket.split();
-            drop(ws_stream);
-
-            let server = server_state.lock().await;
-            let storage_path = server.storage.path.clone();
-            drop(server);
-
-            // Open a new DB connection for this task
-            // If no game_id provided, send error and exit
-            let game_id_str = match game_id {
-                Some(id) => id,
-                None => {
-                    let err = encode_message(&ServerMessage::Error {
-                        message: "No game_id provided".to_string(),
-                    });
-                    let _ = ws_sink.send(Message::Binary(err)).await;
-                    return;
-                }
-            };
-
-            // Open database connection
-            let db = match sqlite::Connection::open(&storage_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    let err = encode_message(&ServerMessage::Error {
-                        message: format!("Database error: {}", e),
-                    });
-                    let _ = ws_sink.send(Message::Binary(err)).await;
-                    return;
-                }
-            };
-
-            // Use parameterized query to prevent SQL injection
-            let mut stmt = match db.prepare("SELECT replay_path FROM game_metadata WHERE id = ?") {
-                Ok(s) => s,
-                Err(e) => {
-                    let err = encode_message(&ServerMessage::Error {
-                        message: format!("Database query error: {}", e),
-                    });
-                    let _ = ws_sink.send(Message::Binary(err)).await;
-                    return;
-                }
-            };
-            let params: Vec<Value> = vec![Value::String(game_id_str.clone())];
-            if let Err(e) = stmt.bind(params.as_slice()) {
-                tracing::error!(%e, game_id = %game_id_str, "Failed to bind game_id");
-                let err = encode_message(&ServerMessage::Error {
-                    message: "Database binding error".to_string(),
-                });
-                let _ = ws_sink.send(Message::Binary(err)).await;
-                return;
-            }
-            let replay_path: String = match stmt.next() {
-                Ok(sqlite::State::Row) => {
-                    let path: String = stmt.read(0).unwrap_or_default();
-                    if path.is_empty() {
-                        let err = encode_message(&ServerMessage::Error {
-                            message: "Replay path not found".to_string(),
-                        });
-                        let _ = ws_sink.send(Message::Binary(err)).await;
-                        return;
-                    }
-                    path
-                }
-                _ => {
-                    let err = encode_message(&ServerMessage::Error {
-                        message: "Replay not found".to_string(),
-                    });
-                    let _ = ws_sink.send(Message::Binary(err)).await;
-                    return;
-                }
-            };
-
-            // Load the replay file and reconstruct the game
-            let map = crate::map::map_config::load_default_map();
-            let num_replay_players = map.cities.len();
-            let mut replay_player = match crate::replay::replay::ReplayPlayer::from_file(
-                &replay_path,
-                Game::new(
-                    map,
-                    crate::game::game::GameSettings {
-                        starting_funds: 100,
-                        initial_manpower: 2000,
-                        funds_per_city: 10.0,
-                        recruitment_rate: 10.0,
-                        game_speed: 60.0,
-                        use_standard_ruleset: true,
-                        unit_types: vec![],
-                        city_upgrade_settings: crate::config::CityUpgradeSettings::default(),
-                        water_speed: 1.2,
-                        influence: crate::game::game::InfluenceSettings::default(),
-                    },
-                    num_replay_players,
-                ),
-            ) {
-                Ok(rp) => rp,
-                Err(_) => return,
-            };
-
-            // Send initial full state
-            let initial_msg = ServerMessage::FullState(replay_player.full_state());
-            let encoded = encode_message(&initial_msg);
-            if ws_sink.send(Message::Binary(encoded)).await.is_err() {
-                return;
-            }
-
-            // Build prev state for delta comparison
-            let mut prev_units: HashMap<String, UnitState> = replay_player
-                .game
-                .unit_states()
-                .to_vec()
-                .into_iter()
-                .map(|u| {
-                    let state: UnitState = u.clone();
-                    (u.id.clone(), state)
-                })
-                .collect();
-            let mut prev_cities: HashMap<String, CityState> = replay_player
-                .game
-                .query_cities()
-                .iter()
-                .map(|c| {
-                    let state: CityState = CityState::from(c);
-                    (c.id.clone(), state)
-                })
-                .collect();
-            let mut prev_funds = replay_player.all_player_funds().clone();
-            let mut prev_vision_grid: Option<Arc<Vec<u8>>> = None;
-            let mut prev_border_grid: Option<Arc<Vec<u8>>> = None;
-            let grid_width = replay_player.game.terrain_width();
-
-            // Loop: consume events and build deltas
-            let mut events: Vec<ReplayEvent> = Vec::new();
-            while let Some(event) = replay_player.next() {
-                events.push(event.clone());
-            }
-            for event in events {
-                replay_player.apply_event(&event);
-                // Flat grids (no 2-D allocation in replay path either)
-                let all_pids: Vec<String> = replay_player.game.players().keys().cloned().collect();
-                let current_vision: Option<Arc<Vec<u8>>> = replay_player
-                    .game
-                    .union_vision_grid_flat(&all_pids)
-                    .map(Arc::new);
-                let current_border: Option<Arc<Vec<u8>>> = replay_player.game.territory_grid_flat();
-                let current_units = replay_player.game.unit_states();
-                let current_cities: Vec<CityState> = replay_player
-                    .game
-                    .query_cities()
-                    .iter()
-                    .map(|c| c.into())
-                    .collect();
-                let all_funds = replay_player.game.all_player_funds();
-                let current_unit_ids: HashSet<&str> =
-                    current_units.iter().map(|u| u.id.as_str()).collect();
-                let shared = compute_shared_deltas(
-                    &prev_units,
-                    &prev_cities,
-                    &current_units,
-                    &current_cities,
-                    &current_unit_ids,
-                    prev_border_grid.as_ref(),
-                    &current_border,
-                    // I2a: same runtime men step as the live path.
-                    replay_player.game.settings().recruitment_rate.max(5.0),
-                    // I2b: cold-field gate driven by the replayed tick.
-                    replay_player.game.tick_number(),
-                    // I5: replay path has no active-check consumer — build
-                    // the map the same way the live path does.
-                    count_units_by_owner(current_units.iter().map(|u| u.owner.as_str())),
-                    // I3: same packed-position quantization scale as the live
-                    // path — the replayed game's map dimensions.
-                    (
-                        replay_player.game.terrain_width(),
-                        replay_player.game.terrain_height(),
-                    ),
-                );
-                if let Some((delta, _)) = build_delta_inner(
-                    &prev_funds,
-                    prev_vision_grid.as_ref(),
-                    &all_funds,
-                    &current_vision,
-                    grid_width,
-                    "",
-                    &shared,
-                ) {
-                    // Commit the prev state only on non-idle delta
-                    prev_units = current_units
-                        .iter()
-                        .map(|u| (u.id.clone(), u.clone()))
-                        .collect();
-                    prev_cities = current_cities
-                        .iter()
-                        .map(|c| (c.id.clone(), c.clone()))
-                        .collect();
-                    prev_funds = all_funds;
-                    prev_vision_grid = current_vision;
-                    prev_border_grid = current_border;
-
-                    let encoded = encode_message(&delta);
-                    if ws_sink.send(Message::Binary(encoded)).await.is_err() {
-                        return;
-                    }
-                }
-                // Wait for next tick (game speed)
-                let interval_ms = (1000.0f64 / 60.0).ceil() as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
-            }
-
-            // Send final full state
-            let final_msg = ServerMessage::FullState(replay_player.full_state());
-            let encoded = encode_message(&final_msg);
-            let _ = ws_sink.send(Message::Binary(encoded)).await;
-        });
-    });
-}
-
 // WebSocket handler for game state
 pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     server_state: axum::extract::State<Arc<Mutex<GameServer>>>,
 ) -> impl axum::response::IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_game(socket, server_state.0))
+}
+
+/// Sec L2: route-level cap gate for the self-terminating read-only
+/// `/ws/replay` stream. Replay connections are NOT counted in
+/// `ws_connections` (they stream a recording once and close), but no new
+/// WebSocket connection of any kind is accepted while the cap is reached —
+/// so while `/ws` + `/ws/spectator` are at capacity this handler rejects
+/// with HTTP 503 (no upgrade) instead of opening yet another socket.
+pub(crate) async fn gated_replay_ws_handler(
+    ws: WebSocketUpgrade,
+    State(server_state): State<Arc<Mutex<GameServer>>>,
+    params: Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let at_capacity = {
+        let server = server_state.lock().await;
+        let cap = server.config.network.max_ws_connections.max(1);
+        server.ws_connections.load(Ordering::Relaxed) >= cap
+    };
+    if at_capacity {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Server at maximum connections — try again later",
+        )
+            .into_response();
+    }
+    crate::server::handlers::replay::replay_ws_handler(ws, State(server_state), params)
+        .await
+        .into_response()
 }
 
 /// I7: shared drain loop for a raw-TCP egress channel — resolves each
@@ -1609,6 +1739,11 @@ pub(crate) async fn tcp_egress_loop(
     ring: Arc<DeltaRing>,
 ) {
     while let Some(msg) = rx.recv().await {
+        if matches!(msg, EgressMessage::Close) {
+            // M3/W7: close requested (encode failure) — drop the writer
+            // half; the FIN ends the peer's stream.
+            break;
+        }
         let data = match egress_bytes(msg, &ring) {
             Some(data) => data,
             None => continue, // stale delta superseded by a newer ring entry
@@ -1630,6 +1765,13 @@ pub(crate) async fn ws_egress_loop<S>(
     S: futures::Sink<Message> + Unpin,
 {
     while let Some(msg) = rx.recv().await {
+        if matches!(msg, EgressMessage::Close) {
+            // M3/W7: close requested (encode failure) — send a proper WS
+            // close frame, then drop the sink (the peer's onclose fires).
+            let mut guard = sink.lock().await;
+            let _ = guard.send(Message::Close(None)).await;
+            break;
+        }
         let data = match egress_vec(msg, &ring) {
             Some(data) => data,
             None => continue, // stale delta superseded by a newer ring entry
@@ -1674,6 +1816,32 @@ pub(crate) async fn handle_tcp_client(
     // Spawn sender task
     tokio::spawn(tcp_egress_loop(writer, rx, ring));
 
+    // Sec L2: reserve a connection slot — the raw TCP game port is a
+    // second entry into the same game, so it shares the WS cap
+    // (config.network.max_ws_connections). Over-cap clients get a clear
+    // Error frame (best-effort, via the already-running egress loop) and
+    // the connection is dropped.
+    {
+        let server = server_state.lock().await;
+        let cap = server.config.network.max_ws_connections.max(1);
+        if server.ws_connections.fetch_add(1, Ordering::Relaxed) >= cap {
+            server.ws_connections.fetch_sub(1, Ordering::Relaxed);
+            // M3: encode failure here means there is nothing to send — just
+            // drop the connection (no partial frame is ever written).
+            match encode_message_result(&ServerMessage::Error {
+                message: "Server at maximum connections — try again later".to_string(),
+            }) {
+                Ok(frame) => {
+                    let _ = player_sender.send_reliable(frame.into()).await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "encode failed at TCP capacity reject — dropping connection");
+                }
+            }
+            return;
+        }
+    }
+
     // Read loop — WP3: length-prefixed frames (u32 BE + CBOR payload); the
     // first frame MUST be Hello (HANDSHAKE_TIMEOUT budget, then the idle
     // connection is dropped).
@@ -1708,9 +1876,13 @@ pub(crate) async fn handle_tcp_client(
                 let resp = ServerMessage::Error {
                     message: "Invalid message format".to_string(),
                 };
-                let _ = player_sender
-                    .send_reliable(encode_message(&resp).into())
-                    .await;
+                match encode_message_result(&resp) {
+                    Ok(frame) => {
+                        let _ = player_sender.send_reliable(frame.into()).await;
+                    }
+                    // M3: no partial frame — log and close.
+                    Err(e) => tracing::error!(error = %e, "encode failed (TCP) — closing"),
+                }
                 break;
             }
         };
@@ -1725,9 +1897,17 @@ pub(crate) async fn handle_tcp_client(
                         protocol_version,
                         features: negotiated,
                     };
-                    let _ = player_sender
-                        .send_reliable(encode_message(&ack).into())
-                        .await;
+                    match encode_message_result(&ack) {
+                        Ok(frame) => {
+                            let _ = player_sender.send_reliable(frame.into()).await;
+                        }
+                        // M3: the handshake ack could not be encoded — the
+                        // connection cannot proceed; close it.
+                        Err(e) => {
+                            tracing::error!(error = %e, "HelloAck encode failed (TCP) — closing");
+                            break;
+                        }
+                    }
                     server_state_clone
                         .lock()
                         .await
@@ -1747,30 +1927,91 @@ pub(crate) async fn handle_tcp_client(
                             "Protocol error: first message must be Hello (version {PROTOCOL_VERSION})"
                         ),
                     };
-                    let _ = player_sender
-                        .send_reliable(encode_message(&resp).into())
-                        .await;
+                    match encode_message_result(&resp) {
+                        Ok(frame) => {
+                            let _ = player_sender.send_reliable(frame.into()).await;
+                        }
+                        // M3: no partial frame — log and close.
+                        Err(e) => tracing::error!(error = %e, "encode failed (TCP) — closing"),
+                    }
                     break;
                 }
             }
             continue;
         }
-        handle_client_message(&conn_id, server_state.clone(), &msg, &player_sender).await;
+        // M3: if the server reply to a client command could not be encoded,
+        // a truncated frame would desync the peer — close the connection.
+        if let Err(e) =
+            handle_client_message(&conn_id, server_state.clone(), &msg, &player_sender).await
+        {
+            tracing::error!(error = %e, "server reply encode failed (TCP) — closing connection");
+            break;
+        }
     }
 
     // Cleanup on disconnect
-    {
+    let owned_lobby = {
         let server = server_state_clone.lock().await;
         let mut player_map = server.player_map.lock().await;
+        // M2: remember this connection's lobby before dropping the entry,
+        // so a creator's unstarted lobby can be removed below.
+        let owned = player_map.get(&conn_id).cloned();
         // Just remove the connection; the game room will handle player removal internally
         player_map.remove(&conn_id);
         server.negotiated_features.lock().await.remove(&conn_id);
+        // Sec L2: release the connection slot reserved at accept time.
+        server.ws_connections.fetch_sub(1, Ordering::Relaxed);
+        owned
+    };
+    // M2: a disconnected creator's unstarted lobby is removed immediately —
+    // without this it would retain up to ~1 MB of client-controlled custom
+    // unit types until the LOBBY_IDLE_TTL sweep.
+    if let Some((player_id, lobby_code)) = owned_lobby {
+        remove_creator_lobby_on_disconnect(&server_state_clone, &player_id, &lobby_code).await;
     }
 }
 
 // WebSocket game handler — same game logic, different transport
-pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<GameServer>>) {
+pub(crate) async fn handle_ws_game(mut socket: WebSocket, server_state: Arc<Mutex<GameServer>>) {
     let conn_id = Uuid::new_v4();
+    // Sec L2: reserve a connection slot (config.network.max_ws_connections,
+    // shared with /ws/spectator). Over-cap connections are rejected with a
+    // clear Error message + WS close code 1013 ("Try Again Later") BEFORE
+    // any per-connection task is spawned; the slot is released in the
+    // disconnect cleanup below.
+    {
+        let server = server_state.lock().await;
+        let cap = server.config.network.max_ws_connections.max(1);
+        if server.ws_connections.fetch_add(1, Ordering::Relaxed) >= cap {
+            server.ws_connections.fetch_sub(1, Ordering::Relaxed);
+            let err = match encode_message_result(&ServerMessage::Error {
+                message: "Server at maximum connections — try again later".to_string(),
+            }) {
+                Ok(e) => e,
+                Err(e) => {
+                    // M3: encode failure — nothing to send; just close.
+                    tracing::error!(error = %e, "encode failed at WS capacity reject — closing connection");
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1011,
+                            reason: "internal error".into(),
+                        })))
+                        .await;
+                    return;
+                }
+            };
+            let _ = socket.send(Message::Binary(err)).await;
+            // axum 0.7: close() takes no frame — send an explicit Close
+            // message with 1013 (Try Again Later) instead.
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1013,
+                    reason: "at capacity".into(),
+                })))
+                .await;
+            return;
+        }
+    }
     // Use a single WebSocket with shared access via channels
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(Mutex::new(ws_sink));
@@ -1821,9 +2062,17 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
                         let resp = ServerMessage::Error {
                             message: "Invalid message format".to_string(),
                         };
-                        let _ = actual_player_sender
-                            .send_reliable(encode_message(&resp).into())
-                            .await;
+                        match encode_message_result(&resp) {
+                            Ok(frame) => {
+                                let _ = actual_player_sender.send_reliable(frame.into()).await;
+                            }
+                            // M3: encode failure — a half frame is
+                            // unrecoverable for the peer; close.
+                            Err(e) => {
+                                tracing::error!(error = %e, "encode failed (WS) — closing connection");
+                                break;
+                            }
+                        }
                         // A malformed FIRST frame can't be the Hello handshake — fatal.
                         if !handshaken {
                             break;
@@ -1842,9 +2091,17 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
                                 protocol_version,
                                 features: negotiated,
                             };
-                            let _ = actual_player_sender
-                                .send_reliable(encode_message(&ack).into())
-                                .await;
+                            match encode_message_result(&ack) {
+                                Ok(frame) => {
+                                    let _ = actual_player_sender.send_reliable(frame.into()).await;
+                                }
+                                // M3: the handshake ack could not be encoded —
+                                // the connection cannot proceed; close.
+                                Err(e) => {
+                                    tracing::error!(error = %e, "HelloAck encode failed (WS) — closing connection");
+                                    break;
+                                }
+                            }
                             server_state_clone
                                 .lock()
                                 .await
@@ -1864,16 +2121,34 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
                                     "Protocol error: first message must be Hello (version {PROTOCOL_VERSION})"
                                 ),
                             };
-                            let _ = actual_player_sender
-                                .send_reliable(encode_message(&resp).into())
-                                .await;
+                            match encode_message_result(&resp) {
+                                Ok(frame) => {
+                                    let _ = actual_player_sender.send_reliable(frame.into()).await;
+                                }
+                                // M3: no partial frame — log and close.
+                                Err(e) => {
+                                    tracing::error!(error = %e, "encode failed (WS) — closing connection")
+                                }
+                            }
                             break;
                         }
                     }
                     continue;
                 }
-                handle_client_message(&conn_id, server_state.clone(), &msg, &actual_player_sender)
-                    .await;
+                // M3: if the server reply to a client command could not be
+                // encoded, a truncated frame would desync the peer — close
+                // the connection (a half frame is unrecoverable).
+                if let Err(e) = handle_client_message(
+                    &conn_id,
+                    server_state.clone(),
+                    &msg,
+                    &actual_player_sender,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "server reply encode failed (WS) — closing connection");
+                    break;
+                }
             }
             Some(Ok(Message::Close(_))) | None => break,
             Some(Ok(Message::Text(_)))
@@ -1886,11 +2161,47 @@ pub(crate) async fn handle_ws_game(socket: WebSocket, server_state: Arc<Mutex<Ga
     }
 
     // Cleanup on disconnect
-    {
+    let owned_lobby = {
         let server = server_state_clone.lock().await;
         let mut player_map = server.player_map.lock().await;
+        // M2: remember this connection's lobby before dropping the entry,
+        // so a creator's unstarted lobby can be removed below.
+        let owned = player_map.get(&conn_id).cloned();
         player_map.remove(&conn_id);
         server.negotiated_features.lock().await.remove(&conn_id);
+        // Sec L2: release the slot reserved at accept.
+        server.ws_connections.fetch_sub(1, Ordering::Relaxed);
+        owned
+    };
+    // M2: a disconnected creator's unstarted lobby is removed immediately —
+    // without this it would retain up to ~1 MB of client-controlled custom
+    // unit types until the LOBBY_IDLE_TTL sweep.
+    if let Some((player_id, lobby_code)) = owned_lobby {
+        remove_creator_lobby_on_disconnect(&server_state_clone, &player_id, &lobby_code).await;
+    }
+}
+
+/// M2: on disconnect, remove the lobby if the departing connection was its
+/// CREATOR. Only an unstarted lobby can still be present here — StartGame
+/// consumes the lobby when the game spawns — so no live game is disturbed.
+/// Lobbies the connection merely joined (as a guest) are left in place: the
+/// creator is still in charge (and the idle TTL sweep is the backstop).
+pub(crate) async fn remove_creator_lobby_on_disconnect(
+    server_state: &Arc<Mutex<GameServer>>,
+    player_id: &str,
+    lobby_code: &str,
+) {
+    let server = server_state.lock().await;
+    let mut lobby_manager = server.lobby_manager.lock().await;
+    let is_creator = lobby_manager
+        .get_lobby(lobby_code)
+        .is_some_and(|l| l.creator == player_id);
+    if is_creator {
+        lobby_manager.remove_lobby(lobby_code);
+        tracing::info!(
+            lobby_code = %lobby_code,
+            "Removed unstarted lobby: creator disconnected"
+        );
     }
 }
 
@@ -1911,6 +2222,12 @@ fn lobby_bridge_sender(player_sender: &PlayerSender) -> PlayerSender {
             let original_sender = player_sender.clone();
             tokio::spawn(async move {
                 while let Some(msg) = rx.recv().await {
+                    if matches!(msg, EgressMessage::Close) {
+                        // M3/W7: forward the close request to the real
+                        // connection (the bridge has no payload to resolve).
+                        original_sender.close();
+                        continue;
+                    }
                     let data = match egress_bytes(msg, &ring) {
                         Some(data) => data,
                         None => continue,
@@ -1928,12 +2245,15 @@ fn lobby_bridge_sender(player_sender: &PlayerSender) -> PlayerSender {
     }
 }
 
+/// M3: fallible — returns `Err` when a server reply cannot be CBOR-encoded.
+/// A truncated frame would desync the peer, so callers close the connection
+/// on `Err` (the read loops do exactly that).
 pub(crate) async fn handle_client_message(
     conn_id: &Uuid,
     server_state: Arc<Mutex<GameServer>>,
     msg: &ClientMessage,
     player_sender: &PlayerSender,
-) {
+) -> Result<(), CborEncodeError> {
     match msg {
         // WP3: Hello is only valid as the connection's FIRST message (the
         // read loops gate it before dispatch); a repeated Hello is a
@@ -1942,7 +2262,7 @@ pub(crate) async fn handle_client_message(
             let resp = ServerMessage::Error {
                 message: "Protocol error: Hello is only allowed as the first message".to_string(),
             };
-            let encoded = encode_message(&resp);
+            let encoded = encode_message_result(&resp)?;
             let _ = player_sender.send_reliable(encoded.into()).await;
         }
         ClientMessage::LobbyMessage(lobby_msg) => {
@@ -1952,6 +2272,43 @@ pub(crate) async fn handle_client_message(
                     password,
                     player_name,
                 } => {
+                    // M2: one lobby per connection — a connection that is
+                    // already in a lobby (creator or guest) cannot create
+                    // another: the player_map entry is single-valued, so a
+                    // second lobby would be unreachable from the disconnect
+                    // cleanup and leak (retaining up to ~1 MB of
+                    // client-controlled custom unit types).
+                    {
+                        let server = server_state.lock().await;
+                        let player_map = server.player_map.lock().await;
+                        if player_map.contains_key(conn_id) {
+                            let resp = ServerMessage::Error {
+                                message:
+                                    "Already in a lobby — start it or leave before creating another"
+                                        .to_string(),
+                            };
+                            let encoded = encode_message_result(&resp)?;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
+                            return Ok(());
+                        }
+                        // M2: global lobby cap (config.network.max_lobbies).
+                        // Existing lobbies are unaffected; the over-cap
+                        // creation is rejected with a clear error.
+                        let lobby_count = server.lobby_manager.lock().await.lobbies.len();
+                        if lobby_count >= server.config.network.max_lobbies {
+                            tracing::warn!(
+                                lobby_count,
+                                cap = server.config.network.max_lobbies,
+                                "CreateLobby rejected: lobby cap reached"
+                            );
+                            let resp = ServerMessage::Error {
+                                message: "Server lobby limit reached — try again later".to_string(),
+                            };
+                            let encoded = encode_message_result(&resp)?;
+                            let _ = player_sender.send_reliable(encoded.into()).await;
+                            return Ok(());
+                        }
+                    }
                     let player_id = format!("player_{}", &Uuid::new_v4().to_string()[..8]);
                     let player_name = player_name.clone().unwrap_or_else(|| "Player".to_string());
                     let code;
@@ -1980,7 +2337,7 @@ pub(crate) async fn handle_client_message(
                     let resp = ServerMessage::LobbyCreated {
                         lobby_code: code.clone(),
                     };
-                    let encoded = encode_message(&resp);
+                    let encoded = encode_message_result(&resp)?;
                     let _ = player_sender.send_reliable(encoded.into()).await;
 
                     // Broadcast LobbyUpdate so the creator sees themselves in the list
@@ -2000,7 +2357,7 @@ pub(crate) async fn handle_client_message(
                                 .collect();
                             let settings = lobby.settings.clone();
                             let update = ServerMessage::LobbyUpdate { players, settings };
-                            let update_encoded = Bytes::from(encode_message(&update));
+                            let update_encoded = Bytes::from(encode_message_result(&update)?);
                             for p in &lobby.players {
                                 let _ = p.connection.send_reliable(update_encoded.clone()).await;
                             }
@@ -2077,18 +2434,19 @@ pub(crate) async fn handle_client_message(
                             let join_resp = ServerMessage::LobbyJoined {
                                 lobby_code: lobby_code_inner.clone(),
                             };
-                            let join_encoded = encode_message(&join_resp);
+                            let join_encoded = encode_message_result(&join_resp)?;
                             let _ = player_sender.send_reliable(join_encoded.into()).await;
 
                             // Broadcast LobbyUpdate to all players in the lobby
                             let server = server_state.lock().await;
                             let lobby_manager = server.lobby_manager.lock().await;
                             if let Some(l) = lobby_manager.get_lobby(&lobby_code_inner) {
-                                let encoded =
-                                    Bytes::from(encode_message(&ServerMessage::LobbyUpdate {
+                                let encoded = Bytes::from(encode_message_result(
+                                    &ServerMessage::LobbyUpdate {
                                         players: players.clone(),
                                         settings: settings.clone(),
-                                    }));
+                                    },
+                                )?);
                                 for p in &l.players {
                                     let _ = p.connection.send_reliable(encoded.clone()).await;
                                 }
@@ -2096,7 +2454,7 @@ pub(crate) async fn handle_client_message(
                         }
                         Err(e) => {
                             let resp = ServerMessage::Error { message: e };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     }
@@ -2121,9 +2479,9 @@ pub(crate) async fn handle_client_message(
                                 message: "Only the lobby creator can configure LLM slots"
                                     .to_string(),
                             };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
-                            return;
+                            return Ok(());
                         }
                         let result = {
                             let server = server_state.lock().await;
@@ -2132,7 +2490,7 @@ pub(crate) async fn handle_client_message(
                         };
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         } else {
                             let (players, settings) = {
@@ -2153,14 +2511,14 @@ pub(crate) async fn handle_client_message(
                                 (players, settings)
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
-                        let encoded = encode_message(&resp);
+                        let encoded = encode_message_result(&resp)?;
                         let _ = player_sender.send_reliable(encoded.into()).await;
                     }
                 }
@@ -2184,9 +2542,9 @@ pub(crate) async fn handle_client_message(
                                 message: "Only the lobby creator can configure LLM slots"
                                     .to_string(),
                             };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
-                            return;
+                            return Ok(());
                         }
 
                         // The wire message carries only { slot, model }. Resolve the
@@ -2223,7 +2581,7 @@ pub(crate) async fn handle_client_message(
                         };
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         } else {
                             // Also update the player's llm_provider for display (idempotent
@@ -2258,14 +2616,14 @@ pub(crate) async fn handle_client_message(
                                 (players, settings)
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
-                        let encoded = encode_message(&resp);
+                        let encoded = encode_message_result(&resp)?;
                         let _ = player_sender.send_reliable(encoded.into()).await;
                     }
                 }
@@ -2289,9 +2647,9 @@ pub(crate) async fn handle_client_message(
                                 message: "Only the lobby creator can configure LLM slots"
                                     .to_string(),
                             };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
-                            return;
+                            return Ok(());
                         }
                         let result = {
                             let server = server_state.lock().await;
@@ -2304,7 +2662,7 @@ pub(crate) async fn handle_client_message(
                         };
                         if let Err(e) = result {
                             let resp = ServerMessage::Error { message: e };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         } else {
                             // Broadcast LobbyUpdate
@@ -2326,14 +2684,14 @@ pub(crate) async fn handle_client_message(
                                 (players, settings)
                             };
                             let resp = ServerMessage::LobbyUpdate { players, settings };
-                            let encoded = encode_message(&resp);
+                            let encoded = encode_message_result(&resp)?;
                             let _ = player_sender.send_reliable(encoded.into()).await;
                         }
                     } else {
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
-                        let encoded = encode_message(&resp);
+                        let encoded = encode_message_result(&resp)?;
                         let _ = player_sender.send_reliable(encoded.into()).await;
                     }
                 }
@@ -2348,15 +2706,15 @@ pub(crate) async fn handle_client_message(
                         let resp = ServerMessage::Error {
                             message: "Not in a lobby".to_string(),
                         };
-                        let encoded = encode_message(&resp);
+                        let encoded = encode_message_result(&resp)?;
                         let _ = player_sender.send_reliable(encoded.into()).await;
-                        return;
+                        return Ok(());
                     };
                     let is_creator = {
                         let server = server_state.lock().await;
                         let player_map = server.player_map.lock().await;
                         let Some((player_id, _)) = player_map.get(conn_id) else {
-                            return;
+                            return Ok(());
                         };
                         let lobby_manager = server.lobby_manager.lock().await;
                         lobby_manager
@@ -2368,9 +2726,9 @@ pub(crate) async fn handle_client_message(
                         let resp = ServerMessage::Error {
                             message: "Only the lobby creator can start the game".to_string(),
                         };
-                        let encoded = encode_message(&resp);
+                        let encoded = encode_message_result(&resp)?;
                         let _ = player_sender.send_reliable(encoded.into()).await;
-                        return;
+                        return Ok(());
                     }
 
                     let (
@@ -2392,19 +2750,26 @@ pub(crate) async fn handle_client_message(
                                 let resp = ServerMessage::Error {
                                     message: "Lobby not found".to_string(),
                                 };
-                                let encoded = encode_message(&resp);
+                                let encoded = encode_message_result(&resp)?;
                                 let _ = player_sender.send_reliable(encoded.into()).await;
-                                return;
+                                return Ok(());
                             }
                         };
                         if !lobby.players.is_empty() {
-                            // G-3: Validate custom ruleset settings
-                            if !lobby.settings.use_standard_ruleset {
+                            // G-3: Validate custom ruleset settings. Custom-ruleset lobbies
+                            // (use_standard_ruleset == false) are validated in full (lobby-level
+                            // fields + unit types). A standard-ruleset lobby is validated too
+                            // when the client still sent custom_unit_types: those types are
+                            // honored once the server's standard ruleset is disabled, so
+                            // validating them "when present" closes the flag-bypass (item 7a).
+                            if !lobby.settings.use_standard_ruleset
+                                || !lobby.settings.custom_unit_types.is_empty()
+                            {
                                 if let Some(err) = validate_custom_settings(&lobby.settings) {
                                     let resp = ServerMessage::Error { message: err };
-                                    let encoded = encode_message(&resp);
+                                    let encoded = encode_message_result(&resp)?;
                                     let _ = player_sender.send_reliable(encoded.into()).await;
-                                    return;
+                                    return Ok(());
                                 }
                             }
 
@@ -2541,7 +2906,7 @@ pub(crate) async fn handle_client_message(
                                 spectator_vision,
                             )
                         } else {
-                            return;
+                            return Ok(());
                         }
                     };
                     // Guard: don't start a second game for a lobby that already has
@@ -2556,9 +2921,9 @@ pub(crate) async fn handle_client_message(
                         let resp = ServerMessage::Error {
                             message: "A game is already running for this lobby".to_string(),
                         };
-                        let encoded = encode_message(&resp);
+                        let encoded = encode_message_result(&resp)?;
                         let _ = player_sender.send_reliable(encoded.into()).await;
-                        return;
+                        return Ok(());
                     }
                     // Spawn the game with human and LLM players
                     let server_state_inner = server_state.clone();
@@ -2576,7 +2941,7 @@ pub(crate) async fn handle_client_message(
                             Ok(d) => d,
                             Err(e) => {
                                 tracing::error!(%e, "Failed to acquire DB lock for player_names");
-                                return;
+                                return Ok(());
                             }
                         };
                         // Update human player names (parameterized — no SQL injection)
@@ -2636,6 +3001,7 @@ pub(crate) async fn handle_client_message(
                     }
                     let lobby_code_clone = lobby_code.clone();
                     let map_clone = map;
+                    let map_name_clone = settings.map.clone();
                     let game_settings_clone = game_settings;
                     let human_players_clone = human_players;
                     let llm_configs_clone = llm_configs;
@@ -2645,6 +3011,7 @@ pub(crate) async fn handle_client_message(
                         let room = GameRoom::new(
                             lobby_code_clone.clone(),
                             map_clone,
+                            map_name_clone,
                             game_settings_clone,
                             human_players_clone,
                             llm_configs_clone,
@@ -2657,11 +3024,25 @@ pub(crate) async fn handle_client_message(
                         let room_arc = Arc::new(Mutex::new(room));
                         games.insert(lobby_code_clone, room_arc);
                     });
-                    // Update player map for this connection
+                    // Remap every lobby member's player_map entry to the in-game
+                    // slot IDs minted above: slot i == lobby.players[i] =>
+                    // "player_{i}" (identical ordering to the mint loop). Each
+                    // connection keeps its room code; a member whose connection
+                    // is gone has no entry and is skipped. Previously only the
+                    // starter was remapped to "player_0", so players 2..N kept
+                    // their lobby-era IDs and the engine's ownership gate
+                    // silently dropped every command they sent.
                     {
                         let server = server_state.lock().await;
                         let mut player_map = server.player_map.lock().await;
-                        player_map.insert(*conn_id, ("player_0".to_string(), lobby_code.clone()));
+                        for entry in player_map.values_mut() {
+                            if let Some(slot) =
+                                lobby_players.iter().position(|(id, _)| id == &entry.0)
+                            {
+                                entry.0 = format!("player_{}", slot);
+                                entry.1 = lobby_code.clone();
+                            }
+                        }
                     }
                     // Capture the lobby's player connections and build the all-players
                     // list BEFORE removing the lobby, so the broadcast below has targets
@@ -2695,12 +3076,12 @@ pub(crate) async fn handle_client_message(
                     };
                     // Broadcast ClearSpectator then LobbyUpdate
                     let clear_resp = ServerMessage::ClearSpectator;
-                    let clear_encoded = Bytes::from(encode_message(&clear_resp));
+                    let clear_encoded = Bytes::from(encode_message_result(&clear_resp)?);
                     let lobby_update_resp = ServerMessage::LobbyUpdate {
                         players: all_players.clone(),
                         settings: settings.clone(),
                     };
-                    let lobby_encoded = Bytes::from(encode_message(&lobby_update_resp));
+                    let lobby_encoded = Bytes::from(encode_message_result(&lobby_update_resp)?);
                     for sender in &lobby_player_senders {
                         let _ = sender.send_reliable(clear_encoded.clone()).await;
                         let _ = sender.send_reliable(lobby_encoded.clone()).await;
@@ -2875,14 +3256,14 @@ pub(crate) async fn handle_client_message(
                 })
                 .collect();
             let resp = ServerMessage::Leaderboard { entries };
-            let encoded = encode_message(&resp);
+            let encoded = encode_message_result(&resp)?;
             let _ = player_sender.send_reliable(encoded.into()).await;
         }
         ClientMessage::EmbarkUnit { unit_id } => {
             let server = server_state.lock().await;
             let (player_id, room_id) = match server.player_map.lock().await.get(conn_id).cloned() {
                 Some(entry) => entry,
-                None => return,
+                None => return Ok(()),
             };
             let room_arc = server.games.lock().await.get(&room_id).cloned();
             drop(server);
@@ -2897,7 +3278,7 @@ pub(crate) async fn handle_client_message(
             let server = server_state.lock().await;
             let (player_id, room_id) = match server.player_map.lock().await.get(conn_id).cloned() {
                 Some(entry) => entry,
-                None => return,
+                None => return Ok(()),
             };
             let room_arc = server.games.lock().await.get(&room_id).cloned();
             drop(server);
@@ -2909,6 +3290,7 @@ pub(crate) async fn handle_client_message(
             }
         }
     }
+    Ok(())
 }
 
 /// Parse equipment string like "rifles:100:0.5" into an Equipment struct
@@ -3043,8 +3425,85 @@ fn validate_custom_settings(settings: &LobbySettings) -> Option<String> {
     if settings.recruitment_rate < 0.0 || settings.recruitment_rate > 100.0 {
         return Some("recruitment_rate must be in range 0-100".into());
     }
-    if settings.water_speed < 0.1 || settings.water_speed > 10.0 {
-        return Some("water_speed must be in range 0.1-10.0".into());
+    // NaN fails both range comparisons, so finiteness is checked explicitly.
+    if !settings.water_speed.is_finite()
+        || settings.water_speed < 0.1
+        || settings.water_speed > 10.0
+    {
+        return Some("water_speed must be finite and in range 0.1-10.0".into());
+    }
+    // Validate custom unit types (fully client-controlled). Degenerate types
+    // are game-breaking or DoS vectors: speed 0 yields 0/0 = NaN on the first
+    // movement tick, and men 0 / recruitment_cost 0 yields an unbounded free
+    // army. `men` is capped because it is the army-size field.
+    for (i, ut) in settings.custom_unit_types.iter().enumerate() {
+        if ut.men == 0 {
+            return Some(format!(
+                "custom unit type {i} ({}): men must be >= 1",
+                ut.name
+            ));
+        }
+        if ut.men > 100_000 {
+            return Some(format!(
+                "custom unit type {i} ({}): men must be <= 100000",
+                ut.name
+            ));
+        }
+        if ut.recruitment_cost == 0 {
+            return Some(format!(
+                "custom unit type {i} ({}): recruitment_cost must be > 0",
+                ut.name
+            ));
+        }
+        if !ut.speed.is_finite() || ut.speed <= 0.0 {
+            return Some(format!(
+                "custom unit type {i} ({}): speed must be finite and > 0",
+                ut.name
+            ));
+        }
+        if ut.speed > 100.0 {
+            return Some(format!(
+                "custom unit type {i} ({}): speed must be <= 100",
+                ut.name
+            ));
+        }
+        // Item 7b: finiteness + sane bounds for the remaining client floats.
+        // NaN/inf here would poison combat resolution and organisation/regen
+        // math for the entire game (a single NaN unit corrupts every future
+        // battle it fights). Negative combat stats and a non-positive
+        // max_organisation are degenerate; the 1e6 cap keeps squared combat
+        // products far below f32 overflow.
+        for (label, value) in [
+            ("soft_attack", ut.soft_attack),
+            ("soft_defense", ut.soft_defense),
+            ("hard_attack", ut.hard_attack),
+            ("hard_defense", ut.hard_defense),
+        ] {
+            if !value.is_finite() || !(0.0..=1_000_000.0).contains(&value) {
+                return Some(format!(
+                    "custom unit type {i} ({}): {label} must be finite and in range 0-1000000",
+                    ut.name
+                ));
+            }
+        }
+        if !ut.max_organisation.is_finite()
+            || ut.max_organisation <= 0.0
+            || ut.max_organisation > 1_000_000.0
+        {
+            return Some(format!(
+                "custom unit type {i} ({}): max_organisation must be finite and in range (0, 1000000]",
+                ut.name
+            ));
+        }
+        if !ut.reinforcement_rate.is_finite()
+            || ut.reinforcement_rate < 0.0
+            || ut.reinforcement_rate > 1_000_000.0
+        {
+            return Some(format!(
+                "custom unit type {i} ({}): reinforcement_rate must be finite and in range 0-1000000",
+                ut.name
+            ));
+        }
     }
     // Validate city upgrade settings
     let cs = &settings.city_upgrade_settings;
@@ -3055,6 +3514,284 @@ fn validate_custom_settings(settings: &LobbySettings) -> Option<String> {
         return Some("base_upgrade_cost must be <= 100000".into());
     }
     None
+}
+
+#[cfg(test)]
+mod validate_custom_settings_tests {
+    use super::validate_custom_settings;
+    use crate::config::CityUpgradeSettings;
+    use crate::server::protocol::{CustomUnitType, LobbySettings};
+
+    /// Baseline custom ruleset that passes every lobby-level check, so each
+    /// test can isolate one unit-type (or water_speed) violation.
+    fn base_settings() -> LobbySettings {
+        // The type default (max_level 100) would itself trip the <= 50 rule,
+        // so override it inline.
+        let city = CityUpgradeSettings {
+            max_level: 10,
+            ..CityUpgradeSettings::default()
+        };
+        LobbySettings {
+            map: "default".to_string(),
+            starting_funds: 1000,
+            initial_manpower: 10_000,
+            funds_per_city: 1.0,
+            game_speed: 1.0,
+            use_standard_ruleset: false,
+            llm_thinking_delay: 3.0,
+            max_players: 4,
+            custom_unit_types: vec![],
+            spectator_vision: false,
+            recruitment_rate: 10.0,
+            water_speed: 1.2,
+            city_upgrade_settings: city,
+        }
+    }
+
+    fn unit_type(speed: f32, men: u32, recruitment_cost: u32) -> CustomUnitType {
+        CustomUnitType {
+            name: "infantry".to_string(),
+            symbol: "I".to_string(),
+            men,
+            equipment: vec![],
+            soft_attack: 5.0,
+            soft_defense: 5.0,
+            hard_attack: 3.0,
+            hard_defense: 2.0,
+            speed,
+            max_organisation: 100.0,
+            reinforcement_rate: 1.0,
+            recruitment_cost,
+        }
+    }
+
+    #[test]
+    fn valid_custom_unit_type_passes() {
+        let mut s = base_settings();
+        s.custom_unit_types = vec![unit_type(1.0, 1000, 20)];
+        assert_eq!(validate_custom_settings(&s), None);
+    }
+
+    #[test]
+    fn zero_or_non_finite_speed_is_rejected() {
+        for speed in [0.0, f32::NAN, f32::INFINITY] {
+            let mut s = base_settings();
+            s.custom_unit_types = vec![unit_type(speed, 1000, 20)];
+            let err = validate_custom_settings(&s)
+                .unwrap_or_else(|| panic!("speed {speed} must be rejected"));
+            assert!(err.contains("speed"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn zero_men_is_rejected() {
+        let mut s = base_settings();
+        s.custom_unit_types = vec![unit_type(1.0, 0, 20)];
+        let err = validate_custom_settings(&s).expect("men 0 must be rejected");
+        assert!(err.contains("men"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn oversized_men_is_rejected() {
+        let mut s = base_settings();
+        s.custom_unit_types = vec![unit_type(1.0, 100_001, 20)];
+        let err = validate_custom_settings(&s).expect("men > 100000 must be rejected");
+        assert!(err.contains("men"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn free_recruitment_is_rejected() {
+        // The reported DoS: recruitment_cost 0 + men 0 (unbounded free army).
+        // Both degenerate fields are rejected individually.
+        let mut s = base_settings();
+        s.custom_unit_types = vec![unit_type(1.0, 0, 0)];
+        let err = validate_custom_settings(&s).expect("men 0 + cost 0 must be rejected");
+        assert!(err.contains("men"), "unexpected error: {err}");
+
+        s.custom_unit_types = vec![unit_type(1.0, 1000, 0)];
+        let err = validate_custom_settings(&s).expect("cost 0 with men > 0 must be rejected");
+        assert!(err.contains("recruitment_cost"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn nan_water_speed_is_rejected() {
+        let mut s = base_settings();
+        s.water_speed = f32::NAN; // NaN passes a bare range check
+        let err = validate_custom_settings(&s).expect("NaN water_speed must be rejected");
+        assert!(err.contains("water_speed"), "unexpected error: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Item 7b: finiteness/bounds for the combat + regen floats
+    // ------------------------------------------------------------------
+
+    fn unit_type_f(
+        soft_attack: f32,
+        soft_defense: f32,
+        hard_attack: f32,
+        hard_defense: f32,
+        max_organisation: f32,
+        reinforcement_rate: f32,
+    ) -> CustomUnitType {
+        CustomUnitType {
+            name: "infantry".to_string(),
+            symbol: "I".to_string(),
+            men: 1000,
+            equipment: vec![],
+            soft_attack,
+            soft_defense,
+            hard_attack,
+            hard_defense,
+            speed: 1.0,
+            max_organisation,
+            reinforcement_rate,
+            recruitment_cost: 20,
+        }
+    }
+
+    #[test]
+    fn nan_combat_stats_are_rejected() {
+        // A single NaN unit would poison every future battle it fights.
+        for (label, ut) in [
+            (
+                "soft_attack",
+                unit_type_f(f32::NAN, 5.0, 3.0, 2.0, 100.0, 1.0),
+            ),
+            (
+                "soft_defense",
+                unit_type_f(5.0, f32::NAN, 3.0, 2.0, 100.0, 1.0),
+            ),
+            (
+                "hard_attack",
+                unit_type_f(5.0, 5.0, f32::NAN, 2.0, 100.0, 1.0),
+            ),
+            (
+                "hard_defense",
+                unit_type_f(5.0, 5.0, 3.0, f32::NAN, 100.0, 1.0),
+            ),
+        ] {
+            let mut s = base_settings();
+            s.custom_unit_types = vec![ut];
+            let Some(err) = validate_custom_settings(&s) else {
+                panic!("NaN {label} must be rejected");
+            };
+            assert!(err.contains(label), "unexpected error for {label}: {err}");
+        }
+    }
+
+    #[test]
+    fn inf_combat_stats_are_rejected() {
+        for (label, ut) in [
+            (
+                "soft_attack",
+                unit_type_f(f32::INFINITY, 5.0, 3.0, 2.0, 100.0, 1.0),
+            ),
+            (
+                "hard_defense",
+                unit_type_f(5.0, 5.0, 3.0, f32::INFINITY, 100.0, 1.0),
+            ),
+        ] {
+            let mut s = base_settings();
+            s.custom_unit_types = vec![ut];
+            let Some(err) = validate_custom_settings(&s) else {
+                panic!("inf {label} must be rejected");
+            };
+            assert!(err.contains(label), "unexpected error for {label}: {err}");
+        }
+    }
+
+    #[test]
+    fn negative_combat_stats_are_rejected() {
+        for (label, ut) in [
+            ("soft_attack", unit_type_f(-1.0, 5.0, 3.0, 2.0, 100.0, 1.0)),
+            ("soft_defense", unit_type_f(5.0, -1.0, 3.0, 2.0, 100.0, 1.0)),
+            ("hard_attack", unit_type_f(5.0, 5.0, -1.0, 2.0, 100.0, 1.0)),
+            ("hard_defense", unit_type_f(5.0, 5.0, 3.0, -1.0, 100.0, 1.0)),
+        ] {
+            let mut s = base_settings();
+            s.custom_unit_types = vec![ut];
+            let Some(err) = validate_custom_settings(&s) else {
+                panic!("negative {label} must be rejected");
+            };
+            assert!(err.contains(label), "unexpected error for {label}: {err}");
+        }
+    }
+
+    #[test]
+    fn degenerate_organisation_and_regen_are_rejected() {
+        // max_organisation <= 0: a unit with no organisation bar (broken HP).
+        // NaN/inf regen: organisation math corruption / unbounded healing.
+        let cases = [
+            (
+                "max_organisation zero",
+                unit_type_f(5.0, 5.0, 3.0, 2.0, 0.0, 1.0),
+            ),
+            (
+                "max_organisation NaN",
+                unit_type_f(5.0, 5.0, 3.0, 2.0, f32::NAN, 1.0),
+            ),
+            (
+                "reinforcement_rate negative",
+                unit_type_f(5.0, 5.0, 3.0, 2.0, 100.0, -1.0),
+            ),
+            (
+                "reinforcement_rate NaN",
+                unit_type_f(5.0, 5.0, 3.0, 2.0, 100.0, f32::NAN),
+            ),
+            (
+                "soft_attack over cap",
+                unit_type_f(1_000_001.0, 5.0, 3.0, 2.0, 100.0, 1.0),
+            ),
+        ];
+        for (label, ut) in cases {
+            let mut s = base_settings();
+            s.custom_unit_types = vec![ut];
+            assert!(
+                validate_custom_settings(&s).is_some(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_bounded_combat_stats_pass() {
+        // Boundary values the validator must ACCEPT (no over-rejection):
+        // zero is legal for combat stats and regen, the 1e6 caps are
+        // inclusive.
+        let mut s = base_settings();
+        s.custom_unit_types = vec![unit_type_f(
+            0.0,         // soft_attack
+            0.0,         // soft_defense
+            0.0,         // hard_attack
+            0.0,         // hard_defense
+            1_000_000.0, // max_organisation (inclusive upper bound)
+            0.0,         // reinforcement_rate
+        )];
+        assert_eq!(validate_custom_settings(&s), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Item 7a: the validator is flag-agnostic — custom types are validated
+    // when PRESENT, even with use_standard_ruleset = true. The StartGame
+    // call site relies on exactly this: it invokes validation whenever
+    // custom_unit_types is non-empty, regardless of the flag.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn custom_types_validated_even_with_standard_flag() {
+        let mut s = base_settings();
+        s.use_standard_ruleset = true; // the bypass the call site now closes
+        s.custom_unit_types = vec![unit_type(0.0, 1000, 20)]; // speed 0 = NaN on move
+        let err = validate_custom_settings(&s)
+            .expect("custom types must be validated even with the standard flag");
+        assert!(err.contains("speed"), "unexpected error: {err}");
+
+        // And a well-formed custom type with the flag set still passes.
+        let mut s = base_settings();
+        s.use_standard_ruleset = true;
+        s.custom_unit_types = vec![unit_type(1.0, 1000, 20)];
+        assert_eq!(validate_custom_settings(&s), None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3709,8 +4446,8 @@ mod wp3_handshake_tests {
     use crate::config::Config;
     use crate::server::framing::{read_frame, write_frame};
     use crate::server::protocol::{
-        ClientMessage, LobbyMessage, LobbySettings, ServerMessage, F_AOI, F_COMPACT_ENTITIES,
-        F_GRID_RLE, PROTOCOL_VERSION,
+        ClientMessage, GameDeltaMessage, GameStateMessage, LobbyMessage, LobbySettings,
+        PlayerState, ServerMessage, F_AOI, F_COMPACT_ENTITIES, F_GRID_RLE, PROTOCOL_VERSION,
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3797,6 +4534,9 @@ replay_path = "{replay}"
     /// negotiated (ANDed) set, then normal lobby traffic flows.
     #[tokio::test]
     async fn tcp_handshake_hello_then_lobby_created() {
+        // The server encodes a HelloAck during this handshake: serialize with
+        // the encode-fault tests (their fault switch is process-global).
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
         let server = make_server().await;
         let (mut client, handle) = spawn_tcp_server(server.clone()).await;
 
@@ -3875,6 +4615,7 @@ replay_path = "{replay}"
     /// every join failed with "Lobby full". create_lobby normalizes 0 → 4.
     #[tokio::test]
     async fn tcp_standard_lobby_omitting_max_players_is_joinable() {
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
         let server = make_server().await;
         let (mut host, host_handle) = spawn_tcp_server(server.clone()).await;
 
@@ -4101,6 +4842,7 @@ replay_path = "{replay}"
     /// exact path the browser client takes.
     #[tokio::test]
     async fn ws_handshake_hello_then_lobby_created() {
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
         let server = make_server().await;
         let state = server.clone();
         let app = axum::Router::new().route(
@@ -4250,5 +4992,1185 @@ replay_path = "{replay}"
             b, "hi nodot",
             "`:name` route must match — this matchit version does NOT support `{{name}}`"
         );
+    }
+
+    /// Regression guard: the replay LIST page (`/replay`) must be served by
+    /// the SPA index handler. Before the explicit `/replay` route existed,
+    /// the request fell through to the static-file fallback and 404'd on
+    /// the real server — which is why the list-UI replay path was dead even
+    /// though the embedded e2e static server happened to serve it. Both
+    /// slash variants must work (main.ts routes on either).
+    #[tokio::test]
+    async fn replay_page_served_at_replay_route() {
+        let server = make_server().await;
+        let app = GameServer::build_router(server);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        for path in ["/replay", "/replay/"] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .send()
+                .await
+                .expect("request replay page");
+            assert_eq!(resp.status(), 200, "{path} must serve the SPA page");
+            let body = resp.text().await.expect("body");
+            assert!(
+                body.contains("<!DOCTYPE html>") || body.contains("<html"),
+                "{path} must return index.html (SPA), got: {body:.80}"
+            );
+        }
+    }
+
+    /// `/replays/:name` must refuse traversal-style names (404, no file
+    /// read) and serve an existing recording verbatim.
+    #[tokio::test]
+    async fn serve_replay_guard_and_roundtrip() {
+        let server = make_server().await;
+
+        // Seed a recording the way the game loop writes it, plus the
+        // game_metadata row both replay endpoints resolve through.
+        let (file_name, stored_path) = {
+            let server = server.lock().await;
+            let dir = server.config.storage.replay_path.clone();
+            let dir_path = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir_path).unwrap();
+            let file_name = "roundtrip-game.jsonl".to_string();
+            let body = "line-one\nline-two\n";
+            std::fs::write(dir_path.join(&file_name), body).unwrap();
+            let file_path = dir_path.join(&file_name);
+            let stored_path = file_path.display().to_string();
+            let db = server.storage.db.lock().unwrap();
+            let params: Vec<sqlite::Value> = vec![
+                sqlite::Value::String("roundtrip-game".to_string()),
+                sqlite::Value::String(String::new()),
+                sqlite::Value::String("[]".to_string()),
+                sqlite::Value::Integer(1_000),
+                sqlite::Value::Integer(1_100),
+                sqlite::Value::String(String::new()),
+                sqlite::Value::String(stored_path.clone()),
+            ];
+            let mut ins = db
+                .prepare(
+                    "INSERT OR IGNORE INTO game_metadata (id, settings, players, start_time, end_time, winner, replay_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .expect("metadata prepare");
+            ins.bind(params.as_slice()).expect("metadata bind");
+            ins.next().expect("metadata insert");
+            (file_name, stored_path)
+        };
+
+        let app = GameServer::build_router(server);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        // The recording is served verbatim.
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/replays/{file_name}"))
+            .send()
+            .await
+            .expect("request recording");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.expect("body"), "line-one\nline-two\n");
+        // Traversal / bad names are refused with 404 (nothing read).
+        for bad in ["a..b.jsonl", "nope.jsonl", "nope"] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}/replays/{bad}"))
+                .send()
+                .await
+                .expect("request bad name");
+            assert_eq!(resp.status(), 404, "`{bad}` must be refused");
+        }
+        let _ = stored_path;
+    }
+
+    /// End-to-end `/ws/replay` contract: the server streams the RECORDED
+    /// JSONL re-wrapped as binary CBOR `ServerMessage` frames — `FullState`
+    /// first (from the `full_state` line), one `DeltaState` per `delta`
+    /// line — then closes. This is exactly what the frontend's
+    /// `connectReplayGame` (read-only `Connection`) consumes.
+    #[tokio::test]
+    async fn replay_ws_streams_recorded_frames() {
+        let server = make_server().await;
+
+        // Seed a 2-event recording with real wire payloads.
+        {
+            let full = GameStateMessage {
+                vision_grid: None,
+                border_grid: None,
+                terrain: vec![vec!["grass".to_string(); 4]; 4],
+                units: Vec::new(),
+                cities: Vec::new(),
+                player: PlayerState {
+                    funds: 100,
+                    units_owned: 1,
+                    player_id: "player_0".to_string(),
+                },
+            };
+            let delta = GameDeltaMessage {
+                vision_grid_diff: None,
+                vision_cells_changed: None,
+                border_grid_diff: None,
+                border_cells_changed: None,
+                grid_width: None,
+                units_added: Arc::new(Vec::new()),
+                units_removed: Arc::new(Vec::new()),
+                unit_updates: Arc::new(Vec::new()),
+                city_updates: Arc::new(Vec::new()),
+                player: PlayerState {
+                    funds: 90,
+                    units_owned: 1,
+                    player_id: "player_0".to_string(),
+                },
+            };
+            let server = server.lock().await;
+            let dir = server.config.storage.replay_path.clone();
+            let dir_path = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir_path).unwrap();
+            let file_path = dir_path.join("replay-e2e.jsonl");
+            let mut jsonl = String::new();
+            jsonl.push_str(&format!(
+                "{{\"full_state\":{}}}\n",
+                serde_json::to_string(&full).unwrap()
+            ));
+            jsonl.push_str(&format!(
+                "{{\"delta\":{}}}\n",
+                serde_json::to_string(&delta).unwrap()
+            ));
+            jsonl.push_str("{\"event\":\"game_end\",\"time\":1}\n");
+            std::fs::write(&file_path, jsonl).unwrap();
+
+            let db = server.storage.db.lock().unwrap();
+            let params: Vec<sqlite::Value> = vec![
+                sqlite::Value::String("replay-e2e".to_string()),
+                sqlite::Value::String(String::new()),
+                sqlite::Value::String("[]".to_string()),
+                sqlite::Value::Integer(1_000),
+                sqlite::Value::Integer(1_100),
+                sqlite::Value::String(String::new()),
+                sqlite::Value::String(file_path.display().to_string()),
+            ];
+            let mut ins = db
+                .prepare(
+                    "INSERT OR IGNORE INTO game_metadata (id, settings, players, start_time, end_time, winner, replay_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .expect("metadata prepare");
+            ins.bind(params.as_slice()).expect("metadata bind");
+            ins.next().expect("metadata insert");
+        }
+
+        let app = GameServer::build_router(server);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /ws/replay?game_id=replay-e2e HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\
+                  \r\n",
+            )
+            .await
+            .unwrap();
+        // Consume the 101 upgrade response headers.
+        let mut raw = Vec::new();
+        loop {
+            if let Some(pos) = super::i7_egress_tests::find(&raw, b"\r\n\r\n") {
+                raw.drain(..=pos + 3);
+                break;
+            }
+            let mut buf = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("101 within 5s")
+                .expect("socket open");
+            if n == 0 {
+                panic!("no 101 upgrade response");
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+
+        // Frame 1: FullState, from the recorded full_state line.
+        let payload = read_ws_until(&mut client, &mut raw)
+            .await
+            .expect("FullState frame");
+        let msg: ServerMessage = ciborium::from_reader(&payload[..]).expect("valid cbor");
+        match msg {
+            ServerMessage::FullState(state) => {
+                assert_eq!(
+                    state.player.funds, 100,
+                    "full_state line must map to FullState"
+                );
+                assert_eq!(state.terrain.len(), 4, "terrain comes from the recording");
+            }
+            other => panic!("expected FullState first, got {other:?}"),
+        }
+
+        // Frame 2: DeltaState, from the recorded delta line.
+        let payload = read_ws_until(&mut client, &mut raw)
+            .await
+            .expect("DeltaState frame");
+        let msg: ServerMessage = ciborium::from_reader(&payload[..]).expect("valid cbor");
+        match msg {
+            ServerMessage::DeltaState(d) => {
+                assert_eq!(d.player.funds, 90, "delta line must map to DeltaState");
+            }
+            other => panic!("expected DeltaState second, got {other:?}"),
+        }
+
+        // Then the stream closes (the game_end marker ends it) — no further
+        // data frames; control frames (e.g. close) are tolerated.
+        let mut buffered = raw;
+        loop {
+            if let Some((consumed, payload)) = take_ws_frame(&buffered) {
+                buffered.drain(..consumed);
+                if !payload.is_empty() {
+                    panic!("unexpected data frame after game_end: {payload:02x?}");
+                }
+                continue;
+            }
+            let mut buf = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("EOF within 5s")
+                .expect("socket read");
+            if n == 0 {
+                break; // server closed after the marker
+            }
+            buffered.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// `/ws/replay` with a malformed `game_id` must not touch the
+    /// filesystem: a single binary `Error` frame, then close.
+    #[tokio::test]
+    async fn replay_ws_rejects_bad_game_id() {
+        let server = make_server().await;
+        let app = GameServer::build_router(server);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /ws/replay?game_id=..%2F..%2Fetc%2Fpasswd HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\
+                  \r\n",
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        loop {
+            if let Some(pos) = super::i7_egress_tests::find(&raw, b"\r\n\r\n") {
+                raw.drain(..=pos + 3);
+                break;
+            }
+            let mut buf = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("101 within 5s")
+                .expect("socket open");
+            if n == 0 {
+                panic!("no 101 upgrade response");
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+
+        let payload = read_ws_until(&mut client, &mut raw)
+            .await
+            .expect("Error frame");
+        let msg: ServerMessage = ciborium::from_reader(&payload[..]).expect("valid cbor");
+        match msg {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("game_id") || message.contains("Invalid"),
+                    "expected a game_id rejection, got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ── M2: unbounded lobby creation (cap / double-creation / creator-disconnect) ──
+
+    /// make_server variant with an explicit `max_lobbies` cap.
+    async fn make_server_with_lobby_cap(cap: usize) -> Arc<Mutex<GameServer>> {
+        let dir = std::env::temp_dir().join(format!("wod-m2-{}", Uuid::new_v4()));
+        let toml_str = format!(
+            r#"
+[llm]
+
+[standard_ruleset]
+enabled = true
+unit_types = []
+
+[storage]
+database_path = "{db}"
+replay_path = "{replay}"
+
+[network]
+max_lobbies = {cap}
+"#,
+            db = dir.join("db.sqlite").display(),
+            replay = dir.join("replays").display(),
+        );
+        let cfg: Config = toml::from_str::<Config>(&toml_str).unwrap().resolve();
+        Arc::new(Mutex::new(GameServer::new(cfg, 0).await.unwrap()))
+    }
+
+    /// M2a: a connection that already owns (or joined) a lobby cannot create
+    /// a second one — the single-valued player_map entry would make the
+    /// second lobby unreachable from the disconnect cleanup (a leak retaining
+    /// up to ~1 MB of client-controlled custom unit types).
+    #[tokio::test]
+    async fn second_lobby_creation_from_same_connection_is_rejected() {
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
+        let server = make_server().await;
+        let (mut client, handle) = spawn_tcp_server(server.clone()).await;
+
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        write_frame(&mut client, &cbor_bytes(&hello)).await.unwrap();
+        read_until_match(&mut client, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("M2Test".to_string()),
+        });
+        write_frame(&mut client, &cbor_bytes(&create))
+            .await
+            .unwrap();
+        let created = read_until_match(&mut client, |m| {
+            matches!(m, ServerMessage::LobbyCreated { .. })
+        })
+        .await;
+        let code = match created {
+            ServerMessage::LobbyCreated { lobby_code } => lobby_code,
+            other => panic!("expected LobbyCreated, got {other:?}"),
+        };
+        assert!(!code.is_empty());
+
+        // Second creation from the same connection → clear Error, and no
+        // second lobby appears on the server.
+        write_frame(&mut client, &cbor_bytes(&create))
+            .await
+            .unwrap();
+        let err = read_until_match(&mut client, |m| matches!(m, ServerMessage::Error { .. })).await;
+        match err {
+            ServerMessage::Error { message } => assert!(
+                message.contains("Already in a lobby"),
+                "unexpected error: {message}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let lobby_count = server.lock().await.lobby_manager.lock().await.lobbies.len();
+        assert_eq!(lobby_count, 1, "double creation must not add a lobby");
+        assert!(
+            server
+                .lock()
+                .await
+                .lobby_manager
+                .lock()
+                .await
+                .get_lobby(&code)
+                .is_some(),
+            "the original lobby must survive the rejected double creation"
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// M2b: total lobbies are capped (`config.network.max_lobbies`).
+    /// Lobbies 1..=cap are created; the (cap+1)th is rejected with a clear
+    /// error and the existing lobbies are unaffected.
+    #[tokio::test]
+    async fn lobby_creation_over_cap_is_rejected() {
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
+        const CAP: usize = 2;
+        let server = make_server_with_lobby_cap(CAP).await;
+
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("CapTest".to_string()),
+        });
+
+        // CAP connections each get a lobby.
+        let mut clients: Vec<(TcpStream, tokio::task::JoinHandle<()>)> = Vec::new();
+        for _ in 0..CAP {
+            let (client, handle) = spawn_tcp_server(server.clone()).await;
+            clients.push((client, handle));
+        }
+        for (client, _) in clients.iter_mut() {
+            write_frame(client, &cbor_bytes(&hello)).await.unwrap();
+            read_until_match(client, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+            write_frame(client, &cbor_bytes(&create)).await.unwrap();
+            let created =
+                read_until_match(client, |m| matches!(m, ServerMessage::LobbyCreated { .. })).await;
+            assert!(matches!(created, ServerMessage::LobbyCreated { .. }));
+        }
+
+        // The (CAP+1)th creation is rejected with a clear error.
+        let (mut over, over_handle) = spawn_tcp_server(server.clone()).await;
+        write_frame(&mut over, &cbor_bytes(&hello)).await.unwrap();
+        read_until_match(&mut over, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+        write_frame(&mut over, &cbor_bytes(&create)).await.unwrap();
+        let err = read_until_match(&mut over, |m| matches!(m, ServerMessage::Error { .. })).await;
+        match err {
+            ServerMessage::Error { message } => assert!(
+                message.contains("lobby limit"),
+                "unexpected error: {message}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let lobby_count = server.lock().await.lobby_manager.lock().await.lobbies.len();
+        assert_eq!(lobby_count, CAP, "over-cap creation must not add a lobby");
+
+        for (_, handle) in clients {
+            handle.abort();
+        }
+        over_handle.abort();
+    }
+
+    /// M2d: when the CREATOR of an unstarted lobby disconnects, the lobby is
+    /// deleted immediately (without this it would retain up to ~1 MB of
+    /// client-controlled custom unit types until the idle-TTL sweep). A GUEST
+    /// disconnect leaves the lobby in place — the creator is still in charge.
+    #[tokio::test]
+    async fn creator_disconnect_removes_unstarted_lobby() {
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
+        let server = make_server().await;
+
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+
+        // Creator: create the lobby.
+        let (mut creator, creator_handle) = spawn_tcp_server(server.clone()).await;
+        write_frame(&mut creator, &cbor_bytes(&hello))
+            .await
+            .unwrap();
+        read_until_match(&mut creator, |m| {
+            matches!(m, ServerMessage::HelloAck { .. })
+        })
+        .await;
+        let create = ClientMessage::LobbyMessage(LobbyMessage::CreateLobby {
+            settings: default_lobby_settings(),
+            password: None,
+            player_name: Some("M2dCreator".to_string()),
+        });
+        write_frame(&mut creator, &cbor_bytes(&create))
+            .await
+            .unwrap();
+        let code = match read_until_match(&mut creator, |m| {
+            matches!(m, ServerMessage::LobbyCreated { .. })
+        })
+        .await
+        {
+            ServerMessage::LobbyCreated { lobby_code } => lobby_code,
+            other => panic!("expected LobbyCreated, got {other:?}"),
+        };
+
+        // Guest joins the lobby.
+        let (mut guest, guest_handle) = spawn_tcp_server(server.clone()).await;
+        write_frame(&mut guest, &cbor_bytes(&hello)).await.unwrap();
+        read_until_match(&mut guest, |m| matches!(m, ServerMessage::HelloAck { .. })).await;
+        let join = ClientMessage::LobbyMessage(LobbyMessage::JoinLobby {
+            lobby_code: code.clone(),
+            password: None,
+            player_name: Some("M2dGuest".to_string()),
+        });
+        write_frame(&mut guest, &cbor_bytes(&join)).await.unwrap();
+        read_until_match(&mut guest, |m| {
+            matches!(m, ServerMessage::LobbyJoined { .. })
+                || matches!(m, ServerMessage::LobbyUpdate { .. })
+        })
+        .await;
+
+        // Guest disconnects: the lobby must SURVIVE (the creator is in
+        // charge). The handler task must run to completion so its cleanup
+        // executes — do NOT abort it.
+        drop(guest);
+        tokio::time::timeout(Duration::from_secs(5), guest_handle)
+            .await
+            .expect("guest handler finished in time")
+            .expect("guest handler completed without panic");
+        assert!(
+            server
+                .lock()
+                .await
+                .lobby_manager
+                .lock()
+                .await
+                .get_lobby(&code)
+                .is_some(),
+            "guest disconnect must not delete the lobby"
+        );
+
+        // Creator disconnects: the unstarted lobby is deleted.
+        drop(creator);
+        let mut removed = false;
+        for _ in 0..100 {
+            if server
+                .lock()
+                .await
+                .lobby_manager
+                .lock()
+                .await
+                .get_lobby(&code)
+                .is_none()
+            {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            removed,
+            "creator disconnect must delete the unstarted lobby"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), creator_handle).await;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Sec L1/L2 hardening: debug endpoint gate + connection/spectator caps.
+// ────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod security_hardening_tests {
+    use super::*;
+    use crate::config::{CityUpgradeSettings, Config};
+    use crate::game::game::InfluenceSettings;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A real GameServer with throwaway storage (unique temp dir per test so
+    /// parallel tests never share a sqlite file). The optional `network` / `debug`
+    /// sections are the knobs under test.
+    async fn make_server_with(
+        max_ws_connections: Option<usize>,
+        max_spectators_per_game: Option<usize>,
+        debug_endpoints: Option<bool>,
+    ) -> Arc<Mutex<GameServer>> {
+        let dir = std::env::temp_dir().join(format!("wod-sec-{}", Uuid::new_v4()));
+        let mut toml_str = format!(
+            r#"
+[llm]
+
+[standard_ruleset]
+enabled = true
+unit_types = []
+
+[storage]
+database_path = "{db}"
+replay_path = "{replay}"
+"#,
+            db = dir.join("db.sqlite").display(),
+            replay = dir.join("replays").display(),
+        );
+        if max_ws_connections.is_some() || max_spectators_per_game.is_some() {
+            toml_str.push_str("\n[network]");
+            if let Some(v) = max_ws_connections {
+                toml_str.push_str(&format!("\nmax_ws_connections = {v}"));
+            }
+            if let Some(v) = max_spectators_per_game {
+                toml_str.push_str(&format!("\nmax_spectators_per_game = {v}"));
+            }
+        }
+        if let Some(v) = debug_endpoints {
+            toml_str.push_str(&format!("\n[debug]\nendpoints = {v}"));
+        }
+        let cfg: Config = toml::from_str::<Config>(&toml_str).unwrap().resolve();
+        Arc::new(Mutex::new(GameServer::new(cfg, 0).await.unwrap()))
+    }
+
+    /// Serve the PRODUCTION router (build_router) on an ephemeral port — the
+    /// same routes production runs, so in debug builds /debug/* are registered
+    /// and the in-handler gate is what keeps them inert.
+    async fn serve_router(state: Arc<Mutex<GameServer>>) -> String {
+        let app = GameServer::build_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    // ── FIX 1: /debug/* request-time gate ──────────────────────────────
+
+    /// Sec L1: in this (debug) build `build_router` registers /debug/stats
+    /// (and /debug/benchmark too, with microbenchmarks) — the routes EXIST.
+    /// With `debug.endpoints = false` the in-handler gate must 404 them:
+    /// a registered route must not execute debug logic (the benchmark is an
+    /// unauthenticated CPU-DoS lever).
+    #[tokio::test]
+    async fn debug_benchmark_404_when_config_gate_closed_despite_registered_route() {
+        let state = make_server_with(None, None, Some(false)).await;
+        let base = serve_router(state).await;
+        let client = reqwest::Client::new();
+        let paths: &[&str] = if cfg!(feature = "microbenchmarks") {
+            &["/debug/stats", "/debug/benchmark"]
+        } else {
+            &["/debug/stats"]
+        };
+        for path in paths {
+            let resp = client
+                .get(format!("{base}{path}"))
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{path} must 404 with the config gate closed, even though the route is registered"
+            );
+        }
+    }
+
+    /// Sec L1: with `debug.endpoints = true` (and a debug build) the same
+    /// routes must work — the gate opens. (Only compiled with microbenchmarks,
+    /// when the /debug/benchmark route exists at all.)
+    #[cfg(feature = "microbenchmarks")]
+    #[tokio::test]
+    async fn debug_benchmark_runs_when_config_gate_open() {
+        let state = make_server_with(None, None, Some(true)).await;
+        let base = serve_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{base}/debug/benchmark?units_per_city=1&ticks=10"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "benchmark must run when debug is enabled"
+        );
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(body.is_object(), "benchmark summary must be a JSON object");
+
+        let resp = client
+            .get(format!("{base}/debug/stats"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "/debug/stats must work"
+        );
+    }
+
+    // ── FIX 2: WS connection cap ───────────────────────────────────────
+
+    /// Raw WS client: HTTP upgrade handshake, returning the stream plus any
+    /// bytes already buffered past the 101 response (same pattern as the WP3
+    /// handshake tests).
+    async fn ws_connect(addr: &str, path: &str) -> (TcpStream, Vec<u8>) {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\n\
+                     Host: localhost\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                raw.drain(..=pos + 3);
+                return (client, raw);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "101 upgrade response in time"
+            );
+            let mut buf = [0u8; 4096];
+            let n = client.read(&mut buf).await.expect("socket open");
+            if n == 0 {
+                panic!("no 101 upgrade response — server closed the connection");
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// One client→server masked binary frame.
+    fn mask_ws_binary(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x82u8]; // FIN + binary opcode
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8 | 0x80);
+        } else if payload.len() < 65536 {
+            frame.push(126 | 0x80);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127 | 0x80);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        let mask = [0xA1u8, 0xB2, 0xC3, 0xD4];
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        frame
+    }
+
+    fn cbor_bytes<T: serde::Serialize>(msg: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(msg, &mut buf).expect("CBOR encode");
+        buf
+    }
+
+    /// Parse one server→client WS frame from the FRONT of `data`.
+    /// Returns (bytes consumed, opcode, payload); control frames carry their
+    /// payload (close code + reason) so callers can inspect it.
+    fn take_ws_frame(data: &[u8]) -> Option<(usize, u8, Vec<u8>)> {
+        if data.len() < 2 {
+            return None;
+        }
+        let opcode = data[0] & 0x0f;
+        let mut len = (data[1] & 0x7f) as usize;
+        let mut off = 2;
+        if len == 126 {
+            if off + 2 > data.len() {
+                return None;
+            }
+            len = u16::from_be_bytes([data[off], data[off + 1]]) as usize;
+            off += 2;
+        } else if len == 127 {
+            if off + 8 > data.len() {
+                return None;
+            }
+            let bytes: [u8; 8] = data[off..off + 8].try_into().ok()?;
+            len = u64::from_be_bytes(bytes) as usize;
+            off += 8;
+        }
+        if data[1] & 0x80 != 0 {
+            off += 4;
+        }
+        if off + len > data.len() {
+            return None;
+        }
+        Some((off + len, opcode, data[off..off + len].to_vec()))
+    }
+
+    /// Read the next complete WS frame (any opcode) with a deadline.
+    async fn read_ws_frame(client: &mut TcpStream, raw: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            if let Some((consumed, opcode, payload)) = take_ws_frame(raw) {
+                raw.drain(..consumed);
+                return Some((opcode, payload));
+            }
+            assert!(tokio::time::Instant::now() < deadline, "WS frame in time");
+            let n = client.read(&mut buf).await.expect("ws client read");
+            if n == 0 {
+                return None;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Sec L2: with max_ws_connections = 2, two connections are accepted, the
+    /// third is rejected with a clear Error + Close(1013) and the counter
+    /// stays at 2; after one connection closes the counter drops to 1 and a
+    /// new connection is accepted again.
+    #[tokio::test]
+    async fn ws_connection_cap_rejects_over_capacity_and_releases_on_close() {
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
+        const CAP: usize = 2;
+        let state = make_server_with(Some(CAP), None, None).await;
+        let base = serve_router(state.clone()).await;
+        let addr = base.trim_start_matches("http://").to_string();
+
+        // Two connections are accepted (upgrade + Hello → HelloAck).
+        let mut conns: Vec<(TcpStream, Vec<u8>)> = Vec::new();
+        for _ in 0..CAP {
+            let (mut client, mut raw) = ws_connect(&addr, "/ws").await;
+            let hello = ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                features: 0,
+            };
+            client
+                .write_all(&mask_ws_binary(&cbor_bytes(&hello)))
+                .await
+                .unwrap();
+            let (opcode, payload) = read_ws_frame(&mut client, &mut raw)
+                .await
+                .expect("HelloAck frame");
+            assert_eq!(opcode, 0x2, "expected binary frame, got opcode {opcode}");
+            let msg: ServerMessage = ciborium::from_reader(&payload[..]).expect("valid cbor");
+            assert!(
+                matches!(msg, ServerMessage::HelloAck { .. }),
+                "expected HelloAck, got {msg:?}"
+            );
+            conns.push((client, raw));
+        }
+        assert_eq!(
+            state.lock().await.ws_connections.load(Ordering::Relaxed),
+            CAP,
+            "both connections must hold a slot"
+        );
+
+        // Third connection: the upgrade succeeds (the cap is enforced inside
+        // the handler), then it receives a clear Error followed by
+        // Close(1013 "Try Again Later"), and no slot is consumed.
+        let (mut client, mut raw) = ws_connect(&addr, "/ws").await;
+        let (opcode, payload) = read_ws_frame(&mut client, &mut raw)
+            .await
+            .expect("over-cap frame");
+        assert_eq!(opcode, 0x2, "expected binary Error frame");
+        let msg: ServerMessage = ciborium::from_reader(&payload[..]).expect("valid cbor");
+        match msg {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("maximum connections"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let (opcode, payload) = read_ws_frame(&mut client, &mut raw)
+            .await
+            .expect("close frame");
+        assert_eq!(
+            opcode, 0x8,
+            "expected Close control frame, got opcode {opcode}"
+        );
+        assert!(payload.len() >= 2, "close frame must carry a code");
+        assert_eq!(
+            u16::from_be_bytes([payload[0], payload[1]]),
+            1013,
+            "close code must be 1013 (Try Again Later)"
+        );
+        assert_eq!(
+            state.lock().await.ws_connections.load(Ordering::Relaxed),
+            CAP,
+            "the rejected connection must not consume a slot"
+        );
+
+        // Close one connection → its slot is released → the counter drops.
+        drop(conns.remove(0).0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if state.lock().await.ws_connections.load(Ordering::Relaxed) == CAP - 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "slot released after close"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A new connection is now accepted — the released slot is reusable.
+        let (mut client, mut raw) = ws_connect(&addr, "/ws").await;
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        client
+            .write_all(&mask_ws_binary(&cbor_bytes(&hello)))
+            .await
+            .unwrap();
+        let (opcode, payload) = read_ws_frame(&mut client, &mut raw)
+            .await
+            .expect("HelloAck frame");
+        assert_eq!(opcode, 0x2);
+        let msg: ServerMessage = ciborium::from_reader(&payload[..]).expect("valid cbor");
+        assert!(
+            matches!(msg, ServerMessage::HelloAck { .. }),
+            "expected HelloAck after slot release, got {msg:?}"
+        );
+    }
+
+    // ── M3/W7: encode failure closes the connection (no partial bytes) ──
+
+    /// M3/W7 caller-path contract: when the server→client CBOR encode fails
+    /// mid-stream, the WS read loop must CLOSE the connection instead of
+    /// shipping a truncated frame. With the test fault armed, the first
+    /// server frame on this connection (the HelloAck reply) fails to encode:
+    /// the client must observe EOF (or a WS close) WITHOUT ever receiving a
+    /// decodable `ServerMessage` — a half frame is unrecoverable for the
+    /// peer, so the drop-and-close is the only safe behavior.
+    ///
+    /// The fault is global but scoped to `HelloAck` encodes; this test
+    /// holds it only from Hello-send to first-read (milliseconds), so the
+    /// blast radius is a stray HelloAck on a concurrent test's fresh
+    /// connection during that window (same trade-off the protocol-level
+    /// fault tests accept).
+    #[tokio::test]
+    async fn ws_encode_failure_closes_connection_without_partial_bytes() {
+        // The fault hook is process-global: serialize with the protocol-level
+        // fault tests for the whole body (we hold the fault across a network
+        // round-trip, so the window is far wider than their microsecond one).
+        let _exclusive = crate::server::protocol::TEST_FAULT_EXCLUSIVE.lock().await;
+        let state = make_server_with(None, None, None).await;
+        let base = serve_router(state).await;
+        let addr = base.trim_start_matches("http://").to_string();
+
+        let (mut client, mut raw) = ws_connect(&addr, "/ws").await;
+
+        // Arm the fault, THEN send Hello: the server's HelloAck encode hits
+        // the fault. Disarm as soon as the first read completes — the close
+        // arrives within one round-trip.
+        let fault = crate::server::protocol::TEST_ENCODE_FAULT.lock().await;
+        let hello = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        client
+            .write_all(&mask_ws_binary(&cbor_bytes(&hello)))
+            .await
+            .unwrap();
+
+        // Read until EOF or a frame appears — whichever comes first.
+        let first =
+            tokio::time::timeout(Duration::from_secs(5), read_ws_frame(&mut client, &mut raw))
+                .await
+                .expect("server answered (close or frame) in time");
+        drop(fault);
+
+        match first {
+            // Expected: the socket closed with no payload at all — no
+            // partial CBOR bytes ever reached the peer.
+            None => {}
+            Some((opcode, payload)) => {
+                // Tolerate a clean WS close frame; reject ANY binary frame —
+                // a decodable one means the contract is violated (a
+                // "successful" encode despite the fault), and an
+                // undecodable one is exactly the partial-frame desync the
+                // fix exists to prevent.
+                assert_eq!(
+                    opcode, 0x8,
+                    "a failed encode must not ship a {opcode:02x}-opcode frame of {payload:?}"
+                );
+                assert!(
+                    payload.len() >= 2,
+                    "close frame carries the 16-bit status code"
+                );
+            }
+        }
+        // After the close, further reads see EOF (the connection is gone —
+        // not half-open, not silently kept).
+        let mut buf = [0u8; 1];
+        let eof = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("EOF read in time")
+            .expect("socket readable until EOF");
+        assert_eq!(eof, 0, "connection must be closed after a failed encode");
+    }
+
+    // ── FIX 2: per-game spectator cap ─────────────────────────────────
+
+    /// Minimal game settings (same shape as the delta.rs test helper).
+    fn test_game_settings() -> GameSettings {
+        let unit_type = UnitType {
+            name: "infantry".to_string(),
+            symbol: "I".to_string(),
+            men: 100,
+            equipment: vec![Equipment {
+                name: "rifle".to_string(),
+                count: 100,
+                max_count: 100,
+                cost_per_item: 2.5,
+            }],
+            soft_attack: 5.0,
+            soft_defense: 5.5,
+            hard_attack: 3.0,
+            hard_defense: 2.0,
+            recruitment_cost: 200,
+            max_organisation: 100.0,
+            reinforcement_rate: 5.0,
+            speed: 1.0,
+            base_attrition: 0.5,
+            fighting_attrition: 1.0,
+            supply_buffer_percent: 10,
+            supply_rate: 1,
+            max_supply: 200,
+        };
+        GameSettings {
+            starting_funds: 1000,
+            initial_manpower: 10_000,
+            funds_per_city: 1.0,
+            recruitment_rate: 1.0,
+            game_speed: 1.0,
+            use_standard_ruleset: true,
+            unit_types: vec![unit_type],
+            city_upgrade_settings: CityUpgradeSettings::default(),
+            water_speed: 0.5,
+            influence: InfluenceSettings::default(),
+        }
+    }
+
+    /// Wait for the spectator's FullState greeting on its egress channel
+    /// (deltas are tolerated and skipped).
+    async fn wait_for_full_state(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<EgressMessage>,
+        label: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label}: FullState in time"
+            );
+            match tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("deadline checked above")
+            {
+                Some(EgressMessage::Reliable(data)) => {
+                    let msg: ServerMessage = ciborium::from_reader(&data[..]).expect("valid cbor");
+                    if matches!(msg, ServerMessage::FullState { .. }) {
+                        return;
+                    }
+                }
+                Some(EgressMessage::Delta(_)) => {} // keep-latest ring ref — skip
+                Some(EgressMessage::Close) => {}    // tolerate: close request (encode-failure path)
+                None => panic!("{label}: egress channel closed before FullState"),
+            }
+        }
+    }
+
+    /// Sec L2: with max_spectators_per_game = 2, spectators 1-2 receive the
+    /// FullState greeting; the third is rejected with a clear Error and NO
+    /// FullState (and earlier spectators keep their stream).
+    #[tokio::test]
+    async fn spectator_cap_rejects_over_capacity_spectators() {
+        const CAP: usize = 2;
+        let state = make_server_with(None, Some(CAP), None).await;
+        let (config, storage) = {
+            let s = state.lock().await;
+            (s.config.clone(), s.storage.clone())
+        };
+
+        // One controlled player with no live connection: the room needs a
+        // real game player (player_0, created by Game::new) so city
+        // ownership and the spectator vision grid resolve.
+        let players = vec![PlayerConnection::Player {
+            id: "player_0".to_string(),
+            tx: PlayerSender::None,
+        }];
+        let room = GameRoom::new(
+            "game1".to_string(),
+            load_default_map(),
+            "default".to_string(),
+            test_game_settings(),
+            players,
+            vec![],
+            "room1".to_string(),
+            state.clone(),
+            config,
+            storage,
+            true,
+        );
+
+        // Spectators 1 and 2 join: each receives the FullState greeting.
+        let mut spec_rxs: Vec<tokio::sync::mpsc::UnboundedReceiver<EgressMessage>> = Vec::new();
+        for i in 0..CAP {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<EgressMessage>();
+            room.command_tx
+                .send(Command::AddSpectator(PlayerSender::Tcp(TcpEgress::new(tx))))
+                .expect("command accepted");
+            let mut rx = rx;
+            wait_for_full_state(&mut rx, &format!("spectator {i}")).await;
+            spec_rxs.push(rx);
+        }
+
+        // Spectator CAP+1 is rejected: a clear Error, and never a FullState.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EgressMessage>();
+        room.command_tx
+            .send(Command::AddSpectator(PlayerSender::Tcp(TcpEgress::new(tx))))
+            .expect("command accepted");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "over-cap spectator: answer in time"
+            );
+            match tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("deadline checked above")
+            {
+                Some(EgressMessage::Reliable(data)) => {
+                    let msg: ServerMessage = ciborium::from_reader(&data[..]).expect("valid cbor");
+                    match msg {
+                        ServerMessage::Error { message } => {
+                            assert!(
+                                message.contains("Spectator limit"),
+                                "unexpected error: {message}"
+                            );
+                            break;
+                        }
+                        ServerMessage::FullState { .. } => {
+                            panic!("over-cap spectator must NOT receive FullState");
+                        }
+                        other => panic!("unexpected message for over-cap spectator: {other:?}"),
+                    }
+                }
+                Some(EgressMessage::Delta(_)) => {} // tolerate
+                Some(EgressMessage::Close) => {}    // tolerate (rejection path never closes)
+                None => panic!("over-cap spectator: channel closed"),
+            }
+        }
+
+        // The earlier spectators are unaffected: the room still holds their
+        // senders (if the rejection path had dropped them, the receiver side
+        // would report the channel closed).
+        for (i, rx) in spec_rxs.iter().enumerate() {
+            assert!(
+                !rx.is_closed(),
+                "accepted spectator {i}'s egress channel must still be open"
+            );
+        }
+
+        // Drop the room → the command channel closes → the tick task exits.
+        drop(room);
     }
 }

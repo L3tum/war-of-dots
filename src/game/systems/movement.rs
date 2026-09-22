@@ -57,6 +57,8 @@ pub struct MovementScratch {
 
 impl MovementScratch {
     /// Number of units with a non-empty path in the current change list.
+    /// Only read by `Game::movement_diag` (benchmark-only).
+    #[cfg(feature = "microbenchmarks")]
     pub fn changes_len(&self) -> usize {
         self.changes.len()
     }
@@ -68,6 +70,14 @@ impl MovementScratch {
 /// at a gameplay cost of at most 3 ticks of delay behind an impassable
 /// front (the old behavior retried every tick and was blocked every tick).
 const GATE_BACKOFF: u8 = 3;
+
+/// Distance below which a unit counts as having reached its current waypoint.
+/// Also guards the `speed / dist` step: a waypoint sitting on the unit's own
+/// position (dist == 0) combined with zero effective speed (e.g. a custom
+/// unit type with speed 0) would otherwise compute `0.0 / 0.0 = NaN` and
+/// write NaN into the unit's position permanently. A zero-length segment is
+/// treated as reached (pop head) instead of dividing.
+const REACHED_EPSILON: f32 = 1e-6;
 
 /// Cap on the backoff vec's entity-id span. Live hecs ids are bounded by total
 /// spawns (tens of thousands); the cap keeps a pathological id (e.g.
@@ -447,9 +457,14 @@ fn compute_movement(
         }
     }
 
-    let (new_pos, pop_head) = if dist < speed {
-        // Reached waypoint: pop the head of the path in the apply phase (no
-        // SmallVec copy here, no O(path) remove(0) memmove in phase 1).
+    let (new_pos, pop_head) = if dist < REACHED_EPSILON || dist < speed {
+        // Reached waypoint — including the degenerate case where the waypoint
+        // is within REACHED_EPSILON of the unit. That guard must come first:
+        // with dist == 0 and speed == 0, `dist < speed` is false and the step
+        // below would divide 0/0 = NaN, poisoning the position. Snapping to
+        // the (coincident) waypoint and popping the head keeps the unit
+        // coherent. (No SmallVec copy here, no O(path) remove(0) memmove in
+        // phase 1.)
         (UnitPosition { x: *nx, y: *ny }, true)
     } else {
         // Moving towards waypoint
@@ -1098,5 +1113,121 @@ mod tests {
             "B must advance after the blocker is gone, got x={}",
             pos.x
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // compute_movement — zero-distance / zero-speed NaN guard
+    // ---------------------------------------------------------------------------
+
+    /// A waypoint sitting exactly on the unit's position (dist == 0) must be
+    /// treated as reached (pop head) and must never yield a NaN position.
+    #[test]
+    fn movement_waypoint_at_current_position_no_nan() {
+        let pos = UnitPosition { x: 5.0, y: 5.0 };
+        let path = UnitPath {
+            path: [(5.0, 5.0)].into_iter().collect(),
+        };
+        let utype = UnitTypeId {
+            name: "infantry".to_string(),
+        };
+        let stats = UnitStats {
+            men: 1000.0,
+            max_men: 1000.0,
+            organisation: 100.0,
+            max_organisation: 100.0,
+        };
+        let equipment = UnitEquipment {
+            equipment: vec![],
+            max_equipment: vec![],
+            supply_buffer_percent: 10,
+            supply_rate: 5,
+            supply: 2000.0,
+            max_supply: 2000.0,
+        };
+        let terrain = test_terrain(20, 20);
+        let settings = test_settings();
+
+        let change = compute_movement(
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
+        )
+        .expect("a unit with a path always gets a movement change");
+        assert!(
+            change.new_pos.x.is_finite() && change.new_pos.y.is_finite(),
+            "position must stay finite, got {:?}/{:?}",
+            change.new_pos.x,
+            change.new_pos.y
+        );
+        assert_eq!(change.new_pos.x, 5.0);
+        assert_eq!(change.new_pos.y, 5.0);
+        assert!(change.pop_head, "zero-length segment counts as reached");
+        assert!(
+            !change.moved,
+            "snapping to the identical position is not a move"
+        );
+    }
+
+    /// A unit type with speed 0 (effective speed 0.0): the old code computed
+    /// `0.0 / 0.0 = NaN` when the waypoint was on the unit (dist == 0),
+    /// permanently poisoning the position. Now the zero-length segment is
+    /// reached, and a far waypoint holds the position without a NaN step.
+    #[test]
+    fn movement_zero_speed_unit_stays_finite() {
+        let mut settings = test_settings();
+        settings.unit_types[0].speed = 0.0;
+        let utype = UnitTypeId {
+            name: "infantry".to_string(),
+        };
+        let stats = UnitStats {
+            men: 1000.0,
+            max_men: 1000.0,
+            organisation: 100.0,
+            max_organisation: 100.0,
+        };
+        let equipment = UnitEquipment {
+            equipment: vec![],
+            max_equipment: vec![],
+            supply_buffer_percent: 10,
+            supply_rate: 5,
+            supply: 2000.0,
+            max_supply: 2000.0,
+        };
+        let terrain = test_terrain(20, 20);
+        let pos = UnitPosition { x: 5.0, y: 5.0 };
+
+        // Waypoint on the unit — the deterministic 0/0 case.
+        let path = UnitPath {
+            path: [(5.0, 5.0)].into_iter().collect(),
+        };
+        let change = compute_movement(
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
+        )
+        .unwrap();
+        assert!(
+            change.new_pos.x.is_finite() && change.new_pos.y.is_finite(),
+            "0/0 must not poison the position, got {:?}/{:?}",
+            change.new_pos.x,
+            change.new_pos.y
+        );
+        assert_eq!(change.new_pos.x, 5.0);
+        assert_eq!(change.new_pos.y, 5.0);
+        assert!(change.pop_head, "zero-length segment counts as reached");
+        assert!(!change.moved);
+
+        // Far waypoint: step ratio is 0/dist == 0 → hold position, do not pop.
+        let path = UnitPath {
+            path: [(15.0, 15.0)].into_iter().collect(),
+        };
+        let change = compute_movement(
+            pos, &path, &utype, &stats, &equipment, &terrain, 20, &settings,
+        )
+        .unwrap();
+        assert!(change.new_pos.x.is_finite() && change.new_pos.y.is_finite());
+        assert_eq!(change.new_pos.x, 5.0);
+        assert_eq!(change.new_pos.y, 5.0);
+        assert!(
+            !change.pop_head,
+            "a speed-0 unit does not reach a far waypoint"
+        );
+        assert!(!change.moved);
     }
 }

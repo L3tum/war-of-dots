@@ -1,14 +1,25 @@
-# Enable AVX2 (x86-64-v3) for auto-vectorization in release builds.
-# Gives ~29% improvement on influence system vs baseline x86-64 (SSE2 only).
-# Override per-invocation: RUSTFLAGS="-C target-cpu=native" cargo build --release
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
-
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
-
-[target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+# Default builds are PORTABLE (x86-64 baseline, SSE2): the binary runs on any
+# x86-64 CPU. Do NOT re-enable the rustflags below in a committed config —
+# target-cpu=x86-64-v3 emits AVX2, which SIGILLs on pre-AVX2 CPUs.
+#
+# Opt in per-invocation when you know the target CPU has AVX2 (check:
+# `grep -o avx2 /proc/cpuinfo` or `scripts/check_vectorization.sh`):
+#
+#   make release-avx2
+#   # or
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+#
+# The AVX2 build gives ~29% on the influence system vs baseline (see README,
+# "Release builds"). The equivalent committed config (kept for reference):
+#
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=x86-64-v3"]
+#
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "target-cpu=x86-64-v3"]
+#
+# [target.x86_64-pc-windows-msvc]
+# rustflags = ["-C", "target-cpu=x86-64-v3"]
+#
+# [target.x86_64-unknown-linux-musl]
+# rustflags = ["-C", "target-cpu=x86-64-v3"]

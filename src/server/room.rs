@@ -25,6 +25,10 @@ pub const DELTA_RING_DEPTH: usize = 3;
 pub enum EgressMessage {
     Delta(u64),
     Reliable(Bytes),
+    /// M3/W7: explicit close requested by the tick task (a player's delta
+    /// encode failed — a half frame is unrecoverable, so the egress loop
+    /// ends the connection instead of leaving the peer desynced).
+    Close,
 }
 
 /// I7: bounded keep-latest ring of encoded delta payloads.
@@ -124,6 +128,9 @@ pub fn egress_bytes(msg: EgressMessage, ring: &DeltaRing) -> Option<Bytes> {
     match msg {
         EgressMessage::Delta(seq) => ring.take(seq).map(Bytes::from),
         EgressMessage::Reliable(data) => Some(data),
+        // The egress loops handle `Close` before resolution (it carries no
+        // payload); this arm only keeps the match exhaustive.
+        EgressMessage::Close => None,
     }
 }
 
@@ -138,6 +145,9 @@ pub fn egress_vec(msg: EgressMessage, ring: &DeltaRing) -> Option<Vec<u8>> {
     match msg {
         EgressMessage::Delta(seq) => ring.take(seq),
         EgressMessage::Reliable(data) => Some(data.to_vec()),
+        // The egress loops handle `Close` before resolution (it carries no
+        // payload); this arm only keeps the match exhaustive.
+        EgressMessage::Close => None,
     }
 }
 
@@ -263,6 +273,18 @@ impl PlayerSender {
     #[allow(clippy::result_unit_err)]
     pub fn blocking_send_reliable(&self, data: Bytes) -> Result<(), ()> {
         self.push_reliable(data)
+    }
+
+    /// M3/W7: request a connection close from the egress side (a delta
+    /// encode failed — a half frame is unrecoverable, so end the stream
+    /// instead of leaving the peer desynced). Best-effort: if the channel
+    /// is already closed (peer gone), there is nothing to do. The `Websocket`
+    /// closure variant has no close hook (legacy, unused by the live game
+    /// path) and is a no-op.
+    pub fn close(&self) {
+        if let PlayerSender::Tcp(e) = self {
+            let _ = e.tx.send(EgressMessage::Close);
+        }
     }
 }
 

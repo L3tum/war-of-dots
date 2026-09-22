@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::agent::{Action, GameState, Tool, ToolCall};
+use super::build_http_client;
+use crate::llm::agent::{GameState, Tool, ToolCall};
 
 #[derive(Clone)]
 pub struct AnthropicClient {
@@ -65,12 +66,24 @@ struct ContentBlock {
 }
 
 impl AnthropicClient {
+    /// Create a client with the default 30 s request timeout.
     pub fn new(api_key: String, model: String, base_url: String) -> Self {
+        Self::with_timeout(api_key, model, base_url, None)
+    }
+
+    /// Create a client with an explicit total request timeout.
+    /// Pass `None` for the default (30 s); the connect timeout is always 10 s.
+    pub fn with_timeout(
+        api_key: String,
+        model: String,
+        base_url: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
         AnthropicClient {
             api_key,
             model,
             base_url,
-            http: reqwest::Client::new(),
+            http: build_http_client(timeout),
         }
     }
 }
@@ -138,27 +151,102 @@ impl AnthropicClient {
         }
         Ok(calls)
     }
+}
 
-    pub async fn query(
-        &self,
-        state: &GameState,
-        system_prompt: &str,
-    ) -> anyhow::Result<Vec<Action>> {
-        let calls = self.call(state, system_prompt, Vec::new()).await?;
-        Ok(calls
-            .into_iter()
-            .map(|tc| {
-                let reason = tc
-                    .arguments
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                Action {
-                    action_type: tc.name,
-                    params: tc.arguments,
-                    reason,
-                }
-            })
-            .collect())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::agent::GameState;
+
+    fn test_state() -> GameState {
+        GameState {
+            vision_grid: vec![vec![true, false]],
+            border_grid: vec![vec![0, 255]],
+            units: Vec::new(),
+            cities: Vec::new(),
+            funds: 100,
+            player_id: "p1".into(),
+        }
+    }
+
+    /// Spin up an axum router on a random loopback port; returns the base URL.
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        // Give the accept loop a head start.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn call_parses_tool_use_blocks_from_mock_server() {
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "I suggest moving."},
+                        {
+                            "type": "tool_use",
+                            "id": "tu_1",
+                            "name": "move_troop",
+                            "input": {
+                                "troop_id": "t1",
+                                "path": [[0, 0], [2, 1]],
+                                "reason": "flank"
+                            }
+                        }
+                    ]
+                }))
+            }),
+        );
+        let base = serve(app).await;
+        let client = AnthropicClient::new("key".into(), "claude-test".into(), base);
+        let calls = client
+            .call(&test_state(), "system prompt", Vec::new())
+            .await
+            .expect("call should succeed against mock server");
+        assert_eq!(calls.len(), 1, "text block must be ignored, tool_use kept");
+        assert_eq!(calls[0].id, "tu_1");
+        assert_eq!(calls[0].name, "move_troop");
+        assert_eq!(calls[0].arguments["troop_id"], "t1");
+        assert_eq!(
+            calls[0].arguments["path"],
+            serde_json::json!([[0, 0], [2, 1]])
+        );
+    }
+
+    #[tokio::test]
+    async fn call_times_out_on_hanging_endpoint() {
+        // Accepts the request and then never responds.
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                std::future::pending::<()>().await;
+                axum::Json(serde_json::json!({}))
+            }),
+        );
+        let base = serve(app).await;
+        let client = AnthropicClient::with_timeout(
+            "key".into(),
+            "claude-test".into(),
+            base,
+            Some(std::time::Duration::from_millis(800)),
+        );
+        let start = std::time::Instant::now();
+        let res = client
+            .call(&test_state(), "system prompt", Vec::new())
+            .await;
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "hanging endpoint must error, got {res:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "call should error quickly, took {elapsed:?}"
+        );
     }
 }

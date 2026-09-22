@@ -30,10 +30,12 @@ use std::sync::Arc;
 
 use hecs::Entity;
 
-use crate::game::game::Game;
+use crate::game::economy::City;
+use crate::game::game::{Game, UnitView};
+use crate::game::NetworkBaselines;
 use crate::server::protocol::{
     encode_message_with_hint, estimate_delta_size, pack_unit_position, CityState, CityUpdate,
-    GameDeltaMessage, PlayerState, ServerMessage, UnitState, UnitUpdate,
+    EquipmentState, GameDeltaMessage, PlayerState, ServerMessage, UnitState, UnitUpdate,
 };
 
 // I2a: the `men` digest quantization step is resolved at RUNTIME as
@@ -120,8 +122,9 @@ fn band_crossed(prev: f32, curr: f32, band: f32) -> bool {
 /// digest field also changes, ensuring we never miss a real update.
 ///
 /// I1: `from_ecs` is the single source of truth for the digest arithmetic —
-/// the live in-place pass (`Game::update_states_in_place`) feeds it raw ECS
-/// values, while `from_unit` (HashMap reference path) delegates to it.
+/// the live in-place pass (`crate::server::delta::update_unit_baselines`,
+/// fed via `from_view` over the engine's plain `UnitView`) and the wire
+/// reference path (`from_unit`) both delegate to it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UnitStateDigest {
     position: (f32, f32),
@@ -224,6 +227,32 @@ impl UnitStateDigest {
             is_cold,
         )
     }
+
+    /// Build a digest from a plain engine `UnitView` (the live in-place
+    /// pass). Delegates to `from_ecs` so the wire path and the engine-view
+    /// path can never drift.
+    pub(crate) fn from_view(u: &UnitView, men_step: f32, is_cold: bool) -> Self {
+        Self::from_ecs(
+            u.position,
+            u.men,
+            u.max_men,
+            u.organisation,
+            u.equipment.iter().map(|e| e.count as u64).sum(),
+            u.max_equipment.iter().map(|e| e.count as u64).sum(),
+            u.path.len(),
+            u.healing,
+            u.resupply_enabled,
+            u.supply_percent,
+            u.encircled,
+            u.attacking,
+            u.on_water,
+            u.boat_supply_percent,
+            u.embarking,
+            u.disembarking,
+            men_step,
+            is_cold,
+        )
+    }
 }
 
 /// Player-independent delta components computed once per tick.
@@ -248,10 +277,10 @@ pub(crate) struct SharedDeltas {
     pub city_updates: Arc<Vec<CityUpdate>>,
     /// W8: per-owner unit counts, built once per tick in single O(N) passes so
     /// `build_delta_inner` does O(1) lookups instead of O(units) scans per
-    /// player. Owned (not borrowed) on purpose: `run_network_phase` reassigns
-    /// `baselines.prev_units` after computing the shared deltas, so a map
-    /// borrowing those keys couldn't live in the result; materializing costs
-    /// one key clone per DISTINCT owner (≤ number of players), not per unit.
+    /// player. Owned (not borrowed) on purpose: the maps arrive from the
+    /// tick's `UnitDiff` (owned) and are moved into the result — no baseline
+    /// borrow to outlive. Materializing costs one key clone per DISTINCT
+    /// owner (≤ number of players), not per unit.
     pub prev_units_by_owner: HashMap<String, u32>,
     pub current_units_by_owner: HashMap<String, u32>,
 }
@@ -260,7 +289,10 @@ pub(crate) struct SharedDeltas {
 /// (borrowed); the owned result clones one key per DISTINCT owner.
 /// I5: exported so the tick loop can build the map ONCE and share it between
 /// the active-player check and `compute_shared_deltas` (which no longer
-/// recomputes it).
+/// recomputes it). Test-only in non-test builds since the replay
+/// resimulation endpoint was replaced by JSONL streaming (kept: delta.rs and
+/// game.rs unit tests exercise it).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn count_units_by_owner<'a>(
     owners: impl Iterator<Item = &'a str> + 'a,
 ) -> HashMap<String, u32> {
@@ -273,8 +305,8 @@ pub(crate) fn count_units_by_owner<'a>(
 
 /// I1: field-level `UnitUpdate` for a unit whose digest already changed
 /// (the digest check happens at the call site). Shared by the live in-place
-/// pass (`Game::update_states_in_place`) and the HashMap reference path
-/// (`compute_shared_deltas` — replay endpoint + tests) so the two can never
+/// pass (`update_unit_baselines`) and the HashMap reference path
+/// (`compute_shared_deltas` — unit tests) so the two can never
 /// drift in what fields an update carries.
 ///
 /// `map_size` (width, height in cells) is the I3 position-quantization scale:
@@ -398,27 +430,64 @@ pub(crate) fn build_unit_update(
     }
 }
 
+/// H5: the identity/ownership/level fields the wire city diff compares.
+/// Implemented by the engine's plain `City` (live path — the engine now owns
+/// the baseline snapshot) and the protocol `CityState` (test-only HashMap
+/// reference path), so both paths share one diff implementation.
+trait CityDiff {
+    fn city_id(&self) -> &str;
+    fn city_owner(&self) -> &Option<String>;
+    fn city_level(&self) -> u32;
+}
+
+impl CityDiff for City {
+    fn city_id(&self) -> &str {
+        &self.id
+    }
+    fn city_owner(&self) -> &Option<String> {
+        &self.owner
+    }
+    fn city_level(&self) -> u32 {
+        self.level
+    }
+}
+
+impl CityDiff for CityState {
+    fn city_id(&self) -> &str {
+        &self.id
+    }
+    fn city_owner(&self) -> &Option<String> {
+        &self.owner
+    }
+    fn city_level(&self) -> u32 {
+        self.level
+    }
+}
+
 /// City owner/level diff (shared by the live and HashMap reference paths).
-fn city_updates_diff(
-    prev_cities: &HashMap<String, CityState>,
-    current_cities: &[CityState],
+/// H5: generic over the city type — the live path diffs the engine's plain
+/// `City` snapshot against the engine-owned baseline, the reference path
+/// keeps protocol `CityState`.
+fn city_updates_diff<P: CityDiff, C: CityDiff>(
+    prev_cities: &HashMap<String, P>,
+    current_cities: &[C],
 ) -> Vec<CityUpdate> {
     let mut city_updates: Vec<CityUpdate> = Vec::new();
     for city in current_cities.iter() {
-        if let Some(prev) = prev_cities.get(&city.id) {
-            let owner_changed = city.owner != prev.owner;
-            let level_changed = city.level != prev.level;
+        if let Some(prev) = prev_cities.get(city.city_id()) {
+            let owner_changed = city.city_owner() != prev.city_owner();
+            let level_changed = city.city_level() != prev.city_level();
 
             if owner_changed || level_changed {
                 city_updates.push(CityUpdate {
-                    id: city.id.clone(),
+                    id: city.city_id().to_string(),
                     owner: if owner_changed {
-                        city.owner.clone()
+                        city.city_owner().clone()
                     } else {
                         None
                     },
                     level: if level_changed {
-                        Some(city.level)
+                        Some(city.city_level())
                     } else {
                         None
                     },
@@ -433,10 +502,13 @@ fn city_updates_diff(
 /// Compute the player-independent portions of the per-player delta.
 /// Called once per tick, not once per player.
 ///
-/// I1: this is the HashMap-based REFERENCE path — the replay endpoint and
-/// the unit tests keep using it (no perf requirement there). The live tick
-/// loop instead runs `Game::update_states_in_place` and builds the shared
-/// deltas from its `UnitDiff` via `compute_shared_deltas_from_diff`.
+/// I1: this is the HashMap-based REFERENCE path — the unit tests keep using
+/// it (no perf requirement there). The live tick loop instead runs
+/// `update_unit_baselines` and builds the shared deltas from its
+/// `UnitDiff` via `compute_shared_deltas_from_diff`.
+/// (The old replay resimulation endpoint was its other consumer; replays are
+/// now streamed JSONL, so this is test-only outside `cfg(test)`.)
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)] // I2a: men_step added; kept flat (not a struct) — it is the only runtime knob
 pub(crate) fn compute_shared_deltas(
     prev_units: &HashMap<String, UnitState>,
@@ -602,7 +674,7 @@ pub(crate) fn grid_diff(
     }
 }
 
-/// I1: the LIVE path's unit diff, produced by `Game::update_states_in_place`
+/// I1: the LIVE path's unit diff, produced by `update_unit_baselines`
 /// (single in-place ECS pass, no per-tick `Vec<UnitState>` materialization).
 /// Wire-relevant content only: added units (full state), removed unit ids,
 /// and field-level updates — plus the per-owner count maps the tick loop's
@@ -620,33 +692,69 @@ pub(crate) struct UnitDiff {
     pub prev_owner_counts: HashMap<String, u32>,
 }
 
+/// H3: the per-tick shared (player-independent) diff inputs, bundled into
+/// one structured value — the unit diff from the in-place baseline pass, the
+/// current city snapshot, and the current territory (border) grid.
+///
+/// `run_network_phase` takes this by value, destructures it, and hands the
+/// fields to `compute_shared_deltas_from_diff` (unit diff moved into
+/// `SharedDeltas`; city snapshot + border grid borrowed for the diff and
+/// moved into the end-of-phase baseline commit). The vision grid is
+/// deliberately NOT part of this bundle: it is per-player (every player sees
+/// a different grid), so its diff stays in the per-player `build_delta_inner`.
+///
+/// Replaces the parallel `unit_diff` + `current_cities` (+ internally
+/// fetched border grid) parameters of the old `run_network_phase` /
+/// `compute_shared_deltas_from_diff` call shape: a new shared diff dimension
+/// now means one field, not one positional parameter at every call site.
+pub(crate) struct TickDiffs {
+    /// In-place unit diff (`update_unit_baselines`) — added / removed /
+    /// field-level updates + the two per-owner count maps.
+    pub units: UnitDiff,
+    /// Current city snapshot — PLAIN engine `City` structs (Arch H2: the
+    /// engine yields engine-owned data; the server converts to wire types
+    /// only inside the diff/commit). The city update list is computed
+    /// against `NetworkBaselines::prev_cities` in the shared compute.
+    pub cities: Vec<City>,
+    /// Current territory grid (published Arc — allocation-free clone); the
+    /// border diff is computed against `NetworkBaselines::prev_border`.
+    pub border_grid: Option<Arc<Vec<u8>>>,
+}
+
 /// I1: build the shared (player-independent) deltas from the live in-place
 /// unit diff. Mirrors `compute_shared_deltas` minus the unit work, which the
 /// diff already carries — so the live path no longer touches any
 /// `HashMap<String, UnitState>` baseline at all.
+///
+/// H3: consumes the `TickDiffs` bundle's fields (destructured by the caller,
+/// `run_network_phase`): the unit diff is moved into `SharedDeltas`; the city
+/// snapshot and border grid are borrowed here and moved by the caller into
+/// the end-of-phase baseline commit. Only the PRE-COMMIT baseline state
+/// (`prev_cities`, `prev_border_grid`) is threaded separately — it lives on
+/// `NetworkBaselines`.
 pub(crate) fn compute_shared_deltas_from_diff(
-    diff: UnitDiff,
-    prev_cities: &HashMap<String, CityState>,
-    current_cities: &[CityState],
+    units: UnitDiff,
+    cities: &[City],
+    border_grid: Option<&Arc<Vec<u8>>>,
+    prev_cities: &HashMap<String, City>,
     prev_border_grid: Option<&Arc<Vec<u8>>>,
-    current_border_grid: &Option<Arc<Vec<u8>>>,
 ) -> SharedDeltas {
     // Border grid diff (shared across all players) — identical to the
     // reference path: share the published Arc (full form) or the packed
     // changed-cell list (I4 sparse form) instead of copying the grid.
     let (border_grid_diff, border_cells_changed, border_changed_cells) =
-        grid_diff(prev_border_grid, current_border_grid.as_ref());
+        grid_diff(prev_border_grid, border_grid);
 
     SharedDeltas {
         border_grid_diff,
         border_cells_changed: border_cells_changed.map(Arc::new),
         border_changed_cells,
-        units_added: Arc::new(diff.added),
-        units_removed: Arc::new(diff.removed),
-        unit_updates: Arc::new(diff.updates),
-        city_updates: Arc::new(city_updates_diff(prev_cities, current_cities)),
-        prev_units_by_owner: diff.prev_owner_counts,
-        current_units_by_owner: diff.current_owner_counts,
+        units_added: Arc::new(units.added),
+        units_removed: Arc::new(units.removed),
+        unit_updates: Arc::new(units.updates),
+        city_updates: Arc::new(city_updates_diff(prev_cities, cities)),
+        prev_units_by_owner: units.prev_owner_counts,
+        current_units_by_owner: units.current_owner_counts,
     }
 }
 
@@ -749,20 +857,11 @@ pub(crate) fn build_delta_inner(
     Some((ServerMessage::DeltaState(delta), vision_changed))
 }
 
-/// Per-tick baseline state for the network phase (W0 fix: shared read-only
-/// baseline with per-player vision).
-/// N1: grids are stored as flat `Arc` slices for O(1) change detection.
-/// I1: the unit baseline is the entity-indexed `UnitBaselineStore` (see
-/// below) instead of a `HashMap<String, UnitState>` rebuilt from a full
-/// snapshot every tick.
-#[derive(Default)]
-pub(crate) struct NetworkBaselines {
-    pub prev_units: UnitBaselineStore,
-    pub prev_cities: HashMap<String, CityState>,
-    pub prev_funds: HashMap<String, u32>,
-    pub prev_vision: HashMap<String, Arc<Vec<u8>>>,
-    pub prev_border: Option<Arc<Vec<u8>>>,
-}
+// H5: the engine-neutral per-tick baselines (cities/funds/vision/border)
+// live in the ENGINE module — `crate::game::NetworkBaselines` (imported
+// above). They name only engine types and advance in a single commit step.
+// The wire-typed unit baseline (`UnitBaselineStore`, below) stays
+// server-owned (Arch H2); server callers keep the two side by side.
 
 /// I1: entity-indexed unit baseline store — the replacement for the old
 /// `HashMap<String, UnitState>` that `run_network_phase` rebuilt from a full
@@ -782,7 +881,7 @@ pub(crate) struct NetworkBaselines {
 /// the pass emits `removed` (tombstone) + `added` (fresh baseline) for it.
 /// Strings (id/owner/unit_type/symbol, equipment names) are allocated once at
 /// recruit and kept in the baseline; the common per-tick commit mutates
-/// numeric fields in place (`update_states_in_place`).
+/// numeric fields in place (`update_unit_baselines`).
 #[derive(Default)]
 pub(crate) struct UnitBaselineStore {
     slots: Vec<Option<UnitState>>,
@@ -813,6 +912,16 @@ impl UnitBaselineStore {
     /// Pre-commit per-owner unit counts (what the old path derived from the
     /// `prev_units` HashMap) — one key clone per DISTINCT owner.
     pub fn prev_owner_counts(&self) -> HashMap<String, u32> {
+        self.owner_counts()
+    }
+
+    /// Per-owner unit counts over the store's current alive set. Called
+    /// PRE-commit for `prev_owner_counts` and POST-commit for the diff's
+    /// `current_owner_counts` (after `commit`, `alive` holds exactly the
+    /// live units, each with its just-refreshed owner — the same values the
+    /// old path derived from the materialized snapshot via
+    /// `count_units_by_owner`, without the per-tick `Vec<UnitState>`).
+    pub fn owner_counts(&self) -> HashMap<String, u32> {
         let mut tmp: HashMap<&str, u32> = HashMap::new();
         for e in &self.alive {
             if let Some(u) = self.resolve(*e) {
@@ -953,6 +1062,281 @@ impl UnitBaselineStore {
     }
 }
 
+// ============================================================================
+// Arch H2 seam — engine snapshot → wire protocol conversion
+//
+// The engine (`crate::game`) exposes PLAIN data only: `UnitView` (borrowed,
+// allocation-free, per-tick) and `UnitQueryData` (owned, full snapshot).
+// This module owns the unit baseline store AND every conversion from that
+// plain data to `protocol::UnitState` / `UnitUpdate` wire types — a
+// protocol change touches this file + `protocol.rs`, never engine code.
+// ============================================================================
+
+/// The single engine→wire conversion for one unit (Arch H2 seam). The wire
+/// id `unit_{id}` is derived from the hecs entity id — the pre-seam
+/// `Game::unit_state_from_entity` did the same, from the components.
+pub(crate) fn wire_unit_state(entity: Entity, u: &UnitView) -> UnitState {
+    let eid = entity.id();
+    UnitState {
+        id: format!("unit_{eid}"),
+        owner: u.owner.to_string(),
+        position: u.position,
+        unit_type: u.unit_type.to_string(),
+        symbol: u.symbol.to_string(),
+        men: u.men,
+        max_men: u.max_men,
+        organisation: u.organisation,
+        equipment: u
+            .equipment
+            .iter()
+            .map(|e| EquipmentState {
+                name: e.name.clone(),
+                count: e.count,
+                cost_per_item: e.cost_per_item,
+            })
+            .collect(),
+        max_equipment: u
+            .max_equipment
+            .iter()
+            .map(|e| EquipmentState {
+                name: e.name.clone(),
+                count: e.count,
+                cost_per_item: e.cost_per_item,
+            })
+            .collect(),
+        path: u.path.to_vec(),
+        healing: u.healing,
+        resupply_enabled: u.resupply_enabled,
+        supply_percent: u.supply_percent,
+        encircled: u.encircled,
+        attacking: u.attacking,
+        on_water: u.on_water,
+        boat_supply_percent: u.boat_supply_percent,
+        embarking: u.embarking,
+        disembarking: u.disembarking,
+    }
+}
+
+/// Wire snapshot of every live unit (full-state builds + the HashMap
+/// reference path). The body of the pre-seam `Game::unit_states()`, now
+/// server-side over the engine's plain `UnitQueryData`.
+pub(crate) fn wire_unit_states(game: &Game) -> Vec<UnitState> {
+    game.query_all_units()
+        .into_iter()
+        .map(|u| {
+            // Compute the derived percentages BEFORE moving the fields out.
+            let supply_percent = u.supply_percent();
+            let boat_supply_percent = u.boat_supply_percent();
+            UnitState {
+                id: u.id,
+                owner: u.owner,
+                position: u.position,
+                unit_type: u.unit_type,
+                symbol: u.symbol,
+                men: u.men,
+                max_men: u.max_men,
+                organisation: u.organisation,
+                equipment: u
+                    .equipment
+                    .into_iter()
+                    .map(|e| EquipmentState {
+                        name: e.name,
+                        count: e.count,
+                        cost_per_item: e.cost_per_item,
+                    })
+                    .collect(),
+                max_equipment: u
+                    .max_equipment
+                    .into_iter()
+                    .map(|e| EquipmentState {
+                        name: e.name,
+                        count: e.count,
+                        cost_per_item: e.cost_per_item,
+                    })
+                    .collect(),
+                path: u.path,
+                healing: u.healing,
+                resupply_enabled: u.resupply_enabled,
+                supply_percent,
+                encircled: u.encircled,
+                attacking: u.fighting,
+                on_water: u.on_water,
+                boat_supply_percent,
+                embarking: u.embarking,
+                disembarking: u.disembarking,
+            }
+        })
+        .collect()
+}
+
+/// I1: seed the entity-indexed unit baseline store from the current world
+/// (server-side; was `Game::init_unit_baselines`). One wire materialization
+/// per live unit, ONCE per game.
+pub(crate) fn init_unit_baselines(game: &Game, store: &mut UnitBaselineStore) {
+    game.for_each_unit(|entity, u| {
+        store.touch(entity);
+        store.insert(entity, wire_unit_state(entity, u));
+    });
+    // Seed the alive list so the first `commit` has correct prev state.
+    // (update_unit_baselines's commit rebuilds `alive` from touched + fresh
+    // inserts; do the first commit here so a world with zero units still
+    // converges.)
+    let mut init_removed = Vec::new();
+    store.commit(&mut init_removed);
+    debug_assert!(init_removed.is_empty());
+}
+
+/// I1: incremental snapshot — the single per-tick in-place ECS pass
+/// (server-side; was `Game::update_states_in_place`). For every live unit
+/// (delivered by the engine as a borrowed `UnitView`) it diffs against the
+/// PRE-COMMIT baseline (`UnitBaselineStore`) and:
+/// - unit absent from the baseline (new recruit, or death→respawn reusing
+///   the same entity id at a bumped generation) → emit the full `UnitState`
+///   in `added`, intern it in the store;
+/// - digest changed → materialize ONLY this unit, emit a field-level
+///   `UnitUpdate` (same `build_unit_update` field logic as the reference
+///   path), and commit the materialized state into the slot;
+/// - digest unchanged → commit the exact current values in place (no
+///   allocation: numeric fields + equipment counts + path are written into
+///   the baseline; strings are interned and invariant).
+///
+/// The store is committed (in-place writes + tombstone of dead slots) as
+/// the final step of this call — AFTER the diff was built against the
+/// pre-commit state, so dead units are still visible as `prev` for
+/// `units_removed`. `UnitStateDigest` still decides what goes on the wire;
+/// this pass only removes the per-tick full materialization.
+pub(crate) fn update_unit_baselines(game: &Game, store: &mut UnitBaselineStore) -> UnitDiff {
+    // I2a: runtime men digest step = max(5.0, recruitment_rate); I2b: the
+    // cold-field gate is driven by the game tick — identical to the
+    // reference path's `compute_shared_deltas` arguments.
+    let men_step = game.settings().recruitment_rate.max(5.0);
+    let is_cold = cold_due(game.tick_number());
+    // I3: packed-position quantization scale — the map dimensions in cells.
+    let map_size = (game.terrain_width(), game.terrain_height());
+
+    // PRE-COMMIT owner counts (what the old path derived from prev_units).
+    let prev_owner_counts = store.prev_owner_counts();
+
+    let mut added: Vec<UnitState> = Vec::new();
+    let mut updates: Vec<UnitUpdate> = Vec::new();
+    // Dead-unit wire ids collected as the pass runs (stale-slot respawns)
+    // and at `commit` (plain deaths) — moved out of the baseline slots, no
+    // key clones.
+    let mut removed: Vec<String> = Vec::new();
+
+    game.for_each_unit(|entity, u| {
+        store.touch(entity);
+
+        // Digest inputs straight from the plain view (no materialization).
+        let digest = UnitStateDigest::from_view(u, men_step, is_cold);
+
+        if store.resolve(entity).is_none() {
+            // New incarnation (recruit, or id reuse after death). A
+            // non-empty stale slot means death→respawn within this one
+            // pass: emit the old incarnation's id as removed BEFORE the
+            // fresh one is inserted (removed+added pair, same wire id).
+            if let Some(stale) = store.take_stale(entity) {
+                removed.push(stale.id);
+            }
+            // Full materialization is the one place the per-unit alloc cost
+            // legitimately remains.
+            let ws = wire_unit_state(entity, u);
+            store.insert(entity, ws.clone());
+            added.push(ws);
+        } else if UnitStateDigest::from_unit(store.resolve(entity).unwrap(), men_step, is_cold)
+            != digest
+        {
+            // Digest changed: materialize ONLY this unit and build the
+            // field-level update against the pre-commit baseline.
+            let curr = wire_unit_state(entity, u);
+            let update = store
+                .resolve(entity)
+                .map(|prev| build_unit_update(prev, &curr, is_cold, map_size))
+                .expect("baseline slot resolved moments ago");
+            // Commit: move the materialized state into the slot (the
+            // update's equipment/path payloads are already cloned out).
+            *store
+                .resolve_mut(entity)
+                .expect("baseline slot resolved moments ago") = curr;
+            updates.push(update);
+        } else if let Some(base) = store.resolve_mut(entity) {
+            // Digest unchanged: no wire output. Commit the EXACT current
+            // values in place (the baseline must track truth — the old
+            // path re-committed the full snapshot every tick, so
+            // thresholds like `equip_threshold`/`band_crossed` see the
+            // same prev values and the wire stays bit-stable).
+            refresh_baseline_in_place(base, u);
+        }
+    });
+
+    // Commit: prune the alive list to the touched entities and emit the
+    // plain-death removed ids — AFTER the diff was fully built against
+    // the pre-commit state.
+    store.commit(&mut removed);
+
+    // Post-commit owner counts: `alive` now holds exactly the live units,
+    // each with its just-refreshed owner (one key clone per DISTINCT owner,
+    // same values as the old path's `count_units_by_owner` over the
+    // materialized snapshot).
+    let current_owner_counts = store.owner_counts();
+
+    UnitDiff {
+        added,
+        removed,
+        updates,
+        current_owner_counts,
+        prev_owner_counts,
+    }
+}
+
+/// I1: in-place baseline commit for a digest-UNCHANGED unit (server-side;
+/// was `Game::refresh_baseline_in_place`). Writes the exact current values
+/// into the stored `UnitState`; allocation-free in the common case (the
+/// path Vec only allocates on net growth, equipment slot lists are
+/// invariant in length, and the owner String only changes when the owner
+/// actually changes). `max_equipment`/`unit_type`/`symbol` are recruit-time
+/// invariants and stay interned.
+fn refresh_baseline_in_place(base: &mut UnitState, u: &UnitView) {
+    base.position = u.position;
+    base.men = u.men;
+    base.max_men = u.max_men;
+    base.organisation = u.organisation;
+    base.healing = u.healing;
+    base.resupply_enabled = u.resupply_enabled;
+    base.supply_percent = u.supply_percent;
+    base.encircled = u.encircled;
+    base.attacking = u.attacking;
+    base.on_water = u.on_water;
+    base.boat_supply_percent = u.boat_supply_percent;
+    base.embarking = u.embarking;
+    base.disembarking = u.disembarking;
+    // Equipment: slot names/costs are invariant; only the counts move.
+    if base.equipment.len() == u.equipment.len() {
+        for (b, e) in base.equipment.iter_mut().zip(u.equipment.iter()) {
+            b.count = e.count;
+        }
+    } else {
+        // Slot list changed (rare): rebuild (also keeps names/costs in sync
+        // with the ECS, so the baseline stays truthful).
+        base.equipment = u
+            .equipment
+            .iter()
+            .map(|e| EquipmentState {
+                name: e.name.clone(),
+                count: e.count,
+                cost_per_item: e.cost_per_item,
+            })
+            .collect();
+    }
+    // Path: in-place rewrite (capacity is reused on shrink/grow cycles).
+    base.path.clear();
+    base.path.extend_from_slice(u.path);
+    // Owner: interned String, replaced only on an actual change.
+    if base.owner != u.owner {
+        base.owner = u.owner.to_string();
+    }
+}
+
 /// Result of a single network-phase invocation.
 pub(crate) struct NetworkPhaseResult {
     pub wire_bytes: u64,
@@ -975,6 +1359,14 @@ pub(crate) struct NetworkPhaseResult {
     /// ticks (no delta was built) and when no pid is being recorded — the
     /// clone cost is one per tick, for exactly one player.
     pub recorded_delta: Option<crate::server::protocol::GameDeltaMessage>,
+    /// M3/W7: player ids whose delta encode FAILED this tick. Their frame
+    /// is dropped (never sent — a truncated frame would desync the peer) and
+    /// their per-player vision baseline is NOT committed (the next tick's
+    /// vision diff then covers the missed change). The caller (tick task)
+    /// closes these connections: the shared unit/city/funds baselines have
+    /// advanced with or without the delivery, so the player's stream is
+    /// unrecoverable for this game.
+    pub encode_failures: Vec<String>,
     /// B0: sub-phase timing — shared compute (`compute_shared_deltas` +
     /// `SpliceShared::build`) plus the per-player `build_delta_inner` calls,
     /// in ms. Feature-gated so a production build pays zero timing cost (the
@@ -1007,20 +1399,29 @@ pub(crate) struct NetworkPhaseResult {
 ///
 /// I1: the `current_units: Vec<UnitState>` materialization param and the tail
 /// `prev_units` HashMap rebuild are gone — the caller runs
-/// `Game::update_states_in_place` first (single in-place ECS pass, baseline
-/// committed there) and hands over its `UnitDiff`.
+/// `update_unit_baselines` first (single in-place ECS pass, baseline
+/// committed there).
+///
+/// H3: the per-tick shared diff inputs arrive as one structured `TickDiffs`
+/// value (unit diff + city snapshot + border grid) instead of parallel
+/// parameters.
 pub(crate) fn run_network_phase(
     game: &Game,
     baselines: &mut NetworkBaselines,
     player_ids: &[&str],
-    unit_diff: UnitDiff,
-    current_cities: Vec<CityState>,
+    diffs: TickDiffs,
     spliced: bool,
     record_pid: Option<&str>,
 ) -> NetworkPhaseResult {
     let all_funds = game.all_player_funds();
-    // N1: flat Arc grids (no 2-D allocation)
-    let border_grid: Option<Arc<Vec<u8>>> = game.territory_grid_flat();
+    // H3: destructure the bundle — the unit diff moves into the shared
+    // compute; the city snapshot + border grid move into the end-of-phase
+    // baseline commit below.
+    let TickDiffs {
+        units,
+        cities,
+        border_grid,
+    } = diffs;
     let grid_width = game.terrain_width();
 
     // B0: sub-phase timing accumulators (feature-gated; zero cost in a
@@ -1032,14 +1433,14 @@ pub(crate) fn run_network_phase(
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     let shared_start = std::time::Instant::now();
     // I1: the unit work (added/removed/updates + both per-owner count maps)
-    // already happened in `Game::update_states_in_place` against the
+    // already happened in `update_unit_baselines` against the
     // pre-commit baseline; this only adds the border grid diff + city diff.
     let shared = compute_shared_deltas_from_diff(
-        unit_diff,
+        units,
+        &cities,
+        border_grid.as_ref(),
         &baselines.prev_cities,
-        &current_cities,
         baselines.prev_border.as_ref(),
-        &border_grid,
     );
     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
     {
@@ -1089,6 +1490,7 @@ pub(crate) fn run_network_phase(
         grid_width,
         unit_updates,
         recorded_delta: None,
+        encode_failures: Vec::new(),
         // B0: sub-phase fields (feature-gated; see the struct definition).
         #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
         delta_ms,
@@ -1099,6 +1501,10 @@ pub(crate) fn run_network_phase(
         #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
         grid_changed_cells,
     };
+
+    // H5: per-player vision commits collected in the loop, applied in the
+    // single end-of-phase commit step below.
+    let mut vision_commits: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
 
     for pid in player_ids {
         // B0: per-player delta-build window (vision lookup + build_delta_inner
@@ -1151,6 +1557,10 @@ pub(crate) fn run_network_phase(
             let encoded = if let Some(ss) = &splice_shared {
                 // W9: splice the shared segments in (byte-for-byte identical to
                 // the standard encoder, pinned by the byte-for-byte test).
+                // The splice path is benchmark-only and keeps its legacy
+                // infallible shape (its failure modes are test-harness panics,
+                // not a live peer). The production (standard) path below is
+                // fallible per the M3/W7 contract.
                 let map_bytes = crate::server::protocol::encode_delta_spliced(delta_ref, ss);
                 let mut out = Vec::with_capacity(
                     crate::server::protocol::DELTA_STATE_VARIANT_WRAPPER.len() + map_bytes.len(),
@@ -1161,7 +1571,25 @@ pub(crate) fn run_network_phase(
             } else {
                 // N5: pre-size the CBOR buffer
                 let cap = estimate_delta_size(delta_ref);
-                encode_message_with_hint(&delta, cap)
+                match encode_message_with_hint(&delta, cap) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // M3/W7: this player's delta encode failed. Drop the
+                        // frame (the truncated buffer is NEVER sent), skip
+                        // this player's vision-baseline commit below (so the
+                        // next tick's diff covers the missed change), and
+                        // report the pid so the tick task closes the
+                        // connection — a half frame is unrecoverable for the
+                        // peer, and the shared baselines advanced regardless.
+                        tracing::error!(
+                            error = %e,
+                            player_id = %pid,
+                            "delta encode failed — dropping frame for this tick"
+                        );
+                        result.encode_failures.push(pid.to_string());
+                        continue;
+                    }
+                }
             };
             #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
             {
@@ -1172,9 +1600,11 @@ pub(crate) fn run_network_phase(
             result.encoded.push((pid.to_string(), encoded));
         }
 
-        // N1: commit Arc refcount bump (no allocation)
+        // N1: commit Arc refcount bump (no allocation) — H5: collected here,
+        // applied in the single end-of-phase commit step (an encode failure
+        // `continue`s above it, so that player keeps its stale grid).
         if let Some(v) = &vision_grid {
-            baselines.prev_vision.insert(pid.to_string(), Arc::clone(v));
+            vision_commits.push((pid.to_string(), Arc::clone(v)));
         }
     }
 
@@ -1188,17 +1618,11 @@ pub(crate) fn run_network_phase(
         result.grid_changed_cells = grid_changed_cells;
     }
 
-    // Commit shared baselines by move.
-    // I1: `baselines.prev_units` is no longer rebuilt here — the in-place
-    // pass (`Game::update_states_in_place`) already committed the unit store
-    // before this call (the UnitDiff was computed against its pre-commit
-    // state). Only the city/funds/grid baselines move in.
-    baselines.prev_cities = current_cities
-        .into_iter()
-        .map(|c| (c.id.clone(), c))
-        .collect();
-    baselines.prev_funds = all_funds;
-    baselines.prev_border = border_grid;
+    // H5: single commit step — every engine-neutral baseline (cities/funds/
+    // border + the per-player vision grids) advances in one atomic call.
+    // I1: the unit baseline is committed separately by `update_unit_baselines`
+    // (server-owned store, Arch H2) — it is no longer rebuilt here.
+    baselines.commit(cities, all_funds, border_grid, vision_commits);
 
     result
 }
@@ -1208,17 +1632,17 @@ pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameS
     let vision_grid = game.vision_grid_2d(player_id).unwrap_or_default();
     let border_grid = game.border_grid_2d(player_id).unwrap_or_default();
 
+    // Arch H2 seam: source the units from the engine's plain `UnitQueryData`
+    // snapshot (no wire hop) — the LLM mapping was previously fed by
+    // `Game::unit_states()` wire types.
     let units: Vec<crate::llm::agent::UnitState> = game
-        .unit_states()
+        .query_all_units()
         .iter()
         .filter(|unit| {
             let (gx, gy) = (unit.position.0 as usize, unit.position.1 as usize);
             unit.owner == player_id
                 || (gy < vision_grid.len() && gx < vision_grid[gy].len() && vision_grid[gy][gx])
         })
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
         .map(|u| crate::llm::agent::UnitState {
             id: u.id.clone(),
             owner: u.owner.clone(),
@@ -1238,7 +1662,7 @@ pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameS
                 .collect(),
             unit_type: u.unit_type.clone(),
             symbol: u.symbol.clone(),
-            supply_percent: u.supply_percent,
+            supply_percent: u.supply_percent(),
             resupply_enabled: u.resupply_enabled,
         })
         .collect();
@@ -2770,26 +3194,24 @@ mod tests {
         (game, unit_type)
     }
 
-    fn seeded_baselines(game: &Game) -> NetworkBaselines {
-        let mut baselines = NetworkBaselines {
-            prev_units: UnitBaselineStore::default(),
-            prev_cities: game
-                .query_cities()
-                .iter()
-                .map(|c| (c.id.clone(), c.into()))
-                .collect(),
-            prev_funds: game.all_player_funds(),
-            prev_vision: HashMap::new(),
-            prev_border: game.territory_grid_flat(),
-        };
-        game.init_unit_baselines(&mut baselines.prev_units);
-        baselines
+    /// H5: seed the engine-neutral baselines (`crate::game::NetworkBaselines`)
+    /// AND the server-owned unit store from the same initial snapshot.
+    fn seeded_baselines(game: &Game) -> (NetworkBaselines, UnitBaselineStore) {
+        let baselines = NetworkBaselines::from_snapshot(
+            game.query_cities(),
+            game.all_player_funds(),
+            HashMap::new(),
+            game.territory_grid_flat(),
+        );
+        let mut unit_store = UnitBaselineStore::default();
+        init_unit_baselines(game, &mut unit_store);
+        (baselines, unit_store)
     }
 
     #[test]
     fn run_network_phase_records_delta_for_record_pid_only() {
         let (mut game, unit_type) = two_player_game();
-        let mut baselines = seeded_baselines(&game);
+        let (mut baselines, mut unit_store) = seeded_baselines(&game);
         let pids = ["player_0", "player_1"];
 
         // Recruit a unit for the viewpoint AFTER seeding the baselines, so
@@ -2799,14 +3221,17 @@ mod tests {
         // Tick 1, recording player_0: the viewpoint's wire delta is retained
         // and its payload carries the player's live funds.
         game.tick_game();
-        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
-        let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
+        let unit_diff = update_unit_baselines(&game, &mut unit_store);
+        let current_cities: Vec<City> = game.query_cities();
         let phase = run_network_phase(
             &game,
             &mut baselines,
             &pids,
-            unit_diff,
-            current_cities,
+            TickDiffs {
+                units: unit_diff,
+                cities: current_cities,
+                border_grid: game.territory_grid_flat(),
+            },
             false,
             Some("player_0"),
         );
@@ -2821,14 +3246,17 @@ mod tests {
 
         // Tick 2, recording disabled: nothing retained.
         game.tick_game();
-        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
-        let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
+        let unit_diff = update_unit_baselines(&game, &mut unit_store);
+        let current_cities: Vec<City> = game.query_cities();
         let phase = run_network_phase(
             &game,
             &mut baselines,
             &pids,
-            unit_diff,
-            current_cities,
+            TickDiffs {
+                units: unit_diff,
+                cities: current_cities,
+                border_grid: game.territory_grid_flat(),
+            },
             false,
             None,
         );
@@ -2836,14 +3264,17 @@ mod tests {
 
         // Tick 3, recording player_1: the other viewpoint's delta.
         game.tick_game();
-        let unit_diff = game.update_states_in_place(&mut baselines.prev_units);
-        let current_cities: Vec<CityState> = game.query_cities().iter().map(|c| c.into()).collect();
+        let unit_diff = update_unit_baselines(&game, &mut unit_store);
+        let current_cities: Vec<City> = game.query_cities();
         let phase = run_network_phase(
             &game,
             &mut baselines,
             &pids,
-            unit_diff,
-            current_cities,
+            TickDiffs {
+                units: unit_diff,
+                cities: current_cities,
+                border_grid: game.territory_grid_flat(),
+            },
             false,
             Some("player_1"),
         );

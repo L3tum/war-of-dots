@@ -21,26 +21,33 @@ pub struct DebugSystemGuard {
 
 impl DebugSystemGuard {
     /// Create a new guard that will record tick timing.
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub fn new(world: &mut World, world_entity: hecs::Entity) -> Self {
-        #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-        {
-            // Reset all system last_ms at start of each tick so benchmark
-            // only sums systems that were actually called this tick.
-            if let Some(wb) = world.world_data_mut(world_entity) {
-                for timings in wb.debug_stats.system_timings.values_mut() {
-                    timings.last_ms = 0.0;
-                }
+        // Reset all system last_ms at start of each tick so benchmark
+        // only sums systems that were actually called this tick.
+        if let Some(wb) = world.world_data_mut(world_entity) {
+            for timings in wb.debug_stats.system_timings.values_mut() {
+                timings.last_ms = 0.0;
             }
         }
-        let now = Instant::now();
 
         Self {
             world_entity,
-            tick_start: now,
+            tick_start: Instant::now(),
+        }
+    }
+    /// Release builds record no tick timing; the stub keeps call sites
+    /// (and the struct fields, used by `SystemTimer`) uniform.
+    #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
+    pub fn new(_world: &mut World, world_entity: hecs::Entity) -> Self {
+        Self {
+            world_entity,
+            tick_start: Instant::now(),
         }
     }
 
     /// Record the tick duration and update stats.
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub fn finish(self, world: &mut World) {
         let duration = self.tick_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -50,59 +57,62 @@ impl DebugSystemGuard {
 
         // Update debug stats in WorldBundle
         if let Some(wb) = world.world_data_mut(self.world_entity) {
-            #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-            {
-                let ds = &mut wb.debug_stats;
-                ds.tick_count += 1;
-                ds.entity_count = entity_count as u32;
-                ds.archetype_count = archetype_count as u32;
-                ds.last_tick_ms = duration;
-                ds.total_ticks_ms += duration;
+            let ds = &mut wb.debug_stats;
+            ds.tick_count += 1;
+            ds.entity_count = entity_count as u32;
+            ds.archetype_count = archetype_count as u32;
+            ds.last_tick_ms = duration;
+            ds.total_ticks_ms += duration;
 
-                // Keep only last 100 tick durations
-                if ds.tick_durations_ms.len() > 100 {
-                    ds.tick_durations_ms.remove(0);
-                }
-                ds.tick_durations_ms.push(duration);
+            // Keep only last 100 tick durations
+            if ds.tick_durations_ms.len() > 100 {
+                ds.tick_durations_ms.remove(0);
             }
+            ds.tick_durations_ms.push(duration);
         }
     }
+    /// Release builds record no tick stats; this is a no-op.
+    #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
+    pub fn finish(self, _world: &mut World) {}
 
     /// Record timing for a specific system.
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub fn record_system(&self, world: &mut World, system_name: &str, duration_ms: f64) {
-        #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-        {
-            if let Some(wb) = world.world_data_mut(self.world_entity) {
-                let ds = &mut wb.debug_stats;
-                let timings = &mut ds.system_timings;
-                let entry = timings.entry(system_name.to_string()).or_default();
-                entry.record(duration_ms);
-            }
+        if let Some(wb) = world.world_data_mut(self.world_entity) {
+            let ds = &mut wb.debug_stats;
+            let timings = &mut ds.system_timings;
+            let entry = timings.entry(system_name.to_string()).or_default();
+            entry.record(duration_ms);
         }
     }
+    /// Release builds record no system timings; this is a no-op.
+    #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
+    pub fn record_system(&self, _world: &mut World, _system_name: &str, _duration_ms: f64) {}
 
     /// Record timing for a specific system sub-part (detailed benchmark mode).
     #[allow(dead_code)] // Used in debug/benchmark builds via feature flags
+    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     pub fn record_detailed(&self, world: &mut World, key: &str, duration_ms: f64) {
-        #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-        {
-            if let Some(wb) = world.world_data_mut(self.world_entity) {
-                let ds = &mut wb.debug_stats;
-                // Only record if the parent system is in detailed mode
-                let parent = key.split('/').next().unwrap_or("");
-                if !ds.detailed_systems.contains(parent) {
-                    return;
-                }
-                let timings = &mut ds.detailed_timings;
-                // get-first: no throwaway `to_string()` per call (see record_system_timing).
-                let entry = match timings.get_mut(key) {
-                    Some(e) => e,
-                    None => timings.entry(key.to_string()).or_default(),
-                };
-                entry.record(duration_ms);
+        if let Some(wb) = world.world_data_mut(self.world_entity) {
+            let ds = &mut wb.debug_stats;
+            // Only record if the parent system is in detailed mode
+            let parent = key.split('/').next().unwrap_or("");
+            if !ds.detailed_systems.contains(parent) {
+                return;
             }
+            let timings = &mut ds.detailed_timings;
+            // get-first: no throwaway `to_string()` per call (see record_system_timing).
+            let entry = match timings.get_mut(key) {
+                Some(e) => e,
+                None => timings.entry(key.to_string()).or_default(),
+            };
+            entry.record(duration_ms);
         }
     }
+    /// Release builds record no detailed timings; this is a no-op.
+    #[allow(dead_code)] // Kept in lockstep with the debug implementation above
+    #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
+    pub fn record_detailed(&self, _world: &mut World, _key: &str, _duration_ms: f64) {}
 }
 
 /// Helper to measure system execution time.
@@ -236,11 +246,9 @@ pub fn hist_percentile(
 
 /// Get debug stats as JSON-serializable structure.
 pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serde_json::Value> {
-    let wb_ref = world.world_data(world_entity)?;
-    let wb = &*wb_ref;
-
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     {
+        let wb = world.world_data(world_entity)?;
         let stats = &wb.debug_stats;
         let tick_durations: Vec<f64> = stats.tick_durations_ms.to_vec();
         let avg_tick_ms = if tick_durations.is_empty() {
@@ -340,6 +348,11 @@ pub fn get_debug_stats(world: &World, world_entity: hecs::Entity) -> Option<serd
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     {
+        // No debug stats to serve in release builds; keep the debug branch's
+        // "None when the world entity has no data" contract.
+        if world.world_data(world_entity).is_none() {
+            return None;
+        }
         None
     }
 }

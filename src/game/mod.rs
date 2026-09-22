@@ -1,5 +1,6 @@
 //! Game module — ECS-based game engine using hecs.
 
+pub mod baselines;
 pub mod components;
 pub mod constants;
 pub mod debug_stats;
@@ -13,3 +14,7 @@ pub mod world_ext;
 pub mod economy;
 pub mod player;
 pub mod unit;
+
+// H5: engine-neutral network baselines (plain engine types, single commit
+// step) — the server's delta path diffs the current snapshot against them.
+pub use baselines::NetworkBaselines;

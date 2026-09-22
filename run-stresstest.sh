@@ -35,6 +35,7 @@ has_flag --bench-cities "${EXTRA[@]}" || EXTRA+=(--bench-cities 100)
 has_flag --bench-ticks "${EXTRA[@]}" || EXTRA+=(--bench-ticks 1500)
 has_flag --bench-splice "${EXTRA[@]}" || EXTRA+=(--bench-splice)
 
+mkdir -p reports
 cargo run --profile release --features debug-overlay,microbenchmarks,bench-alloc -- \
     --benchmark --bench-seed 42 \
     --bench-html "./reports/stress_${SUFFIX}.html" "${EXTRA[@]}"

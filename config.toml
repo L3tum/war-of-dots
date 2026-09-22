@@ -34,3 +34,35 @@ hill_radius_multiplier = 2.0
 [storage]
 database_path = "war_of_dots.db"
 replay_path = "replays"
+
+# --- Connection limits (Sec L2 — see docs/THREAT_MODEL.md) ----------------
+[network]
+# Max concurrent WebSocket connections (game /ws + spectator /ws/spectator).
+# New connections over the cap are rejected with a clear error message and
+# WS close code 1013 ("Try Again Later"). The read-only /ws/replay stream
+# is not counted but is rejected while the cap is reached.
+# Default: 64.
+max_ws_connections = 64
+# Max concurrent spectators per game. Over-cap joins receive an Error
+# message; earlier spectators are unaffected.
+# Default: 8.
+max_spectators_per_game = 8
+# Max concurrent lobbies (Sec M2). A CreateLobby that would exceed the cap
+# is rejected with a clear error; existing lobbies are unaffected. Idle
+# lobbies (no join activity for 30 minutes) are reaped by a periodic sweep,
+# so this also bounds the memory footprint of client-controlled custom unit
+# types (up to ~1 MB per lobby).
+# Default: 100.
+max_lobbies = 100
+
+# --- /debug/* endpoint gate (Sec L1) ---------------------------------------
+[debug]
+# Request-time gate for /debug/stats and /debug/benchmark (the latter only
+# exists with the microbenchmarks feature).
+# The routes are only registered in debug builds / with the `debug-overlay`
+# feature (same condition as the default); the handlers re-check this flag
+# at request time, so a route that is ever exposed must not execute debug
+# logic. The default follows the build (true in debug builds / with
+# debug-overlay, false in release) — leave it unset to keep that behavior.
+# Set `endpoints = false` to disable the endpoints in a debug build.
+# endpoints = true

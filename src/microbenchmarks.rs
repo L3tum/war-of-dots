@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::CityUpgradeSettings;
@@ -18,6 +19,10 @@ use crate::game::economy::{City, UnitType};
 use crate::game::game::{Game, GameSettings, InfluenceSettings, TickContext};
 use crate::game::unit::{Equipment, Terrain};
 use crate::game::world_ext::WorldExt;
+use crate::server::protocol::{
+    CityState, CityUpdate, EquipmentState, GameDeltaMessage, GameStateMessage, PlayerState,
+    UnitState, UnitUpdate,
+};
 use hecs::World;
 
 // ============================================================================
@@ -1708,6 +1713,231 @@ fn bench_map_settings() -> Vec<MicrobenchmarkResult> {
 }
 
 // ============================================================================
+// Protocol Benchmarks (CBOR encode/decode) — the server's per-tick and
+// first-push wire cost, measured on the real wire types (GameStateMessage /
+// GameDeltaMessage) with ciborium, the same encoder the live server uses
+// (`ciborium::into_writer` in the egress path).
+// ============================================================================
+
+/// A standard wire-format unit (the shape the frontend receives in
+/// FullState / units_added).
+fn protocol_unit_state(i: usize) -> UnitState {
+    let eq = EquipmentState {
+        name: "rifle".to_string(),
+        count: 10,
+        cost_per_item: 2.5,
+    };
+    UnitState {
+        id: format!("unit_{i}"),
+        owner: format!("player_{}", i % 4),
+        position: (5.0 + (i % 20) as f32, 5.0 + (i / 20) as f32),
+        unit_type: "infantry".to_string(),
+        symbol: "I".to_string(),
+        men: 100.0,
+        max_men: 1000.0,
+        organisation: 80.0,
+        equipment: vec![eq.clone()],
+        max_equipment: vec![eq],
+        path: vec![(10.0, 10.0), (11.0, 10.0)],
+        healing: false,
+        resupply_enabled: true,
+        supply_percent: 95.0,
+        encircled: false,
+        attacking: i.is_multiple_of(7),
+        on_water: false,
+        boat_supply_percent: 0.0,
+        embarking: false,
+        disembarking: false,
+    }
+}
+
+/// A full-state message: `w`×`h` terrain grid, `units` units, `cities`
+/// cities — the first-push shape the server sends on connect.
+fn make_full_state_msg(w: u32, h: u32, units: usize, cities: usize) -> GameStateMessage {
+    let terrain = vec![vec!["Plains".to_string(); h as usize]; w as usize];
+    GameStateMessage {
+        vision_grid: None,
+        border_grid: None,
+        terrain,
+        units: (0..units).map(protocol_unit_state).collect(),
+        cities: (0..cities)
+            .map(|i| CityState {
+                id: format!("city_{i}"),
+                position: (10.0, 10.0),
+                owner: Some(format!("player_{i}")),
+                manpower: 1000,
+                level: 1,
+            })
+            .collect(),
+        player: PlayerState {
+            funds: 1000,
+            units_owned: units as u32,
+            player_id: "player_0".to_string(),
+        },
+    }
+}
+
+/// A mid-game tick delta: `updates` sparse unit updates and no grid diff
+/// (the common case — grids ship as full/sparse diffs only when changed).
+fn make_delta_msg(updates: usize) -> GameDeltaMessage {
+    GameDeltaMessage {
+        vision_grid_diff: None,
+        vision_cells_changed: None,
+        border_grid_diff: None,
+        border_cells_changed: None,
+        grid_width: None,
+        units_added: Arc::new(Vec::new()),
+        units_removed: Arc::new(Vec::new()),
+        unit_updates: Arc::new(
+            (0..updates)
+                .map(|i| UnitUpdate {
+                    id: format!("unit_{i}"),
+                    position: Some(12_345),
+                    men: Some(100.0 - (i % 10) as f32),
+                    organisation: Some(80.0),
+                    equipment: Some(vec![10, 5]),
+                    path: Some(vec![(1.0, 2.0), (3.0, 4.0)]),
+                    healing: None,
+                    resupply_enabled: None,
+                    supply_percent: Some(95.0),
+                    encircled: None,
+                    attacking: Some(i % 7 == 0),
+                    on_water: None,
+                    boat_supply_percent: None,
+                    embarking: None,
+                    disembarking: None,
+                })
+                .collect(),
+        ),
+        city_updates: Arc::new(vec![CityUpdate {
+            id: "city_0".to_string(),
+            manpower: Some(990),
+            owner: None,
+            level: None,
+        }]),
+        player: PlayerState {
+            funds: 1000,
+            units_owned: updates as u32,
+            player_id: "player_0".to_string(),
+        },
+    }
+}
+
+fn bench_protocol() -> Vec<MicrobenchmarkResult> {
+    let cfg = BenchConfig::default();
+    let mut results = Vec::new();
+
+    /// Encode-then-decode a message and return the wire bytes (the decode
+    /// probes time the real client/server receive path against real bytes).
+    fn wire_bytes<T: serde::Serialize>(msg: &T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(msg, &mut bytes).expect("CBOR encode in setup");
+        bytes
+    }
+
+    // ── Full state, 200 units (typical first push) ──
+    let full200 = make_full_state_msg(20, 20, 200, 4);
+    let full200_bytes = wire_bytes(&full200);
+
+    let result = run_bench(
+        cfg,
+        || {},
+        || {
+            let mut buf: Vec<u8> = Vec::with_capacity(full200_bytes.len());
+            let _ = ciborium::into_writer(&full200, &mut buf);
+            black_box(0);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "protocol/cbor_encode_full_state_200u".to_string(),
+        group: "protocol".to_string(),
+        ..result
+    });
+
+    let result = run_bench(
+        cfg,
+        || {},
+        || {
+            let _ = ciborium::from_reader::<GameStateMessage, _>(&full200_bytes[..]);
+            black_box(0);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "protocol/cbor_decode_full_state_200u".to_string(),
+        group: "protocol".to_string(),
+        ..result
+    });
+
+    // ── Delta, 100 unit updates (typical per-tick push) ──
+    let delta100 = make_delta_msg(100);
+    let delta100_bytes = wire_bytes(&delta100);
+
+    let result = run_bench(
+        cfg,
+        || {},
+        || {
+            let mut buf: Vec<u8> = Vec::with_capacity(delta100_bytes.len());
+            let _ = ciborium::into_writer(&delta100, &mut buf);
+            black_box(0);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "protocol/cbor_encode_delta_100u".to_string(),
+        group: "protocol".to_string(),
+        ..result
+    });
+
+    let result = run_bench(
+        cfg,
+        || {},
+        || {
+            let _ = ciborium::from_reader::<GameDeltaMessage, _>(&delta100_bytes[..]);
+            black_box(0);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "protocol/cbor_decode_delta_100u".to_string(),
+        group: "protocol".to_string(),
+        ..result
+    });
+
+    // ── Full state, 1000 units (lobby→game scale-up) ──
+    let full1000 = make_full_state_msg(50, 50, 1000, 10);
+    let full1000_bytes = wire_bytes(&full1000);
+
+    let result = run_bench(
+        cfg,
+        || {},
+        || {
+            let mut buf: Vec<u8> = Vec::with_capacity(full1000_bytes.len());
+            let _ = ciborium::into_writer(&full1000, &mut buf);
+            black_box(0);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "protocol/cbor_encode_full_state_1000u".to_string(),
+        group: "protocol".to_string(),
+        ..result
+    });
+
+    let result = run_bench(
+        cfg,
+        || {},
+        || {
+            let _ = ciborium::from_reader::<GameStateMessage, _>(&full1000_bytes[..]);
+            black_box(0);
+        },
+    );
+    results.push(MicrobenchmarkResult {
+        id: "protocol/cbor_decode_full_state_1000u".to_string(),
+        group: "protocol".to_string(),
+        ..result
+    });
+
+    results
+}
+
+// ============================================================================
 // Public Runner
 // ============================================================================
 
@@ -1735,6 +1965,12 @@ pub fn run_microbenchmarks() -> Vec<MicrobenchmarkResult> {
         print_result(r);
     }
     results.extend(map_settings);
+
+    let protocol = bench_protocol();
+    for r in &protocol {
+        print_result(r);
+    }
+    results.extend(protocol);
 
     println!("  ───────────────────────────────────────────────");
     println!("  Microbenchmarks complete: {} benchmarks", results.len());
@@ -1796,4 +2032,72 @@ pub fn results_to_json(results: &[MicrobenchmarkResult]) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "count": results.len()
     })
+}
+
+// ============================================================================
+// CI Performance Gates
+// ============================================================================
+//
+// Median-based regression gates for the protocol (CBOR encode/decode) probes.
+// Gated behind the `microbenchmarks` feature so the default test suite stays
+// fast; CI runs them via:
+//
+//   cargo test --features microbenchmarks --lib microbenchmarks::perf_gates
+//
+// Thresholds are set at ~5× the measured median on a development machine so
+// they act as regression tripwires ("something got 5× slower"), not absolute
+// performance budgets — shared CI runners are both faster and noisier than
+// dev hardware, and median (not mean) keeps clock-noise spikes from flaking
+// a healthy build. Raising a gate requires the measured numbers in the PR.
+#[cfg(test)]
+mod perf_gates {
+    use super::*;
+
+    /// (benchmark id, max allowed median in ns).
+    ///
+    /// Measured 2026-09-22 on a dev machine (AMD Ryzen, debug profile —
+    /// the same profile CI's gate step builds), 3 consecutive runs, n=100
+    /// timed iterations each. Values below are the WORST run of the three
+    /// (run-to-run variance reached ~2× under load, which is why the gate
+    /// carries a 5× margin on top of the worst sample):
+    ///   protocol/cbor_encode_full_state_200u   median =  7,356,306 ns
+    ///   protocol/cbor_decode_full_state_200u   median = 13,555,611 ns
+    ///   protocol/cbor_encode_delta_100u        median =  1,334,801 ns
+    ///   protocol/cbor_decode_delta_100u        median =  1,891,052 ns
+    ///   protocol/cbor_encode_full_state_1000u  median = 22,211,617 ns
+    ///   protocol/cbor_decode_full_state_1000u  median = 57,008,235 ns
+    /// Gates below = 5× each worst-run value, rounded up to clean numbers.
+    const GATES: &[(&str, f64)] = &[
+        ("protocol/cbor_encode_full_state_200u", 40_000_000.0), // 40 ms
+        ("protocol/cbor_decode_full_state_200u", 70_000_000.0), // 70 ms
+        ("protocol/cbor_encode_delta_100u", 7_000_000.0),       // 7 ms
+        ("protocol/cbor_decode_delta_100u", 10_000_000.0),      // 10 ms
+        ("protocol/cbor_encode_full_state_1000u", 120_000_000.0), // 120 ms
+        ("protocol/cbor_decode_full_state_1000u", 300_000_000.0), // 300 ms
+    ];
+
+    fn find<'a>(results: &'a [MicrobenchmarkResult], id: &str) -> &'a MicrobenchmarkResult {
+        results
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("perf gate: benchmark `{id}` missing from results"))
+    }
+
+    #[test]
+    fn protocol_cbor_median_gates() {
+        let results = bench_protocol();
+        for (id, max_median_ns) in GATES {
+            let r = find(&results, id);
+            assert!(
+                r.median_ns <= *max_median_ns,
+                "{id}: median {med:.0}ns exceeds gate {gate:.0}ns (min {min:.0}, p99 {p99:.0}, n={n}) — \
+                 investigate the regression before raising the gate",
+                med = r.median_ns,
+                gate = *max_median_ns,
+                min = r.min_ns,
+                p99 = r.p99_ns,
+                n = r.n,
+            );
+        }
+    }
 }

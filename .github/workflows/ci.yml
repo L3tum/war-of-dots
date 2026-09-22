@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (build + clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build (debug)
+        run: cargo build
+
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The dhat heap-growth test uses a process-global allocator, so running
+      # it alongside the other test binaries makes its bound flaky (same
+      # reason the Makefile `test` target splits it out).
+      - name: Tests (full suite)
+        run: cargo test --all-targets -- --skip alloc_invariants::warm_tick_net_heap_growth_is_bounded
+
+      - name: dhat heap-growth test (isolated for a clean measurement)
+        run: cargo test --lib alloc_invariants::warm_tick_net_heap_growth_is_bounded -- --exact
+
+      # Median-based perf gates for the microbenchmark probes (feature-gated,
+      # so they do not slow the default suite). Thresholds carry wide
+      # headroom for CI hardware — see src/microbenchmarks.rs perf_gates.
+      - name: Perf probe median gates
+        run: cargo test --features microbenchmarks --lib microbenchmarks::perf_gates
+
+      - name: Check release (validates cfg'd-out paths)
+        run: cargo check --release --lib --bins
+
+  schema:
+    name: Protocol schema (regenerate + diff + typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Root package.json carries the json2ts dev dependency; the frontend
+      # job installs the rest for the post-regen typecheck.
+      - name: Install (root)
+        run: npm ci
+
+      - name: Install (frontend)
+        working-directory: frontend
+        run: npm ci
+
+      # Regenerate the tracked JSON schema from the CURRENT Rust wire types.
+      # A commit that adds a variant/field but forgets to regenerate the
+      # schema breaks here — the diff below is the drift gate.
+      - name: Regenerate protocol.schema.json
+        run: cargo run --bin generate_schema
+
+      - name: Assert tracked schema matches the Rust types
+        run: git diff --exit-code frontend/schema/protocol.schema.json
+
+      # frontend/src/generated/ is gitignored (local build artifact) — so
+      # "clean diff" for the TS side means: regenerate it and prove the
+      # frontend typechecks against the freshly generated types. mkdir: the
+      # dir is gitignored, so a fresh CI checkout has no such directory.
+      - name: Regenerate frontend/src/generated/protocol.ts
+        run: |
+          mkdir -p frontend/src/generated
+          npx json2ts frontend/schema/protocol.schema.json > frontend/src/generated/protocol.ts
+
+      - name: Typecheck frontend against fresh types
+        working-directory: frontend
+        run: npm run typecheck
+
+  frontend:
+    name: Frontend (typecheck + unit tests + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Root package.json only carries the JSON-schema codegen dev dependency;
+      # the frontend job installs both so a future root-level script works.
+      - name: Install (root)
+        run: npm ci
+
+      - name: Install (frontend)
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Unit tests (vitest)
+        working-directory: frontend
+        run: npm test
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+  e2e:
+    name: E2E (Playwright vs live Rust server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # run_e2e.sh gates on xvfb-run (headed Chromium + SwiftShader); the
+      # Playwright install below covers Chromium's own system libraries.
+      - name: Install xvfb
+        run: sudo apt-get update -y && sudo apt-get install -y xvfb
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright Chromium (with system deps)
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      # The real server binary (serves the baked frontend + /ws). run_e2e.sh
+      # also builds its own debug binary as the live layer's default, so the
+      # debug profile compiles here as well — expected, not a bug.
+      - name: Build server binary (release)
+        run: cargo build --release
+
+      - name: Run E2E suite (exit 77 = skipped = FAIL in CI)
+        run: |
+          set +e
+          WOZ_E2E_SERVER_BIN="$GITHUB_WORKSPACE/target/release/war-of-dots" \
+            bash frontend/e2e/run_e2e.sh
+          code=$?
+          set -e
+          if [ "$code" -eq 77 ]; then
+            echo "E2E SKIPPED"
+            echo "::error::E2E SKIPPED — run_e2e.sh exited 77 (a required tool or the server binary was missing). A silent skip must not pass CI; see the 'Tool check' output above for the gate that failed."
+            exit 77
+          fi
+          if [ "$code" -ne 0 ]; then
+            echo "::error::E2E suite failed with exit code $code"
+            exit "$code"
+          fi
+          echo "E2E PASSED"

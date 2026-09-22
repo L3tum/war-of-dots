@@ -6,6 +6,7 @@ import {
   applyCells,
   applyEquipmentCounts,
   mapSizeFromTerrain,
+  stripUndefined,
   unpackUnitPosition,
 } from './connection';
 import { Connection } from './connection';
@@ -18,19 +19,6 @@ import type { Spectator } from '../ui/spectator';
 import type { Advisor } from '../ui/advisor';
 import type { LobbyUI } from '../ui/lobby';
 import type { UnitState, CityState, EquipmentState } from '../generated/protocol';
-
-/** Recursively remove `undefined` values from plain objects and arrays. */
-function stripUndefined(value: unknown): unknown {
-  if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(stripUndefined);
-  const result: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(value)) {
-    if (val !== undefined) {
-      result[key] = stripUndefined(val);
-    }
-  }
-  return result;
-}
 
 describe('I4 sparse changed-cell apply (applyCells)', () => {
   it('applies packed (value<<bits)|index entries to a vision grid, incl. 1→0 flips', () => {
@@ -1014,5 +1002,60 @@ describe('Connection (real class, fake WebSocket)', () => {
 
     h.ws.feedServerMessage({ ClearSpectator: null });
     expect(h.spectator.clearAll).toHaveBeenCalled();
+  });
+
+  /**
+   * Debug-log scrubbing guard (WP2): the per-frame `console.log`/`console.debug`
+   * calls that used to sit in the send/dispatch path (one log per WebSocket
+   * frame, both directions) were pure debug noise — the payload is fully
+   * re-derivable from gameState — and are removed. This asserts that a full
+   * handshake + representative full/delta traffic + an outbound send never
+   * reaches the console with a `[WS]` frame log. (One-shot lifecycle logs
+   * like 'negotiated features' are fine; per-frame frame-payload logs are not.)
+   */
+  it('hot-path traffic never logs frame payloads to the console', () => {
+    const logged: unknown[][] = [];
+    const spyLog = vi.spyOn(console, 'log').mockImplementation((...args) => logged.push(args));
+    const spyDebug = vi.spyOn(console, 'debug').mockImplementation((...args) => logged.push(args));
+    const spyInfo = vi.spyOn(console, 'info').mockImplementation((...args) => logged.push(args));
+    try {
+      // Full handshake, then representative full + delta traffic...
+      h.ws.feedServerMessage({ HelloAck: { protocol_version: 1, features: 0 } });
+      h.ws.feedServerMessage({
+        FullState: {
+          terrain: Array.from({ length: 4 }, () => Array(4).fill('Plains')),
+          units: [makeUnitState()],
+          cities: [makeCityState()],
+          player: { funds: 100, units_owned: 1, player_id: 'player_0' },
+        },
+      });
+      h.ws.feedServerMessage({
+        DeltaState: {
+          unit_updates: [{ id: 'u1', position: 0, equipment: [5] }],
+          city_updates: [],
+          units_added: [],
+          units_removed: [],
+          player: { funds: 101, units_owned: 1, player_id: 'player_0' },
+        },
+      });
+      // ...and outbound traffic (HelloAck delivered → raw send path).
+      h.conn.send({ MoveTroop: { troop_id: 'u1', path: [[1, 1]] } });
+    } finally {
+      spyLog.mockRestore();
+      spyDebug.mockRestore();
+      spyInfo.mockRestore();
+    }
+
+    // No per-frame frame logs in either direction, ever.
+    const frameLogs = logged.filter((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('[WS]')),
+    );
+    expect(frameLogs).toEqual([]);
+    // console.debug was only used by the removed hot-path logs.
+    expect(spyDebug).not.toHaveBeenCalled();
+    // The traffic itself was applied (proves the guard ran with real flow,
+    // not with the handlers short-circuited).
+    expect(h.gameState.player.funds).toBe(101);
+    expect(h.gameState.units.get('u1')!.equipment[0].count).toBe(5);
   });
 });

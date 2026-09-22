@@ -8,6 +8,86 @@ pub struct Config {
     pub llm: LlmConfig,
     pub standard_ruleset: StandardRuleset,
     pub storage: StorageConfig,
+    /// Connection limits (Sec L2). Omit the section to use defaults.
+    #[serde(default)]
+    pub network: NetworkConfig,
+    /// /debug/* endpoint gate (see docs/THREAT_MODEL.md). Omit to use the
+    /// build-following default.
+    #[serde(default)]
+    pub debug: DebugConfig,
+}
+
+/// Connection limits (Sec L2, docs/THREAT_MODEL.md). Caps are enforced at
+/// the connection/accept point in game_server.rs: over-cap WebSocket
+/// connections are rejected with a clear error message + WS close code 1013
+/// ("Try Again Later"); over-cap spectator joins receive an Error message
+/// while earlier spectators are unaffected. The lobby cap is enforced at
+/// CreateLobby (Sec M2): over-cap creations are rejected with a clear error
+/// while existing lobbies are unaffected.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NetworkConfig {
+    /// Max concurrent WebSocket connections (game `/ws` + spectator
+    /// `/ws/spectator`; the self-terminating read-only `/ws/replay` is not
+    /// counted but is rejected while the cap is reached). Default: 64.
+    #[serde(default = "default_max_ws_connections")]
+    pub max_ws_connections: usize,
+    /// Max concurrent spectators per game. Default: 8.
+    #[serde(default = "default_max_spectators_per_game")]
+    pub max_spectators_per_game: usize,
+    /// Max concurrent lobbies (Sec M2). A CreateLobby that would exceed the
+    /// cap is rejected with a clear error; existing lobbies are unaffected.
+    /// Each lobby can retain up to ~1 MB of client-controlled custom unit
+    /// types, so this also bounds that memory footprint. Default: 100.
+    #[serde(default = "default_max_lobbies")]
+    pub max_lobbies: usize,
+}
+
+fn default_max_ws_connections() -> usize {
+    64
+}
+fn default_max_spectators_per_game() -> usize {
+    8
+}
+fn default_max_lobbies() -> usize {
+    100
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            max_ws_connections: default_max_ws_connections(),
+            max_spectators_per_game: default_max_spectators_per_game(),
+            max_lobbies: default_max_lobbies(),
+        }
+    }
+}
+
+/// Gate for the /debug/* HTTP endpoints (Sec L1, docs/THREAT_MODEL.md).
+#[derive(Debug, Deserialize, Clone)]
+pub struct DebugConfig {
+    /// Request-time gate for /debug/stats and /debug/benchmark (the latter
+    /// only exists with the `microbenchmarks` feature).
+    /// Default follows the build: `true` in debug builds / with the
+    /// `debug-overlay` feature, `false` in plain release — the same condition
+    /// under which the routes are registered. The routes are only registered
+    /// in those builds, but the handlers re-check this flag at request time
+    /// so an exposed route (misconfigured proxy, feature-flag slip) must not
+    /// execute debug logic. Set `false` to disable the endpoints in a debug
+    /// build.
+    #[serde(default = "default_debug_endpoints")]
+    pub endpoints: bool,
+}
+
+fn default_debug_endpoints() -> bool {
+    cfg!(any(debug_assertions, feature = "debug-overlay"))
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: default_debug_endpoints(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -133,7 +213,7 @@ pub struct StandardRuleset {
     /// Manpower is always used when recruiting — it is not gated behind city upgrades.
     #[serde(default = "default_initial_manpower")]
     pub initial_manpower: u32,
-    /// Funds generated per city per economy tick (default: 1.0)
+    /// Funds generated per city per economy tick (default: 20.0)
     #[serde(default = "default_funds_per_city")]
     pub funds_per_city: f32,
     /// Game tick speed in ticks per second (default: 60)
@@ -242,6 +322,66 @@ pub struct StorageConfig {
     pub replay_path: String,
 }
 
+#[cfg(test)]
+mod network_config_tests {
+    use super::*;
+
+    /// Omitting both sections must still yield the documented defaults —
+    /// every existing config file (and the test tomls) predates them.
+    #[test]
+    fn caps_and_debug_gate_default_when_omitted() {
+        let cfg: Config = toml::from_str(
+            r#"
+[llm]
+
+[standard_ruleset]
+enabled = true
+unit_types = []
+
+[storage]
+database_path = ":memory:"
+replay_path = "replays"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.network.max_ws_connections, 64);
+        assert_eq!(cfg.network.max_spectators_per_game, 8);
+        assert_eq!(cfg.network.max_lobbies, 100);
+        // The flag defaults follow the build (debug in `cargo test`).
+        assert_eq!(cfg.debug.endpoints, default_debug_endpoints());
+    }
+
+    #[test]
+    fn caps_and_debug_gate_parse_explicit_values() {
+        let cfg: Config = toml::from_str(
+            r#"
+[llm]
+
+[standard_ruleset]
+enabled = true
+unit_types = []
+
+[storage]
+database_path = ":memory:"
+replay_path = "replays"
+
+[network]
+max_ws_connections = 7
+max_spectators_per_game = 3
+max_lobbies = 5
+
+[debug]
+endpoints = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.network.max_ws_connections, 7);
+        assert_eq!(cfg.network.max_spectators_per_game, 3);
+        assert_eq!(cfg.network.max_lobbies, 5);
+        assert!(!cfg.debug.endpoints);
+    }
+}
+
 pub fn load(path: &str) -> Result<Config, crate::errors::ConfigError> {
     let content =
         std::fs::read_to_string(path).map_err(|_| crate::errors::ConfigError::NotFound {
@@ -311,6 +451,17 @@ impl Config {
             ut.equipment = ut.equipment.iter().map(|e| expand_env_vars(e)).collect();
         }
 
+        // M5: configured circle radii are hard-clamped to the span table's max
+        // in the influence hot path (see `influence::clamp_circle_radius`), so
+        // an oversized radius would otherwise be silently ignored. Warn once
+        // per load (not per tick, not per city), naming the setting, the
+        // provided value, and the clamped value.
+        if let Some(inf) = &self.standard_ruleset.influence {
+            for warning in influence_radius_warnings(inf) {
+                tracing::warn!("{warning}");
+            }
+        }
+
         self
     }
 
@@ -321,6 +472,48 @@ impl Config {
             .clone()
             .unwrap_or_default()
     }
+}
+
+/// Names the influence radii the circle-span table will clamp (see
+/// `game::systems::influence::clamp_circle_radius`). The hot path clamps
+/// silently; this is the loud layer, run exactly once per config load.
+/// One message per clamped radius: the setting(s), the provided effective
+/// radius, and the value the engine will actually use. When the base
+/// `unit_radius` is itself clamped, the multiplier products are skipped —
+/// the base message already names the cap they hit.
+fn influence_radius_warnings(inf: &crate::game::game::InfluenceSettings) -> Vec<String> {
+    let (base_clamped, base_fired) =
+        crate::game::systems::influence::clamp_circle_radius(inf.unit_radius);
+    let mut warnings = Vec::new();
+    if base_fired {
+        warnings.push(format!(
+            "influence.unit_radius = {} is clamped to {} by the circle-span table — \
+             vision/influence will not extend beyond radius {}",
+            inf.unit_radius, base_clamped, base_clamped
+        ));
+        return warnings;
+    }
+    // Base radius in range: a multiplier can still push the effective
+    // radius past the table (e.g. hill_radius_multiplier) — warn per product.
+    let cases: [(&str, f32); 2] = [
+        (
+            "unit_radius × city_radius_multiplier",
+            inf.unit_radius * inf.city_radius_multiplier,
+        ),
+        (
+            "unit_radius × hill_radius_multiplier",
+            inf.unit_radius * inf.hill_radius_multiplier,
+        ),
+    ];
+    for (setting, value) in cases {
+        if let (clamped, true) = crate::game::systems::influence::clamp_circle_radius(value) {
+            warnings.push(format!(
+                "influence.{setting} = {value} is clamped to {clamped} by the circle-span \
+                 table — vision/influence will not extend beyond radius {clamped}"
+            ));
+        }
+    }
+    warnings
 }
 
 impl Default for CityUpgradeSettings {
@@ -508,5 +701,86 @@ mod tests {
     #[test]
     fn expand_env_vars_empty_string() {
         assert_eq!(expand_env_vars(""), "");
+    }
+
+    /// The shipped root `config.toml` must keep parsing — a typo in a new
+    /// section (e.g. `[network]`) would otherwise only surface when an
+    /// operator starts the server. Cargo runs tests from the package root,
+    /// so the path resolves.
+    #[test]
+    fn repo_config_toml_parses_with_sec_sections() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml");
+        let raw = std::fs::read_to_string(path).expect("read config.toml");
+        let cfg: Config = toml::from_str(&raw).expect("config.toml parses");
+        // The shipped values match the documented Sec L2 defaults.
+        assert_eq!(cfg.network.max_ws_connections, 64);
+        assert_eq!(cfg.network.max_spectators_per_game, 8);
+        // The shipped [network] section documents the max_lobbies default.
+        assert_eq!(cfg.network.max_lobbies, 100);
+        // The [debug] section ships commented out: the default follows the
+        // build (true in debug builds / debug-overlay, false in release).
+        assert_eq!(
+            cfg.debug.endpoints,
+            cfg!(any(debug_assertions, feature = "debug-overlay"))
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // M5: circle-span radius clamp warnings (once per load, named values)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn influence_radius_warns_when_clamped() {
+        // Provided 15 → the engine will silently use 10; the load-time warn
+        // must name the setting, the provided value, and the clamped value.
+        let inf = crate::game::game::InfluenceSettings {
+            unit_radius: 15.0,
+            city_radius_multiplier: 1.0,
+            hill_radius_multiplier: 1.0,
+            ..Default::default()
+        };
+        let warnings = influence_radius_warnings(&inf);
+        assert_eq!(warnings.len(), 1, "one warning for one oversized radius");
+        assert!(warnings[0].contains("unit_radius"), "{}", warnings[0]);
+        assert!(warnings[0].contains("15"), "{}", warnings[0]);
+        assert!(warnings[0].contains("10"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn influence_radius_multiplied_radius_warns_per_knob() {
+        // Base radius fine, but hill multiplier pushes the effective radius
+        // past the span table max: exactly one warning, for that product.
+        let inf = crate::game::game::InfluenceSettings {
+            unit_radius: 6.0,
+            city_radius_multiplier: 1.0,
+            hill_radius_multiplier: 2.0, // 6 × 2.0 = 12 → clamped to 10
+            ..Default::default()
+        };
+        let warnings = influence_radius_warnings(&inf);
+        assert_eq!(warnings.len(), 1, "{}", warnings.join(" | "));
+        assert!(
+            warnings[0].contains("hill_radius_multiplier"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn influence_radius_no_warn_within_span_table() {
+        let inf = crate::game::game::InfluenceSettings {
+            unit_radius: 7.0,
+            city_radius_multiplier: 1.0,
+            hill_radius_multiplier: 1.0,
+            ..Default::default()
+        };
+        assert!(influence_radius_warnings(&inf).is_empty());
+    }
+
+    #[test]
+    fn influence_defaults_do_not_warn() {
+        // The shipped config.toml values must load silently.
+        assert!(
+            influence_radius_warnings(&crate::game::game::InfluenceSettings::default()).is_empty()
+        );
     }
 }

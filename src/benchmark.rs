@@ -20,15 +20,16 @@ use rand::{Rng, SeedableRng};
 use crate::config::CityUpgradeSettings;
 use crate::game::economy::UnitType;
 use crate::game::game::{Game, GameSettings, InfluenceSettings};
+// H5: engine-neutral network baselines (engine module, plain engine types).
+use crate::game::NetworkBaselines;
 use crate::map::map::{Map, MapConfig};
 #[cfg(feature = "microbenchmarks")]
 use crate::microbenchmarks;
 use crate::server::delta::{
-    build_delta_inner, run_network_phase, NetworkBaselines, UnitBaselineStore,
+    build_delta_inner, init_unit_baselines, run_network_phase, update_unit_baselines, TickDiffs,
+    UnitBaselineStore,
 };
-use crate::server::protocol::{
-    encode_message_with_hint, estimate_delta_size, CityState, ServerMessage,
-};
+use crate::server::protocol::{encode_message_with_hint, estimate_delta_size, ServerMessage};
 
 /// Number of measured (timed) runs per benchmark; the per-tick series are
 /// averaged across these runs and summary latency/overhead stats are computed
@@ -345,7 +346,12 @@ fn bench_spectator_delta(
             out.extend_from_slice(&map_bytes);
             Some(out)
         } else {
-            Some(encode_message_with_hint(&delta, estimate_delta_size(dref)))
+            // M3/W7: encode is now fallible — a failure here is a harness
+            // bug (encoding valid types), not a runtime condition.
+            Some(
+                encode_message_with_hint(&delta, estimate_delta_size(dref))
+                    .expect("benchmark: spectator delta encode failed"),
+            )
         }
     } else {
         None
@@ -353,9 +359,7 @@ fn bench_spectator_delta(
     // Commit the vision baseline unconditionally (game_server does the same
     // even when the idle-skip fires).
     if let Some(v) = &spec_vision {
-        net_baselines
-            .prev_vision
-            .insert(spec_pid.clone(), Arc::clone(v));
+        net_baselines.commit_vision(spec_pid.clone(), Arc::clone(v));
     }
     (
         emitted.map(|e| e.len() as u64).unwrap_or(0),
@@ -666,16 +670,13 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             .collect();
         // W4: run_network_phase takes &[&str] — borrowed pid list, no clones.
         let player_id_strs: Vec<&str> = player_ids.iter().map(|s| s.as_str()).collect();
-        let mut net_baselines: NetworkBaselines = NetworkBaselines {
-            prev_units: UnitBaselineStore::default(),
-            prev_cities: game
-                .query_cities()
-                .iter()
-                .map(|c| (c.id.clone(), c.into()))
-                .collect(),
-            prev_funds: game.all_player_funds(),
-            prev_border: game.territory_grid_flat(),
-            prev_vision: {
+        // H5: engine-neutral baselines live in the ENGINE module (plain
+        // engine types, single commit step); the wire-typed unit baseline
+        // store stays server-side (Arch H2) and is seeded alongside.
+        let mut net_baselines = NetworkBaselines::from_snapshot(
+            game.query_cities(),
+            game.all_player_funds(),
+            {
                 let mut m = std::collections::HashMap::new();
                 for pid in &player_ids {
                     if let Some(v) = game.vision_grid_flat(pid) {
@@ -684,17 +685,19 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 }
                 m
             },
-        };
+            game.territory_grid_flat(),
+        );
         // I1: seed the entity-indexed unit baseline store ONCE (the live tick
         // loop does the same) — the per-tick `prev_units` HashMap rebuild is
         // gone; the in-place pass commits it instead.
-        game.init_unit_baselines(&mut net_baselines.prev_units);
+        let mut unit_baselines = UnitBaselineStore::default();
+        init_unit_baselines(&game, &mut unit_baselines);
 
         // W5: synthetic spectator baseline (pid ""), seeded from the union
         // vision grid so warmup reaches steady state like game_server does.
         if config.bench_spectator {
             if let Some(v) = game.union_vision_grid_flat(&player_ids) {
-                net_baselines.prev_vision.insert(String::new(), Arc::new(v));
+                net_baselines.commit_vision(String::new(), Arc::new(v));
             }
         }
 
@@ -702,17 +705,19 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
         for _ in 0..BENCH_WARMUP_TICKS {
             sim.tick(&mut game, &config);
             game.tick_game();
-            let unit_diff = game.update_states_in_place(&mut net_baselines.prev_units);
-            // W7: convert City → CityState while the world guard is alive (no
-            // redundant full Vec<City> clone).
-            let current_cities: Vec<CityState> =
-                game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
+            let unit_diff = update_unit_baselines(&game, &mut unit_baselines);
+            // H5: plain engine city snapshot (the server converts to wire
+            // types only inside the diff/commit).
+            let current_cities: Vec<crate::game::economy::City> = game.query_cities();
             let phase = run_network_phase(
                 &game,
                 &mut net_baselines,
                 &player_id_strs,
-                unit_diff,
-                current_cities,
+                TickDiffs {
+                    units: unit_diff,
+                    cities: current_cities,
+                    border_grid: game.territory_grid_flat(),
+                },
                 config.bench_splice,
                 None, // no replay recording in the benchmark
             );
@@ -766,7 +771,7 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // Network phase (W1): snapshot + build + encode per-player deltas,
             // measured as a system via tick_system! so it appears in the
             // per-system P90/P99 breakdown and alloc table alongside ECS systems.
-            // The in-place unit diff (update_states_in_place) + cities
+            // The in-place unit diff (update_unit_baselines) + cities
             // read-back snapshot is inside the timing block so its allocs
             // are attributed to "network" (matching the pre-W1 behaviour
             // where run_network_phase called them internally).
@@ -777,11 +782,16 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     // timing cost.
                     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
                     let snapshot_start = std::time::Instant::now();
-                    let unit_diff = game.update_states_in_place(&mut net_baselines.prev_units);
-                    // W7: convert City → CityState while the world guard is alive
-                    // (no per-tick Vec<City> clone).
-                    let current_cities: Vec<CityState> =
-                        game.with_cities(|cities| cities.iter().map(|c| c.into()).collect());
+                    let unit_diff = update_unit_baselines(&game, &mut unit_baselines);
+                    // H5: plain engine city snapshot (the server converts to
+                    // wire types only inside the diff/commit).
+                    let current_cities: Vec<crate::game::economy::City> = game.query_cities();
+                    // B0 attribution note: `territory_grid_flat` is an
+                    // allocation-free Arc clone; fetching it OUTSIDE the
+                    // snapshot sub-window matches its pre-H3 placement
+                    // (it ran before the shared-compute window inside
+                    // `run_network_phase`).
+                    let border_grid = game.territory_grid_flat();
                     #[cfg(any(feature = "microbenchmarks", feature = "bench-alloc"))]
                     let snapshot_ms = snapshot_start.elapsed().as_secs_f64() * 1000.0;
                     #[cfg(not(any(feature = "microbenchmarks", feature = "bench-alloc")))]
@@ -791,8 +801,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                             &game,
                             &mut net_baselines,
                             &player_id_strs,
-                            unit_diff,
-                            current_cities,
+                            TickDiffs {
+                                units: unit_diff,
+                                cities: current_cities,
+                                border_grid,
+                            },
                             config.bench_splice,
                             None, // no replay recording in the benchmark
                         ),

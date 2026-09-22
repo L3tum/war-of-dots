@@ -1023,3 +1023,163 @@ describe('Config constants', () => {
     }
   });
 });
+
+// ============================================================================
+// Perf #3 — territory/fog change detection
+// (the dirty flags fire on every delta; the pipeline must skip the full
+//  40k-cell recompute when its inputs actually changed is false)
+// ============================================================================
+
+describe('Perf #3 — territory + fog change detection', () => {
+  const CAM = { x: 512, y: 256, zoom: 1 };
+
+  function setup(): Harness {
+    const harness = makeRenderer();
+    harness.renderer.camera = { ...CAM };
+    return harness;
+  }
+
+  it('skips the territory BFS when grid + cities are unchanged', () => {
+    const { renderer } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(1);
+
+    // Dirty flag alone (no content change) must not trigger a BFS
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(1);
+
+    // A single-cell grid change → recompute
+    state.borderGrid[2][3] = state.borderGrid[2][3] === 0 ? 1 : 0;
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(2);
+
+    // A city owner change is an input too (anchors feed the BFS)
+    state.cities.get('c1')!.owner = 'player_1';
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(3);
+  });
+
+  it('a city position change triggers a recompute (anchor key)', () => {
+    const { renderer } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(1);
+
+    state.cities.get('c1')!.position = [7, 5];
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(2);
+  });
+
+  it('keeps the border upload identical across a skipped pass', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    const b = buffersOf(renderer);
+    const first = new Float32Array(latestPayload(device.queue, b.borderPositionsBuffer));
+
+    // Same content, dirty flag set again → no BFS, same uploaded positions
+    renderer.markBorderDirty();
+    renderer.render(state);
+    const again = latestPayload(device.queue, b.borderPositionsBuffer);
+    expect(again).toEqual(first);
+  });
+
+  it('skips the border position upload when edges + zoom are unchanged; re-uploads on zoom change', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    const b = buffersOf(renderer);
+    const writes1 = writeCallsTo(device.queue, b.borderPositionsBuffer).length;
+    expect(writes1).toBe(1);
+
+    // Same edges + same zoom (e.g. a unit-movement frame) → no re-upload
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(writeCallsTo(device.queue, b.borderPositionsBuffer).length).toBe(writes1);
+
+    // Zoom change → line width changes → re-upload
+    renderer.camera.zoom = 2;
+    renderer.render(state);
+    expect(writeCallsTo(device.queue, b.borderPositionsBuffer).length).toBe(writes1 + 1);
+    expect(latestPayload(device.queue, b.borderPositionsBuffer).length).toBeGreaterThan(0);
+  });
+
+  it('clearing the border grid drops the borders; re-sending identical content restores them', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    const original = state.borderGrid;
+    renderer.render(state);
+    const b = buffersOf(renderer);
+    expect(renderer.territoryRecomputeCount).toBe(1);
+
+    // Grid cleared → no borders, no recompute
+    state.borderGrid = [];
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(1);
+
+    // Re-send the exact same grid content → must recompute + re-upload
+    // (the cleared pass must have reset the committed snapshot)
+    state.borderGrid = original;
+    renderer.markBorderDirty();
+    renderer.render(state);
+    expect(renderer.territoryRecomputeCount).toBe(2);
+    expect(writeCallsTo(device.queue, b.borderPositionsBuffer).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('fog: flag forces a rewrite, flagless renders stay stable, uploads mirror content', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(1);
+
+    // No flag, no content change → no rewrite
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(1);
+
+    // Flag → rewrite (existing contract) — even when content is identical
+    renderer.markFogDirty();
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(2);
+
+    // Flag cleared → stable again
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(2);
+
+    // A real content flip (flagged) rewrites with the flipped alpha
+    state.visionGrid[0][0] = !state.visionGrid[0][0];
+    renderer.markFogDirty();
+    renderer.render(state);
+    expect(device.queue.writeTextureCalls.length).toBe(3);
+    const call = device.queue.writeTextureCalls[2];
+    expect(call.data.length).toBe(state.terrain.length * state.terrain[0].length * 4);
+    expect(call.data[0 * 4 + 3]).toBe(state.visionGrid[0][0] ? 0 : 255);
+    expect(call.data[1 * 4 + 3]).toBe(state.visionGrid[0][1] ? 0 : 255);
+  });
+
+  it('fog alpha still matches vision content after repeated content flips', () => {
+    const { renderer, device } = setup();
+    const state = makeGameState();
+    const w = state.terrain[0].length;
+
+    renderer.render(state); // initial upload
+
+    for (let i = 0; i < 5; i++) {
+      state.visionGrid[i % 2][i % w] = !state.visionGrid[i % 2][i % w];
+      renderer.markFogDirty();
+      renderer.render(state);
+    }
+    expect(device.queue.writeTextureCalls.length).toBe(6); // 1 initial + 5 flips
+    const data = new Uint8Array(device.queue.writeTextureCalls[5].data);
+    for (let y = 0; y < state.visionGrid.length; y++) {
+      for (let x = 0; x < w; x++) {
+        expect(data[(y * w + x) * 4 + 3]).toBe(state.visionGrid[y][x] ? 0 : 255);
+      }
+    }
+  });
+});

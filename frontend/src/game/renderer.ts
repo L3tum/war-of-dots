@@ -1,9 +1,9 @@
 //! WebGPU rendering with fog of war, borders, unit symbols, and path preview
 
 import { GameState } from './game_state';
-import { marchingSquares } from './terrain';
-import { fillTerritory } from './territory';
-import { detectBorderEdges, type BorderEdge } from './geometry';
+import { marchingSquares, type TerrainType } from './terrain';
+import { TerritoryFiller, TERRITORY_NONE } from './territory';
+import { detectBorderEdgesFlat, type EdgeBuffers } from './geometry';
 import {
   CELL_SIZE,
   UNIT_DOT_SIZE,
@@ -97,8 +97,50 @@ export class Renderer {
   // Border cache — store logical edges (camera-independent), recompute positions each frame
   // Exposed dirty flags for external marking
   public borderDirty: boolean = true;
-  private displayGrid: number[][] = [];
-  private borderCacheEdges: BorderEdge[] = [];
+  // Perf #3: flat, allocation-free territory/border pipeline. All scratch
+  // buffers are grow-only and reused across passes — a dirty pass flattens the
+  // grid into `borderFlatScratch`, compares it (plus city anchors + terrain)
+  // against the committed snapshot, and only then runs the BFS.
+  private territoryFiller = new TerritoryFiller();
+  /** Last border grid that actually went through the BFS (change-detection snapshot). */
+  private lastBorderFlat: Uint8Array = new Uint8Array(0);
+  /** Current border grid, flattened row-major (rewritten each dirty pass). */
+  private borderFlatScratch: Uint8Array = new Uint8Array(0);
+  /** Water mask derived from terrain (terrain is static during a match). */
+  private waterMask: Uint8Array = new Uint8Array(0);
+  private waterMaskTerrainRef: unknown = null;
+  /** City anchor scratch (packed parallel arrays) + change-detection key. */
+  private anchorX = new Int32Array(0);
+  private anchorY = new Int32Array(0);
+  private anchorOwner = new Uint8Array(0);
+  private lastCityKey: string | null = null;
+  private lastTerrainRef: unknown = null;
+  /** Logical edges (camera-independent), struct-of-arrays — see EdgeBuffers. */
+  private edgeX = new Int32Array(0);
+  private edgeY = new Int32Array(0);
+  private edgeDir = new Uint8Array(0);
+  private edgeOwnerA = new Uint8Array(0);
+  private edgeOwnerB = new Uint8Array(0);
+  private edgeCount = 0;
+  private edgeBufCache: EdgeBuffers | null = null;
+  /** Border positions/colors upload data — reused grow-only buffers. */
+  private borderPosData: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private borderColData: Float32Array<ArrayBuffer> = new Float32Array(0);
+  // Perf #3: fog change detection — last vision grid flattened/uploaded.
+  private lastVisionFlat: Uint8Array = new Uint8Array(0);
+  /** Current vision grid, flattened row-major (rewritten each pass). */
+  private visionFlatScratch: Uint8Array = new Uint8Array(0);
+  /** Fog RGBA upload data — reused grow-only buffer. */
+  private fogData: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+  /** Test hook: full territory BFS passes actually executed (Perf #3 assertions). */
+  public territoryRecomputeCount = 0;
+  /** Sequence number of the last logical-edge regeneration (bumped when the
+   *  BFS + edge scan actually run). Position data depends only on the edges
+   *  plus zoom (the shader applies the camera), so uploads are gated on it. */
+  private borderEdgeSeq = 0;
+  /** (edgeSeq, zoom) for which the current border buffer content was generated. */
+  private lastPosEdgeSeq = -1;
+  private lastPosZoom: number = NaN;
 
   // Symbol cache — track when unit data changes
   private symbolCacheKey: string | null = null;
@@ -1244,55 +1286,165 @@ export class Renderer {
 
       // Rebuild logical edges when grid content changes
       if (this.borderDirty) {
-        this.borderCacheEdges = [];
-        if (borderGrid.length > 0) {
-          // W5: Fill territory so borders form contiguous regions instead of city-connecting blobs
-          const cityAnchors = Array.from(gameState.cities.values()).map((city) => ({
-            x: Math.floor(city.position[0]),
-            y: Math.floor(city.position[1]),
-            ownerIdx: gameState.colorIndexForOwner(city.owner),
-          }));
-          const displayGrid = fillTerritory(borderGrid, gameState.terrain, cityAnchors);
-          this.borderCacheEdges = detectBorderEdges(displayGrid);
-        }
         this.borderDirty = false;
+        if (borderGrid.length > 0) {
+          const rows = borderGrid.length;
+          const cols = borderGrid[0].length;
+          const cells = rows * cols;
+
+          // W5: Fill territory so borders form contiguous regions instead of city-connecting blobs.
+          // Perf #3: the dirty flag fires on every delta, but most deltas don't change the
+          // grid content — flatten into a reused buffer, then skip the full BFS when the
+          // grid, city anchors, and terrain are all unchanged since the last pass.
+          this.refreshWaterMask(gameState.terrain, rows, cols);
+
+          if (this.borderFlatScratch.length < cells) this.borderFlatScratch = new Uint8Array(cells);
+          const flat = this.borderFlatScratch;
+          for (let y = 0; y < rows; y++) {
+            const row = borderGrid[y];
+            let i = y * cols;
+            for (let x = 0; x < cols; x++, i++) flat[i] = row[x] ?? TERRITORY_NONE;
+          }
+
+          // City anchors → packed scratch + change key (position + owner index).
+          let anchorCount = 0;
+          let cityKey = '';
+          for (const city of gameState.cities.values()) {
+            if (anchorCount === this.anchorX.length) this.growAnchors();
+            this.anchorX[anchorCount] = Math.floor(city.position[0]);
+            this.anchorY[anchorCount] = Math.floor(city.position[1]);
+            this.anchorOwner[anchorCount] = gameState.colorIndexForOwner(city.owner);
+            cityKey +=
+              `${this.anchorX[anchorCount]},${this.anchorY[anchorCount]},${this.anchorOwner[anchorCount]};`;
+            anchorCount++;
+          }
+
+          const changed =
+            this.lastBorderFlat.length !== cells ||
+            this.lastCityKey !== cityKey ||
+            this.lastTerrainRef !== gameState.terrain ||
+            this.bytesDiffer(this.lastBorderFlat, flat, cells);
+
+          if (changed) {
+            const display = this.territoryFiller.fill(
+              flat,
+              this.waterMask,
+              rows,
+              cols,
+              this.anchorX,
+              this.anchorY,
+              this.anchorOwner,
+              anchorCount,
+            );
+            this.ensureEdgeCapacity(cells);
+            this.edgeCount = detectBorderEdgesFlat(display, rows, cols, this.edgeBuf());
+            this.borderEdgeSeq++;
+            this.territoryRecomputeCount++;
+            // Commit the input snapshot for next pass's change detection.
+            if (this.lastBorderFlat.length !== cells) this.lastBorderFlat = new Uint8Array(cells);
+            this.lastBorderFlat.set(flat.subarray(0, cells), 0);
+            this.lastCityKey = cityKey;
+            this.lastTerrainRef = gameState.terrain;
+          }
+          // !changed: the edgeCount + edge arrays from the last pass are still
+          // valid (identical grid content) — keep them.
+        } else {
+          // Grid cleared → drop the cached edges (original behaviour: no
+          // borders) and reset the committed snapshot so the next non-empty
+          // pass always recomputes — even if its bytes match the pre-clear grid.
+          this.edgeCount = 0;
+          this.lastBorderFlat = new Uint8Array(0);
+          this.lastCityKey = null;
+          this.lastTerrainRef = null;
+        }
       }
 
       // Compute WORLD-SPACE positions from cached logical edges; shader applies camera + zoom
       // Each owner boundary is rendered as TWO adjacent thin quads, one in each owner's
       // colour (the "player colour / other player colour" two-line request).
-      const borderPositions: number[] = [];
-      const borderColors: number[] = [];
+      // Perf #3: write into reused grow-only typed arrays (no per-frame JS arrays).
+      // Positions depend only on the logical edges + zoom (world space; the
+      // shader applies the camera), so an unchanged (edgeSeq, zoom) pair skips
+      // both the ~1.2M-value regeneration and the GPU upload — the buffer
+      // already holds the exact content.
       const lw = BORDER_LINE_WIDTH / this.camera.zoom;
-      for (const edge of this.borderCacheEdges) {
-        const cA = PLAYER_COLORS[edge.ownerA % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
-        const cB = PLAYER_COLORS[edge.ownerB % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
-        if (edge.dir === 'h') {
-          // Horizontal border between rows (gridY) and (gridY+1). ownerA is the upper cell.
-          const wx = edge.gridX * CELL_SIZE;
-          const wy = (edge.gridY + 1) * CELL_SIZE;
-          // Quad A (ownerA) — upper half, [wy - lw, wy]
-          borderPositions.push(wx, wy - lw, wx + CELL_SIZE, wy - lw, wx + CELL_SIZE, wy, wx, wy);
-          // Quad B (ownerB) — lower half, [wy, wy + lw]
-          borderPositions.push(wx, wy, wx + CELL_SIZE, wy, wx + CELL_SIZE, wy + lw, wx, wy + lw);
-        } else {
-          // Vertical border between cols (gridX) and (gridX+1). ownerA is the left cell.
-          const wx = (edge.gridX + 1) * CELL_SIZE;
-          const wy = edge.gridY * CELL_SIZE;
-          // Quad A (ownerA) — left half, [wx - lw, wx]
-          const xa = wx - lw;
-          borderPositions.push(xa, wy, wx, wy, wx, wy + CELL_SIZE, xa, wy + CELL_SIZE);
-          // Quad B (ownerB) — right half, [wx, wx + lw]
-          borderPositions.push(wx, wy, wx + lw, wy, wx + lw, wy + CELL_SIZE, wx, wy + CELL_SIZE);
+      const posGenNeeded =
+        this.edgeCount > 0 &&
+        (this.lastPosEdgeSeq !== this.borderEdgeSeq || this.lastPosZoom !== this.camera.zoom);
+      if (posGenNeeded) {
+        const posLen = this.edgeCount * 16; // 2 quads × 4 verts × 2 coords
+        const colLen = this.edgeCount * 24; // 2 quads × 4 verts × 3 colors
+        if (this.borderPosData.length < posLen) this.borderPosData = new Float32Array(posLen);
+        if (this.borderColData.length < colLen) this.borderColData = new Float32Array(colLen);
+        const bp = this.borderPosData;
+        const bc = this.borderColData;
+        let pi = 0;
+        let ci = 0;
+        for (let e = 0; e < this.edgeCount; e++) {
+          const cA =
+            PLAYER_COLORS[this.edgeOwnerA[e] % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
+          const cB =
+            PLAYER_COLORS[this.edgeOwnerB[e] % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
+          if (this.edgeDir[e] === 0) {
+            // 'h': horizontal border between rows (gridY) and (gridY+1). ownerA is the upper cell.
+            const wx = this.edgeX[e] * CELL_SIZE;
+            const wy = (this.edgeY[e] + 1) * CELL_SIZE;
+            // Quad A (ownerA) — upper half, [wy - lw, wy]
+            bp[pi++] = wx;
+            bp[pi++] = wy - lw;
+            bp[pi++] = wx + CELL_SIZE;
+            bp[pi++] = wy - lw;
+            bp[pi++] = wx + CELL_SIZE;
+            bp[pi++] = wy;
+            bp[pi++] = wx;
+            bp[pi++] = wy;
+            // Quad B (ownerB) — lower half, [wy, wy + lw]
+            bp[pi++] = wx;
+            bp[pi++] = wy;
+            bp[pi++] = wx + CELL_SIZE;
+            bp[pi++] = wy;
+            bp[pi++] = wx + CELL_SIZE;
+            bp[pi++] = wy + lw;
+            bp[pi++] = wx;
+            bp[pi++] = wy + lw;
+          } else {
+            // 'v': vertical border between cols (gridX) and (gridX+1). ownerA is the left cell.
+            const wx = (this.edgeX[e] + 1) * CELL_SIZE;
+            const wy = this.edgeY[e] * CELL_SIZE;
+            // Quad A (ownerA) — left half, [wx - lw, wx]
+            const xa = wx - lw;
+            bp[pi++] = xa;
+            bp[pi++] = wy;
+            bp[pi++] = wx;
+            bp[pi++] = wy;
+            bp[pi++] = wx;
+            bp[pi++] = wy + CELL_SIZE;
+            bp[pi++] = xa;
+            bp[pi++] = wy + CELL_SIZE;
+            // Quad B (ownerB) — right half, [wx, wx + lw]
+            bp[pi++] = wx;
+            bp[pi++] = wy;
+            bp[pi++] = wx + lw;
+            bp[pi++] = wy;
+            bp[pi++] = wx + lw;
+            bp[pi++] = wy + CELL_SIZE;
+            bp[pi++] = wx;
+            bp[pi++] = wy + CELL_SIZE;
+          }
+          for (let i = 0; i < 4; i++) {
+            bc[ci++] = cA.r;
+            bc[ci++] = cA.g;
+            bc[ci++] = cA.b;
+          }
+          for (let i = 0; i < 4; i++) {
+            bc[ci++] = cB.r;
+            bc[ci++] = cB.g;
+            bc[ci++] = cB.b;
+          }
         }
-        for (let i = 0; i < 4; i++) borderColors.push(cA.r, cA.g, cA.b);
-        for (let i = 0; i < 4; i++) borderColors.push(cB.r, cB.g, cB.b);
-      }
-
-      if (borderPositions.length > 0) {
-        this.borderVertexCount = borderPositions.length / 2;
-        const bordP = new Float32Array(borderPositions);
-        const bordC = new Float32Array(borderColors);
+        this.borderVertexCount = this.edgeCount * 8; // 2 quads × 4 verts
+        const bordP = bp.subarray(0, posLen);
+        const bordC = bc.subarray(0, colLen);
         this.borderPositionsBuffer = this.ensureBuffer(
           this.borderPositionsBuffer,
           bordP.byteLength,
@@ -1300,8 +1452,11 @@ export class Renderer {
         this.borderColorBuffer = this.ensureBuffer(this.borderColorBuffer, bordC.byteLength);
         this.device.queue.writeBuffer(this.borderPositionsBuffer, 0, bordP);
         this.device.queue.writeBuffer(this.borderColorBuffer, 0, bordC);
+        this.lastPosEdgeSeq = this.borderEdgeSeq;
+        this.lastPosZoom = this.camera.zoom;
       } else {
-        this.borderVertexCount = 0;
+        // Buffer content already current (or no edges) — keep the draw count.
+        this.borderVertexCount = this.edgeCount * 8; // 0 when no edges
       }
 
       // Update path preview
@@ -1454,23 +1609,43 @@ export class Renderer {
       if (visionGrid.length > 0) {
         const width = visionGrid[0].length;
         const height = visionGrid.length;
+        const cells = width * height;
 
+        // Perf #3: flatten into a reused buffer and compare against the last
+        // uploaded content — the dirty flag fires on any vision delta, but most
+        // deltas leave the uploaded grid unchanged (or patch a cell to its
+        // current value). A content-identical pass skips the 4*cells-byte
+        // rebuild and the GPU writeTexture.
+        if (this.visionFlatScratch.length < cells) this.visionFlatScratch = new Uint8Array(cells);
+        const vis = this.visionFlatScratch;
+        for (let y = 0; y < height; y++) {
+          const row = visionGrid[y];
+          let i = y * width;
+          for (let x = 0; x < width; x++, i++) vis[i] = row?.[x] ? 1 : 0;
+        }
+        const contentChanged =
+          this.lastVisionFlat.length !== cells || this.bytesDiffer(this.lastVisionFlat, vis, cells);
+
+        // Existing contract (see "dirty-flag and cache gating" tests):
+        // markFogDirty forces a re-upload, and a size change does too. The
+        // contentChanged term is a safety net for callers that mutate
+        // visionGrid without marking fog dirty — it only ever adds rewrites,
+        // never removes ones the flag requires.
         const needsUpdate =
           this.fogDirty ||
           !this.fogTexture ||
           this.fogCacheWidth !== width ||
-          this.fogCacheHeight !== height;
+          this.fogCacheHeight !== height ||
+          contentChanged;
 
         if (needsUpdate) {
-          const fogData = new Uint8Array(width * height * 4);
-          for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-              const visible = visionGrid[y]?.[x];
-              fogData[(y * width + x) * 4] = 0;
-              fogData[(y * width + x) * 4 + 1] = 0;
-              fogData[(y * width + x) * 4 + 2] = 0;
-              fogData[(y * width + x) * 4 + 3] = visible ? 0 : 255;
-            }
+          if (this.fogData.length < cells * 4) this.fogData = new Uint8Array(cells * 4);
+          const fogData = this.fogData;
+          for (let i = 0; i < cells; i++) {
+            fogData[i * 4] = 0;
+            fogData[i * 4 + 1] = 0;
+            fogData[i * 4 + 2] = 0;
+            fogData[i * 4 + 3] = vis[i] ? 0 : 255;
           }
           if (!this.fogTexture) {
             this.fogTexture = this.device.createTexture({
@@ -1483,18 +1658,90 @@ export class Renderer {
           }
           this.device.queue.writeTexture(
             { texture: this.fogTexture },
-            fogData,
+            fogData.subarray(0, cells * 4),
             { offset: 0, bytesPerRow: width * 4 },
             [width, height, 1] as [number, number, number],
           );
           this.fogCacheWidth = width;
           this.fogCacheHeight = height;
           this.fogDirty = false;
+          // Commit the uploaded content for next pass's change detection.
+          if (this.lastVisionFlat.length !== cells) this.lastVisionFlat = new Uint8Array(cells);
+          this.lastVisionFlat.set(vis.subarray(0, cells), 0);
         }
       }
     } catch (err) {
       console.error('Render update error:', err);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Perf #3 helpers — flat scratch management for the territory/fog pipeline
+  // ------------------------------------------------------------------
+
+  /** (Re)build the flat water mask when the terrain reference or size changed. */
+  private refreshWaterMask(terrain: TerrainType[][], rows: number, cols: number): void {
+    const cells = rows * cols;
+    if (this.waterMaskTerrainRef === terrain && this.waterMask.length >= cells) return;
+    const mask = new Uint8Array(cells);
+    for (let y = 0; y < rows; y++) {
+      const tRow = terrain[y];
+      if (!tRow) continue;
+      for (let x = 0; x < cols; x++) {
+        if (tRow[x] === 'Water') mask[y * cols + x] = 1;
+      }
+    }
+    this.waterMask = mask;
+    this.waterMaskTerrainRef = terrain;
+  }
+
+  /** Grow the packed city-anchor scratch (×2, minimum 8). */
+  private growAnchors(): void {
+    const n = Math.max(8, this.anchorX.length * 2);
+    const x = new Int32Array(n);
+    x.set(this.anchorX);
+    const y = new Int32Array(n);
+    y.set(this.anchorY);
+    const o = new Uint8Array(n);
+    o.set(this.anchorOwner);
+    this.anchorX = x;
+    this.anchorY = y;
+    this.anchorOwner = o;
+  }
+
+  /** Reusable EdgeBuffers view over the edge arrays (rebuilt after growth). */
+  private edgeBuf(): EdgeBuffers {
+    if (!this.edgeBufCache) {
+      this.edgeBufCache = {
+        x: this.edgeX,
+        y: this.edgeY,
+        dir: this.edgeDir,
+        ownerA: this.edgeOwnerA,
+        ownerB: this.edgeOwnerB,
+      };
+    }
+    return this.edgeBufCache;
+  }
+
+  /** Grow the edge storage to hold up to 2 edges per cell (right + lower). */
+  private ensureEdgeCapacity(cells: number): void {
+    const need = cells * 2;
+    if (this.edgeX.length < need) {
+      this.edgeX = new Int32Array(need);
+      this.edgeY = new Int32Array(need);
+      this.edgeDir = new Uint8Array(need);
+      this.edgeOwnerA = new Uint8Array(need);
+      this.edgeOwnerB = new Uint8Array(need);
+    }
+    this.edgeBufCache = null; // invalidate the cached view (arrays may have moved)
+  }
+
+  /** Cheap change detection: are two flat byte buffers different over `len` cells? */
+  private bytesDiffer(a: Uint8Array, b: Uint8Array, len: number): boolean {
+    for (let i = 0; i < len; i++) {
+      if (a[i] !== b[i]) return true;
+    }
+    return false;
   }
 
   /** Mark the fog texture as needing a rebuild (call after visionGrid changes) */

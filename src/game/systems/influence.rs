@@ -30,6 +30,29 @@ use std::sync::{Arc, OnceLock};
 /// the largest precomputed span instead of panicking.
 const MAX_RADIUS: i32 = 10;
 
+/// Clamp a configured effective circle radius to the span table's range.
+///
+/// Returns `(clamped_radius, clamped_fired)` — the fired flag is true when
+/// the value left the representable range (negative or above
+/// [`MAX_RADIUS`]), which is what `config` warns about once per load. Same
+/// semantics as the runtime span lookup (truncating `as i32`, then clamp),
+/// so a warning exactly matches what the hot path will do.
+pub fn clamp_circle_radius(radius: f32) -> (i32, bool) {
+    // NaN is a misconfiguration the cast would silently turn into 0 (all
+    // units lose vision) — report it as clamped so config load can warn.
+    if radius.is_nan() {
+        return (0, true);
+    }
+    let r = radius as i32; // saturating: ±inf→±i32::MAX
+    if r < 0 {
+        (0, true)
+    } else if r > MAX_RADIUS {
+        (MAX_RADIUS, true)
+    } else {
+        (r, false)
+    }
+}
+
 /// Precomputed circle spans: for each radius r, array of (dy, dx_start, dx_end).
 /// Each row tells you which columns to touch at that row offset from center.
 /// Eliminates `sqrt()` calls in the inner loop.
@@ -211,19 +234,21 @@ fn compute_player(
     for handle in units {
         let (ux_f, uy_f) = handle.pos;
 
-        // Hills extend the circle radius (both vision and influence). The lower
-        // `.clamp(0, …)` guard defends against a negative configured radius (would
-        // otherwise wrap `as usize` and panic on the span lookup); the upper bound
-        // caps to the precomputed span table.
-        let radius = ((settings.unit_radius
-            * match terrain
-                .get((uy_f as usize) * w_usize + (ux_f as usize))
-                .copied()
-            {
-                Some(Terrain::Hills) => settings.hill_radius_multiplier,
-                _ => 1.0,
-            }) as i32)
-            .clamp(0, MAX_RADIUS);
+        // Hills extend the circle radius (both vision and influence). The
+        // lower clamp in `clamp_circle_radius` guards against a negative
+        // configured radius (would otherwise wrap `as usize` and panic on the
+        // span lookup); the upper bound caps to the precomputed span table.
+        let radius = clamp_circle_radius(
+            settings.unit_radius
+                * match terrain
+                    .get((uy_f as usize) * w_usize + (ux_f as usize))
+                    .copied()
+                {
+                    Some(Terrain::Hills) => settings.hill_radius_multiplier,
+                    _ => 1.0,
+                },
+        )
+        .0;
 
         stamp_circle(
             vision,
@@ -239,8 +264,7 @@ fn compute_player(
 
     // City loop — same single-circle shape, configured radius/weight, no
     // terrain modifier.
-    let city_radius =
-        ((settings.unit_radius * settings.city_radius_multiplier) as i32).clamp(0, MAX_RADIUS);
+    let city_radius = clamp_circle_radius(settings.unit_radius * settings.city_radius_multiplier).0;
     city_positions.clear();
     for c in cities {
         if c.owner.as_deref() == Some(player_id) {
@@ -918,5 +942,35 @@ mod tests {
             "stamp_cost_probe: units={} iters={} min={:.4}ms med={:.4}ms",
             count, iters, samples[0], med
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // clamp_circle_radius (M5: the span-table clamp must be loud at config
+    // load — config.rs warns when `clamped_fired` is true)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clamp_circle_radius_within_range_is_identity() {
+        assert_eq!(clamp_circle_radius(7.0), (7, false));
+        assert_eq!(clamp_circle_radius(0.0), (0, false));
+        assert_eq!(clamp_circle_radius(10.0), (10, false)); // exactly the max
+        assert_eq!(clamp_circle_radius(9.9), (9, false)); // truncation, no clamp
+    }
+
+    #[test]
+    fn clamp_circle_radius_caps_at_max() {
+        // Configured 15 → the hot path will silently use 10; the config
+        // layer is what makes that loud (warns once per load).
+        assert_eq!(clamp_circle_radius(15.0), (10, true));
+        assert_eq!(clamp_circle_radius(10.5), (10, false)); // truncates to 10, in range
+        assert_eq!(clamp_circle_radius(99.0), (10, true));
+        assert_eq!(clamp_circle_radius(f32::INFINITY), (10, true));
+    }
+
+    #[test]
+    fn clamp_circle_radius_rejects_negative_and_nan() {
+        assert_eq!(clamp_circle_radius(-5.0), (0, true));
+        // f32→i32 saturating cast: NaN → 0, which the predicate reports.
+        assert_eq!(clamp_circle_radius(f32::NAN), (0, true));
     }
 }

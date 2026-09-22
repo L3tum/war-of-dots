@@ -2,8 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
+
+/// M2: lobbies with no join activity for this long are reaped by the
+/// periodic sweep in `GameServer::run`. A disconnected creator's lobby is
+/// removed immediately (see the disconnect cleanup in game_server.rs) — the
+/// TTL is the backstop for lobbies whose members simply never come back.
+pub const LOBBY_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lobby {
@@ -17,6 +24,11 @@ pub struct Lobby {
     pub llm_agent_configs: std::collections::HashMap<u32, LlmAgentConfig>,
     /// Custom unit types when use_standard_ruleset is false (from lobby settings)
     pub custom_unit_types: Vec<super::protocol::CustomUnitType>,
+    /// M2: last join activity (creation counts as activity). Updated on
+    /// every successful `join_lobby`/`add_llm_player`; the TTL sweep reaps
+    /// lobbies idle longer than `LOBBY_IDLE_TTL`.
+    #[serde(skip, default = "lobby_last_activity_default")]
+    pub last_activity: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +83,10 @@ impl<'de> serde::Deserialize<'de> for LobbyPlayer {
             connection: PlayerSender::Tcp(super::room::TcpEgress::new(_tx)),
         })
     }
+}
+
+fn lobby_last_activity_default() -> Instant {
+    Instant::now()
 }
 
 use super::game_server::PlayerSender;
@@ -137,6 +153,7 @@ impl LobbyManager {
             llm_agents: Vec::new(),
             llm_agent_configs: std::collections::HashMap::new(),
             custom_unit_types,
+            last_activity: Instant::now(),
         };
         self.lobbies.insert(code.clone(), lobby);
         code
@@ -161,6 +178,8 @@ impl LobbyManager {
         if lobby.players.len() >= lobby.settings.max_players as usize {
             return Err("Lobby full".to_string());
         }
+        // M2: a successful join is activity — reset the TTL clock.
+        lobby.last_activity = Instant::now();
         lobby.players.push(LobbyPlayer {
             id: player_id,
             name: player_name,
@@ -213,6 +232,8 @@ impl LobbyManager {
         }
         let slot = lobby.players.len() as u32;
         let id = format!("llm-{}", slot);
+        // M2: an LLM slot fill is join activity too.
+        lobby.last_activity = Instant::now();
         lobby.players.push(LobbyPlayer {
             id: id.clone(),
             name,
@@ -243,6 +264,22 @@ impl LobbyManager {
     /// duplicate StartGame.
     pub fn remove_lobby(&mut self, code: &str) -> Option<Lobby> {
         self.lobbies.remove(code)
+    }
+
+    /// M2: remove every lobby idle (no join activity) for at least `ttl`.
+    /// Returns the removed lobby codes so the caller can log them.
+    pub fn reap_idle_lobbies(&mut self, ttl: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let idle: Vec<String> = self
+            .lobbies
+            .values()
+            .filter(|l| now.duration_since(l.last_activity) >= ttl)
+            .map(|l| l.code.clone())
+            .collect();
+        for code in &idle {
+            self.lobbies.remove(code);
+        }
+        idle
     }
 }
 
@@ -338,5 +375,77 @@ mod tests {
             .join_lobby(&code, "p4".into(), "p4".into(), None, PlayerSender::None)
             .expect_err("fifth join must fail on a normalized cap-4 lobby");
         assert_eq!(err, "Lobby full");
+    }
+
+    /// M2: an idle lobby is reaped once it exceeds the TTL, while a lobby
+    /// with recent activity survives. The TTL is a parameter, so the test
+    /// uses a tiny budget instead of sleeping 30 minutes.
+    #[test]
+    fn reap_idle_lobbies_drops_only_idle_lobbies() {
+        let mut mgr = LobbyManager::new();
+        let idle_code = mgr.create_lobby(
+            "host1".into(),
+            "Host1".into(),
+            settings_with_max_players(4),
+            None,
+            PlayerSender::None,
+            vec![],
+        );
+        let live_code = mgr.create_lobby(
+            "host2".into(),
+            "Host2".into(),
+            settings_with_max_players(4),
+            None,
+            PlayerSender::None,
+            vec![],
+        );
+        // Backdate the idle lobby past a 10 ms TTL.
+        {
+            let lobby = mgr.lobbies.get_mut(&idle_code).unwrap();
+            lobby.last_activity = Instant::now() - Duration::from_millis(50);
+        }
+        // A join on the live lobby must reset its activity clock.
+        mgr.join_lobby(
+            &live_code,
+            "guest".into(),
+            "Guest".into(),
+            None,
+            PlayerSender::None,
+        )
+        .expect("join must succeed");
+        assert!(mgr.get_lobby(&live_code).unwrap().last_activity > lobby_now_minus_50ms());
+
+        let reaped = mgr.reap_idle_lobbies(Duration::from_millis(10));
+        assert_eq!(reaped, vec![idle_code.clone()]);
+        assert!(
+            mgr.get_lobby(&idle_code).is_none(),
+            "idle lobby must be gone"
+        );
+        assert!(
+            mgr.get_lobby(&live_code).is_some(),
+            "active lobby must survive"
+        );
+    }
+
+    /// M2: the join-activity update is what keeps a lobby alive — without a
+    /// join, even a just-created lobby is reaped at a zero TTL.
+    #[test]
+    fn created_lobby_is_reapable_when_idle() {
+        let mut mgr = LobbyManager::new();
+        let code = mgr.create_lobby(
+            "host".into(),
+            "Host".into(),
+            settings_with_max_players(4),
+            None,
+            PlayerSender::None,
+            vec![],
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        let reaped = mgr.reap_idle_lobbies(Duration::from_millis(1));
+        assert_eq!(reaped, vec![code]);
+    }
+
+    fn lobby_now_minus_50ms() -> Instant {
+        Instant::now() - Duration::from_millis(50)
     }
 }

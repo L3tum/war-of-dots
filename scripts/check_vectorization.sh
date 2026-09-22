@@ -3,11 +3,12 @@
 # function, whether wide-register (AVX2) vector *arithmetic* was emitted.
 #
 # WHY THIS EXISTS
-#   .cargo/config.toml sets `-C target-cpu=x86-64-v3` (AVX2) so LLVM
-#   auto-vectorizes tight numeric loops. This script is the tripwire: it checks
-#   that the loops we EXPECT to vectorize actually did. A function in
-#   EXPECT_VECTOR that has 0 vector math is a regression (the loop stopped
-#   vectorizing, or the build silently fell back to SSE2).
+#   The AVX2 (x86-64-v3) build is OPT-IN (make release-avx2 / RUSTFLAGS="-C
+#   target-cpu=x86-64-v3") so default releases stay portable. This script is
+#   the tripwire for that opt-in build: it checks that the loops we EXPECT to
+#   vectorize actually did. A function in EXPECT_VECTOR that has 0 vector math
+#   is a regression (the loop stopped vectorizing, or the build is the
+#   portable baseline build, which vectorizes to 128-bit SSE2 only).
 #
 # HOW IT WORKS
 #   - Disassembles target/release/war-of-dots with `rust-objdump -d --demangle`.
@@ -32,8 +33,10 @@
 #   If any .rs is newer than the binary, the disassembly may not reflect current
 #   source — we warn but still run.
 #
-# PREREQ: a built target/release/war-of-dots (`cargo build --release`).
-#        (The script does NOT rebuild — build.rs requires node/npm.)
+# PREREQ: a built target/release/war-of-dots — ideally the AVX2 build
+#        (`make release-avx2`): the portable default build is checked too, but
+#        EXPECT_VECTOR then reports SSE2-only misses by design. (The script
+#        does NOT rebuild — build.rs requires node/npm.)
 # Usage:  bash scripts/check_vectorization.sh [binary] [--strict]
 #   --strict: also FAIL if a REPORT_ONLY symbol is entirely missing (catches a
 #             loop being inlined away that we still expect to exist).
@@ -43,6 +46,9 @@ BIN="${1:-target/release/war-of-dots}"
 strict="${2:-}"
 
 [[ "$(uname -m)" == "x86_64" ]] || { echo "skip: not x86_64"; exit 0; }
+# CPU support gate: an AVX2 build SIGILLs on this machine without AVX2, and
+# wide-register (ymm/zmm) patterns cannot be expected otherwise.
+grep -qw avx2 /proc/cpuinfo 2>/dev/null || { echo "skip: CPU lacks AVX2 (check /proc/cpuinfo)"; exit 0; }
 [[ -f "$BIN" ]] || { echo "error: $BIN not found — run 'cargo build --release' first"; exit 1; }
 
 # Staleness warning (non-fatal).
@@ -200,7 +206,7 @@ for re in "${EXPECT_VECTOR[@]}" "${REPORT_ONLY[@]}"; do
         echo "  ✓ vector math: $re  ($n wide-register SIMD ops in symbol body)"
     else
         if [[ "$is_expect" -eq 1 ]]; then
-            echo "  ✗ NOT vectorized (expected): $re  — REGRESSION: the loop stopped vectorizing, or the build fell back to SSE2"
+            echo "  ✗ NOT vectorized (expected): $re  — REGRESSION: the loop stopped vectorizing, or the build is the portable baseline (rebuild with 'make release-avx2' for the AVX2 check)"
             expect_fail=$((expect_fail + 1))
         else
             echo "  – scalar (as expected, backlog): $re  — 0 vector ops; manual-SIMD candidate"

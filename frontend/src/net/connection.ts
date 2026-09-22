@@ -155,8 +155,10 @@ export function applyEquipmentCounts(
 /** Re-export for replay player. */
 export { flatTo2D, flatTo2DBools };
 
-/** Recursively remove `undefined` values from plain objects and arrays. */
-function stripUndefined(value: unknown): unknown {
+/** Recursively remove `undefined` values from plain objects and arrays.
+ * Exported so tests assert the exact helper the wire path uses (instead of a
+ * duplicated copy). */
+export function stripUndefined(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map(stripUndefined);
   const result: Record<string, unknown> = {};
@@ -257,10 +259,6 @@ export class Connection {
           const uint8 = new Uint8Array(data);
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const msg = CBOR.decode(uint8) as ServerMessage & Record<string, any>;
-          // Debug: log received message in dev mode
-          if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-            console.debug('[WS] ←', msg);
-          }
           this.handleServerMessage(msg);
         } else if (typeof data === 'string') {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -318,10 +316,6 @@ export class Connection {
   private sendRaw(message: Record<string, unknown>) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       const encoded = CBOR.encode(message);
-      // Debug: log sent message in dev mode
-      if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-        console.debug('[WS] →', message);
-      }
       this.ws.send(encoded);
     }
   }

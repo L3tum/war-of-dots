@@ -53,7 +53,14 @@ impl Advisor {
                     // Advisor doesn't execute commands, so use dummy player_id
                     let (_command, reason) = match tools::tool_call_to_command(tc, "advisor") {
                         Ok(res) => res,
-                        Err(_) => return None,
+                        Err(e) => {
+                            tracing::warn!(
+                                "advisor: skipping malformed tool call '{}': {}",
+                                tc.name,
+                                e
+                            );
+                            return None;
+                        }
                     };
                     let action = Action {
                         action_type: tc.name.clone(),

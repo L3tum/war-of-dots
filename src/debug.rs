@@ -1,20 +1,40 @@
 //! Debug overlay module.
 //!
 //! Provides runtime performance statistics for development and debugging.
-//! Only compiled when `debug-overlay` feature is enabled or `debug_assertions` is set.
+//! The /debug/* routes are only registered in debug builds or with the
+//! `debug-overlay` feature (`GameServer::build_router`), and every handler
+//! re-checks the same condition — plus the runtime `debug.endpoints`
+//! config flag — at request time (Sec L1: see `debug_gate` below and
+//! docs/THREAT_MODEL.md), so an exposed route must not execute debug
+//! logic in a non-debug deployment.
 
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
 use tokio::sync::Mutex;
 
 use crate::server::GameServer;
 
+/// Sec L1: the request-time gate for every /debug/* handler below. The
+/// routes are only registered in debug builds / with `debug-overlay`
+/// (see `GameServer::build_router`), but each handler re-checks
+/// `debug_endpoints_enabled` at request time, so a route that is ever
+/// exposed (misconfigured proxy, feature-flag slip, a test app registering
+/// the route unconditionally) must not execute debug logic — in particular
+/// the CPU-heavy benchmark. The gate is the single source of truth:
+/// `debug_endpoints_enabled` combines the same cfg condition as route
+/// registration with the `debug.endpoints` config flag (runtime override).
+async fn debug_gate(state: &Mutex<GameServer>) -> bool {
+    state.lock().await.debug_endpoints_enabled()
+}
+
 /// GET /debug/stats — return performance statistics for all active games.
-pub async fn debug_stats_handler(
-    State(state): State<Arc<Mutex<GameServer>>>,
-) -> Json<serde_json::Value> {
+pub async fn debug_stats_handler(State(state): State<Arc<Mutex<GameServer>>>) -> Response {
+    if !debug_gate(&state).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
     {
         let server = state.lock().await;
@@ -45,6 +65,7 @@ pub async fn debug_stats_handler(
             // system_timings is populated by the benchmark or per-game tick stats
             "system_timings": null,
         }))
+        .into_response()
     }
 
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
@@ -57,13 +78,26 @@ pub async fn debug_stats_handler(
             "hint": "Recompile with --features debug-overlay or in debug mode",
             "active_games": games.len(),
         }))
+        .into_response()
     }
 }
 
 /// GET /debug/benchmark — run a benchmark with default params.
+///
+/// Only compiled (and routed) with the `microbenchmarks` feature: the
+/// benchmark module itself is feature-gated.
+///
+/// Sec L1: this endpoint is an unauthenticated CPU-DoS lever; the gate in
+/// `debug_gate` (checked at request time, not just at route registration)
+/// is what keeps it inert when debug is disabled.
+#[cfg(feature = "microbenchmarks")]
 pub async fn debug_benchmark_handler(
+    State(state): State<Arc<Mutex<GameServer>>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response {
+    if !debug_gate(&state).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let units_per_city: u32 = params
         .get("units_per_city")
         .and_then(|s| s.parse().ok())
@@ -92,35 +126,5 @@ pub async fn debug_benchmark_handler(
         .await
         .unwrap();
 
-    Json(result.summary)
-}
-
-/// GET /debug/tick — return tick timing info (read-only).
-pub async fn debug_tick_handler(
-    State(state): State<Arc<Mutex<GameServer>>>,
-) -> Json<serde_json::Value> {
-    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-    {
-        let server = state.lock().await;
-        let games = server.games.lock().await;
-
-        let mut results = Vec::new();
-        for (game_id, _room) in games.iter() {
-            results.push(serde_json::json!({
-                "game_id": game_id,
-            }));
-        }
-
-        Json(serde_json::json!({
-            "active_games": results.len(),
-            "games": results,
-        }))
-    }
-
-    #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
-    {
-        Json(serde_json::json!({
-            "error": "Debug tick not available in release builds",
-        }))
-    }
+    Json(result.summary).into_response()
 }

@@ -2,6 +2,7 @@
 
 import { GameState } from './game/game_state';
 import { Renderer } from './game/renderer';
+import { requestWebGPUDevice } from './game/webgpu';
 import { Connection } from './net/connection';
 import { LobbyUI } from './ui/lobby';
 import { Controls } from './ui/controls';
@@ -32,8 +33,10 @@ async function main() {
     const urlParams = new URLSearchParams(window.location.search);
     const gameId = urlParams.get('game_id');
     if (gameId) {
-      // Connect to replay WebSocket
-      connectReplayGame(canvas, gameId);
+      // Connect to replay WebSocket — awaited so bootstrap failures surface
+      // via the error overlay (handled inside connectReplayGame) instead of
+      // becoming an unhandled promise rejection.
+      await connectReplayGame(canvas, gameId);
     } else {
       // Show replay list
       const spectatorReplay = new SpectatorReplay(canvas);
@@ -91,11 +94,7 @@ async function main() {
 
   let device: GPUDevice;
   try {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) {
-      throw new Error('No WebGPU adapter available. Your device may not support WebGPU.');
-    }
-    device = await adapter.requestDevice();
+    device = await requestWebGPUDevice();
   } catch (err) {
     hideLoading();
     showErrorMessage(
@@ -210,9 +209,34 @@ async function main() {
 // the live path: enum terrain, camera centering, unit construction, fog/border dirty flags,
 // delta handling, and GameOver — all handled by Connection.
 async function connectReplayGame(canvas: HTMLCanvasElement, gameId: string) {
-  const adapter = await navigator.gpu!.requestAdapter({ powerPreference: 'high-performance' });
-  const device = await adapter!.requestDevice();
-  const renderer = new Renderer(canvas, device);
+  // Show loading overlay during WebGPU initialization (mirrors the live path)
+  showLoading('Initializing graphics...');
+
+  let device: GPUDevice;
+  try {
+    device = await requestWebGPUDevice();
+  } catch (err) {
+    hideLoading();
+    showErrorMessage(
+      `Failed to initialize WebGPU: ${err instanceof Error ? err.message : 'Unknown error'}`,
+    );
+    return;
+  }
+
+  let renderer: Renderer;
+  try {
+    renderer = new Renderer(canvas, device);
+  } catch (err) {
+    hideLoading();
+    showErrorMessage(
+      `Failed to initialize renderer: ${err instanceof Error ? err.message : 'Unknown error'}`,
+    );
+    return;
+  }
+
+  // Hide loading overlay now that WebGPU is initialized
+  hideLoading();
+
   const gameState = new GameState();
 
   // Resize canvas when window is resized

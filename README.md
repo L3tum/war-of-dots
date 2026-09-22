@@ -37,6 +37,34 @@ cd ..
 cargo build --release
 ```
 
+`cargo build` also rebuilds the frontend automatically (`build.rs` runs
+`npm run build` and bakes `frontend/dist` into the binary via `include_dir!`).
+The npm step is skipped when `frontend/dist` is newer than all inputs
+(`frontend/src`, `index.html`, `package.json`, `package-lock.json`,
+`tsconfig.json`). For fast server-only dev loops you can force the skip:
+
+```bash
+WOD_SKIP_FRONTEND=1 cargo run
+```
+
+(embeds the existing `frontend/dist` as-is; fails loudly if dist is missing).
+
+### Release builds (portable vs AVX2)
+
+The default release build is **portable** (x86-64 baseline, SSE2): it runs on
+any x86-64 CPU. An AVX2 (x86-64-v3) build gives ~29% on the influence system,
+but **SIGILLs on pre-AVX2 CPUs** — only ship it where the host CPU has AVX2
+(`grep -o avx2 /proc/cpuinfo`). Opt in per-invocation:
+
+```bash
+make release-avx2
+# or equivalently:
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+```
+
+`make check-vectorization` (which also checks CPU AVX2 support) verifies that
+the hot loops actually wide-vectorized in the binary you built.
+
 ### Regenerating Frontend Types from Server Protocol
 
 The TypeScript client types in `frontend/src/generated/protocol.ts` are generated from Rust server types using the `schemars` JSON schema pipeline:
@@ -61,6 +89,8 @@ cargo run --release -- --config custom_config.toml
 # With local LLM (Ollama)
 cargo run --release
 ```
+
+> **Security:** the server is designed for trusted LANs — no transport encryption, no auth, default bind `0.0.0.0` (restrict with `--bind 127.0.0.1`). See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Configuration
 
@@ -142,10 +172,12 @@ perf stat cargo run --release -- --benchmark --bench-html /dev/null
 
 ### Verify Auto-Vectorization
 
-Check whether hot loops were auto-vectorized to AVX2 in the release binary:
+Check whether hot loops were auto-vectorized to AVX2 (run against the AVX2
+build from `make release-avx2`; the portable default build is SSE2-only by
+design):
 
 ```bash
-make build-release
+make release-avx2
 make check-vectorization
 ```
 
@@ -160,7 +192,7 @@ cargo rustc --release -- --emit asm | less
 - `bench-alloc` is incompatible with Miri (replaces the global allocator). Run `make miri` without the feature.
 - The counting allocator adds ~1 atomic add per allocation (~0.5 ns overhead). Negligible vs. tick cost.
 - Dynamic peak-stack measurement is out of scope; `heaptrack` is the escape hatch if needed.
-- The AVX2 build config (`target-cpu=x86-64-v3`) is verified by the `x86_64_build_targets_avx2` unit test on every `cargo test`.
+- The portable-default build is verified by the `x86_64_default_build_is_portable` unit test on every `cargo test` (it fails if an AVX2 rustflag is ever re-committed; AVX2 is opt-in via `make release-avx2` / `RUSTFLAGS`).
 
 ## License
 

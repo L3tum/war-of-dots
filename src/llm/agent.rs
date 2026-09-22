@@ -179,6 +179,12 @@ impl LlmAgent {
                     }
                 }
                 Err(e) => {
+                    tracing::warn!(
+                        "LLM agent {}: skipping malformed tool call '{}': {}",
+                        self.id,
+                        tc.name,
+                        e
+                    );
                     self.reason_log.push(ReasonEntry {
                         timestamp,
                         action: format!("Invalid tool call: {}", tc.name),

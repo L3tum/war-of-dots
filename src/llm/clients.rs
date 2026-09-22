@@ -1,6 +1,6 @@
 //! Enum-based LLM client for dyn compatibility
 
-use super::agent::{Action, GameState, Tool, ToolCall};
+use super::agent::{GameState, Tool, ToolCall};
 use super::providers::anthropic::AnthropicClient;
 use super::providers::ollama::OllamaClient;
 use super::providers::openai::OpenAiClient;
@@ -40,20 +40,6 @@ impl LlmClient {
             LlmClient::OpenAi(client) => client.call(state, system_prompt, tools).await,
             LlmClient::Ollama(client) => client.call(state, system_prompt, tools).await,
             LlmClient::Anthropic(client) => client.call(state, system_prompt, tools).await,
-        }
-    }
-
-    /// Legacy free-form query
-    #[allow(dead_code)]
-    pub async fn query(
-        &self,
-        state: &GameState,
-        system_prompt: &str,
-    ) -> anyhow::Result<Vec<Action>> {
-        match self {
-            LlmClient::OpenAi(client) => client.query(state, system_prompt).await,
-            LlmClient::Ollama(client) => client.query(state, system_prompt).await,
-            LlmClient::Anthropic(client) => client.query(state, system_prompt).await,
         }
     }
 }
