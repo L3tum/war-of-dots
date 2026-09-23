@@ -89,8 +89,8 @@ fn lobby_last_activity_default() -> Instant {
     Instant::now()
 }
 
-use super::game_server::PlayerSender;
 use super::protocol::LobbySettings;
+use super::room::PlayerSender;
 use crate::llm::agent::LlmAgentConfig;
 
 pub struct LobbyManager {

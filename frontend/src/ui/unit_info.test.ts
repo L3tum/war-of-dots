@@ -168,10 +168,7 @@ describe('UnitInfoUI — unit panel', () => {
 
   it('a unit that is already disembarking does not offer the button again', () => {
     const h = makeHarness();
-    h.gameState.units.set(
-      'u1',
-      new Unit(makeUnitState({ on_water: true, disembarking: true })),
-    );
+    h.gameState.units.set('u1', new Unit(makeUnitState({ on_water: true, disembarking: true })));
     h.ui.selectUnit('u1');
 
     expect(document.getElementById('disembark-btn')).toBeNull();

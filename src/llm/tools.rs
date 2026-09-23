@@ -1,7 +1,7 @@
 //! Tool definitions and command conversion for LLM agents
 
 use super::agent::{Tool, ToolCall};
-use crate::server::game_server::Command;
+use crate::server::room::Command;
 
 /// Get all available game tools for LLM
 pub fn get_game_tools() -> Vec<Tool> {

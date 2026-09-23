@@ -31,9 +31,7 @@ function spectatorPanel() {
 }
 
 function reasonEntries() {
-  return Array.from(
-    document.querySelectorAll<HTMLDivElement>('#spectator-reasons .player-reason'),
-  );
+  return Array.from(document.querySelectorAll<HTMLDivElement>('#spectator-reasons .player-reason'));
 }
 
 function filterButtons() {
@@ -112,7 +110,9 @@ describe('Spectator reason log', () => {
     expect(entries[0].textContent).toContain('bob-reason');
 
     // Back to All: both entries return.
-    filterButtons().find((b) => b.textContent === 'All')!.click();
+    filterButtons()
+      .find((b) => b.textContent === 'All')!
+      .click();
     expect(reasonEntries()).toHaveLength(2);
   });
 
@@ -144,9 +144,7 @@ describe('Spectator game over + clearAll', () => {
     s.gameOver('Alice', 'game-42', 'Alice crushed the enemy');
 
     expect(document.getElementById('game-over-overlay')!.classList.contains('hidden')).toBe(false);
-    expect(document.getElementById('game-over-title')!.textContent).toBe(
-      'Alice crushed the enemy',
-    );
+    expect(document.getElementById('game-over-title')!.textContent).toBe('Alice crushed the enemy');
     // The replay link targets this specific game (spectator replay route).
     expect(document.getElementById('replay-link')!.getAttribute('href')).toBe(
       '/replay?game_id=game-42',

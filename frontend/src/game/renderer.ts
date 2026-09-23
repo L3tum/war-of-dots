@@ -1314,8 +1314,7 @@ export class Renderer {
             this.anchorX[anchorCount] = Math.floor(city.position[0]);
             this.anchorY[anchorCount] = Math.floor(city.position[1]);
             this.anchorOwner[anchorCount] = gameState.colorIndexForOwner(city.owner);
-            cityKey +=
-              `${this.anchorX[anchorCount]},${this.anchorY[anchorCount]},${this.anchorOwner[anchorCount]};`;
+            cityKey += `${this.anchorX[anchorCount]},${this.anchorY[anchorCount]},${this.anchorOwner[anchorCount]};`;
             anchorCount++;
           }
 
@@ -1381,10 +1380,16 @@ export class Renderer {
         let pi = 0;
         let ci = 0;
         for (let e = 0; e < this.edgeCount; e++) {
-          const cA =
-            PLAYER_COLORS[this.edgeOwnerA[e] % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
-          const cB =
-            PLAYER_COLORS[this.edgeOwnerB[e] % PLAYER_COLORS.length] || { r: 0.5, g: 0.5, b: 0.5 };
+          const cA = PLAYER_COLORS[this.edgeOwnerA[e] % PLAYER_COLORS.length] || {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+          };
+          const cB = PLAYER_COLORS[this.edgeOwnerB[e] % PLAYER_COLORS.length] || {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+          };
           if (this.edgeDir[e] === 0) {
             // 'h': horizontal border between rows (gridY) and (gridY+1). ownerA is the upper cell.
             const wx = this.edgeX[e] * CELL_SIZE;

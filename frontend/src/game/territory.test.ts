@@ -139,7 +139,9 @@ function flatFill(c: RandomCase): number[][] {
     ao[i] = cities[i].ownerIdx;
   }
   const out = new TerritoryFiller().fill(flat, water, rows, cols, ax, ay, ao, cities.length);
-  return Array.from({ length: rows }, (_, y) => Array.from(out.subarray(y * cols, y * cols + cols)));
+  return Array.from({ length: rows }, (_, y) =>
+    Array.from(out.subarray(y * cols, y * cols + cols)),
+  );
 }
 
 const plains = (rows: number, cols: number): string[][] =>

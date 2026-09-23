@@ -183,5 +183,7 @@ export function fillTerritory(
     cities.length,
   );
 
-  return Array.from({ length: rows }, (_, y) => Array.from(out.subarray(y * cols, y * cols + cols)));
+  return Array.from({ length: rows }, (_, y) =>
+    Array.from(out.subarray(y * cols, y * cols + cols)),
+  );
 }

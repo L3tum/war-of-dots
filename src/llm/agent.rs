@@ -143,7 +143,7 @@ impl LlmAgent {
         &mut self,
         client: &LlmClient,
         state: &GameState,
-    ) -> anyhow::Result<Vec<crate::server::game_server::Command>> {
+    ) -> anyhow::Result<Vec<crate::server::room::Command>> {
         // Use time-based delay instead of turn count
         let now = std::time::Instant::now();
         if now.duration_since(self.last_call_time) < self.thinking_delay {

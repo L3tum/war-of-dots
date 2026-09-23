@@ -203,9 +203,7 @@ describe('live-recorded replay shape (server-written JSONL)', () => {
     await player.loadReplay('legacy_fixture.jsonl');
     player.tick();
 
-    const gs = (
-      player as unknown as { gameState: { terrain: string[][] } }
-    ).gameState;
+    const gs = (player as unknown as { gameState: { terrain: string[][] } }).gameState;
     expect(gs.terrain).toEqual([['Forest', 'Plains']]);
   });
 });

@@ -45,13 +45,14 @@ use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
 
-use crate::server::game_server::GameServer;
 use crate::server::protocol::{encode_message, GameDeltaMessage, GameStateMessage, ServerMessage};
+use crate::server::GameServer;
 
 /// Basename charset rule for any client-supplied replay identifier
 /// (the `game_id` query param on `/ws/replay`, the `:name` path param on
@@ -351,4 +352,114 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// List all available replays
+pub(crate) async fn list_replays(
+    State(state): State<Arc<Mutex<GameServer>>>,
+) -> axum::Json<Vec<ReplayInfo>> {
+    let server = state.lock().await;
+    let storage = server.storage.clone();
+    let db = match storage.db.lock() {
+        Ok(d) => d,
+        Err(_) => return axum::Json(Vec::new()),
+    };
+    let mut stmt = match db.prepare(
+        "SELECT id, players, winner, start_time, end_time FROM game_metadata ORDER BY end_time DESC"
+    ) {
+        Ok(s) => s,
+        Err(_) => return axum::Json(Vec::new()),
+    };
+    let mut replays = Vec::new();
+    while let Ok(sqlite::State::Row) = stmt.next() {
+        let id: String = stmt.read(0).unwrap_or_default();
+        let players_str: String = stmt.read(1).unwrap_or_default();
+        let winner: String = stmt.read(2).unwrap_or_default();
+        let start_time: i64 = stmt.read(3).unwrap_or(0);
+        let end_time: i64 = stmt.read(4).unwrap_or(0);
+        let players: Vec<String> = serde_json::from_str(&players_str).unwrap_or_default();
+        let duration = if start_time < end_time {
+            end_time - start_time
+        } else {
+            0
+        };
+        replays.push(ReplayInfo {
+            game_id: id,
+            winner,
+            players,
+            start_time,
+            end_time,
+            duration,
+        });
+    }
+    axum::Json(replays)
+}
+
+/// Serve a recorded replay JSONL from the runtime replay directory.
+///
+/// The embedded `FRONTEND` static fallback (include_dir) only knows about
+/// files that existed at compile time, so runtime-recorded games need this
+/// dedicated route. The frontend's `ReplayPlayer` fetches `replays/{file}`
+/// and this is what resolves it for live-recorded games.
+///
+/// NOTE: this axum/matchit version (0.7.9 / 0.7.3) uses the `:param` path
+/// syntax — the `{param}` form does not match. See
+/// `path_param_routes_use_colon_syntax` for the regression guard.
+///
+/// Security: the shared basename-only rule
+/// (`crate::server::handlers::replay::is_safe_replay_file_name`) — no path
+/// separators, no `..` sequences, no null bytes, `.jsonl` suffix — otherwise
+/// the route could read arbitrary files (`/replays/../../config.toml`).
+pub(crate) async fn serve_replay(
+    State(state): State<Arc<Mutex<GameServer>>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    if !crate::server::handlers::replay::is_safe_replay_file_name(&name) {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+    let dir = state.lock().await.config.storage.replay_path.clone();
+    let content = std::fs::read(std::path::Path::new(&dir).join(&name))
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(axum::body::Body::from(content))
+        .unwrap())
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ReplayInfo {
+    game_id: String,
+    winner: String,
+    players: Vec<String>,
+    start_time: i64,
+    end_time: i64,
+    duration: i64,
+}
+
+/// Sec L2: route-level cap gate for the self-terminating read-only
+/// `/ws/replay` stream. Replay connections are NOT counted in
+/// `ws_connections` (they stream a recording once and close), but no new
+/// WebSocket connection of any kind is accepted while the cap is reached —
+/// so while `/ws` + `/ws/spectator` are at capacity this handler rejects
+/// with HTTP 503 (no upgrade) instead of opening yet another socket.
+pub(crate) async fn gated_replay_ws_handler(
+    ws: WebSocketUpgrade,
+    State(server_state): State<Arc<Mutex<GameServer>>>,
+    params: Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let at_capacity = {
+        let server = server_state.lock().await;
+        let cap = server.config.network.max_ws_connections.max(1);
+        server.ws_connections.load(Ordering::Relaxed) >= cap
+    };
+    if at_capacity {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Server at maximum connections — try again later",
+        )
+            .into_response();
+    }
+    crate::server::handlers::replay::replay_ws_handler(ws, State(server_state), params)
+        .await
+        .into_response()
 }

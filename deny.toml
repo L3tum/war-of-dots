@@ -7,7 +7,6 @@ allow = [
     "BSD-3-Clause",
     "BSD-2-Clause",
     "Unicode-3.0",
-    "MPL-2.0",
     "CDLA-Permissive-2.0",
     "Zlib",
 ]
@@ -17,11 +16,8 @@ allow = [
 multiple-versions = "warn"
 
 [advisories]
-# Block crates with unresolved security advisories
-ignore = [
-    "RUSTSEC-2021-0127",  # serde_cbor unmaintained (used by console client and server protocol)
-    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained (used by reqwest)
-    "RUSTSEC-2026-0098",  # rustls-webpki URI name constraint (reqwest -> rustls)
-    "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraint (reqwest -> rustls)
-    "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic (reqwest -> rustls)
-]
+# Block crates with unresolved security advisories.
+# (No active ignores. If one is needed, add it with a one-line rationale —
+# stale entries are surfaced by `advisory-not-detected` warnings and should
+# be pruned; see git history for prunes after the reqwest 0.12 bump.)
+ignore = []

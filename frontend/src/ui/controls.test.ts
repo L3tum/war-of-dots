@@ -93,11 +93,7 @@ function makeControls(): Harness {
 }
 
 /** Dispatch a pointer event with the given props (happy-dom-safe). */
-function dispatchPointer(
-  target: EventTarget,
-  type: string,
-  props: Record<string, unknown>,
-): void {
+function dispatchPointer(target: EventTarget, type: string, props: Record<string, unknown>): void {
   const event = Object.assign(new Event(type, { bubbles: true, cancelable: true }), props);
   target.dispatchEvent(event as unknown as PointerEvent);
 }
@@ -146,7 +142,12 @@ describe('Controls — selection and path drawing', () => {
     h.renderer.currentPath = [{ x: 1, y: 1 }];
 
     const c = clientForEntity(10, 10);
-    dispatchPointer(h.canvas, 'pointerdown', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointerdown', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
 
     expect(h.selectUnit).toHaveBeenCalledWith('u1');
     expect(h.selectCity).not.toHaveBeenCalled();
@@ -163,7 +164,12 @@ describe('Controls — selection and path drawing', () => {
     });
 
     const c = clientForEntity(15, 5);
-    dispatchPointer(h.canvas, 'pointerdown', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointerdown', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
 
     expect(h.selectCity).toHaveBeenCalledWith('c1');
     expect(h.selectUnit).not.toHaveBeenCalled();
@@ -172,7 +178,12 @@ describe('Controls — selection and path drawing', () => {
   it('clicking empty ground deselects and starts a new path at the clicked cell', () => {
     // Click at cell (1, 4) — far from any unit/city.
     const c = clientForCellCenter(1, 4);
-    dispatchPointer(h.canvas, 'pointerdown', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointerdown', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
 
     expect(h.selectUnit).toHaveBeenCalledWith(null);
     expect(h.selectCity).toHaveBeenCalledWith(null);
@@ -182,12 +193,27 @@ describe('Controls — selection and path drawing', () => {
   it('pointermove extends the drawn path (one point per new cell)', () => {
     // Start a path at (1,4), then move the cursor to (3,5) and (3,6).
     let c = clientForCellCenter(1, 4);
-    dispatchPointer(h.canvas, 'pointerdown', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointerdown', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
 
     c = clientForCellCenter(3, 5);
-    dispatchPointer(h.canvas, 'pointermove', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointermove', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
     c = clientForCellCenter(3, 6);
-    dispatchPointer(h.canvas, 'pointermove', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointermove', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
 
     expect(h.renderer.currentPath).toEqual([
       { x: 1, y: 4 },
@@ -198,7 +224,12 @@ describe('Controls — selection and path drawing', () => {
 
   it('pointermove without a started path does nothing', () => {
     const c = clientForCellCenter(3, 5);
-    dispatchPointer(h.canvas, 'pointermove', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointermove', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
     expect(h.renderer.currentPath).toEqual([]);
   });
 
@@ -208,7 +239,12 @@ describe('Controls — selection and path drawing', () => {
     const state = makeUnitState({ position: [10, 10] });
     h.gameState.units.set(state.id, new Unit(state));
     const c = clientForEntity(10, 10);
-    dispatchPointer(h.canvas, 'pointerdown', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointerdown', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
 
     h.renderer.currentPath = [
       { x: 11, y: 10 },
@@ -217,7 +253,13 @@ describe('Controls — selection and path drawing', () => {
     dispatchPointer(h.canvas, 'pointerup', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
 
     expect(h.send).toHaveBeenCalledWith({
-      MoveUnit: { unitId: 'u1', path: [{ x: 11, y: 10 }, { x: 12, y: 10 }] },
+      MoveUnit: {
+        unitId: 'u1',
+        path: [
+          { x: 11, y: 10 },
+          { x: 12, y: 10 },
+        ],
+      },
     });
     expect(h.renderer.currentPath).toEqual([]);
     expect(h.selectUnit).toHaveBeenLastCalledWith(null);
@@ -234,7 +276,12 @@ describe('Controls — selection and path drawing', () => {
     const state = makeUnitState({ position: [10, 10] });
     h.gameState.units.set(state.id, new Unit(state));
     const c = clientForEntity(10, 10);
-    dispatchPointer(h.canvas, 'pointerdown', { button: 0, clientX: c.x, clientY: c.y, pointerId: 1 });
+    dispatchPointer(h.canvas, 'pointerdown', {
+      button: 0,
+      clientX: c.x,
+      clientY: c.y,
+      pointerId: 1,
+    });
     h.renderer.currentPath = [{ x: 2, y: 2 }];
 
     h.controls.deselect();
