@@ -1,15 +1,19 @@
-/// Map registry for loading maps by name
+/// Map registry for loading maps by name.
+///
+/// RwLock, not Mutex: `get`/`list_maps` are read-heavy (every game start,
+/// every /maps request) while `register` is rare (startup + tests), so
+/// concurrent readers must not serialize against each other.
 use crate::map::map::Map;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 #[allow(clippy::type_complexity)]
-static MAP_REGISTRY: Mutex<Option<HashMap<String, Box<dyn Fn() -> Map + Send + Sync>>>> =
-    Mutex::new(None);
+static MAP_REGISTRY: RwLock<Option<HashMap<String, Box<dyn Fn() -> Map + Send + Sync>>>> =
+    RwLock::new(None);
 
 /// Register a map loader function under a name
 pub fn register(name: &str, loader: impl Fn() -> Map + Send + Sync + 'static) {
-    let mut registry = MAP_REGISTRY.lock().unwrap();
+    let mut registry = MAP_REGISTRY.write().unwrap();
     registry
         .get_or_insert_with(HashMap::new)
         .insert(name.to_string(), Box::new(loader));
@@ -17,7 +21,7 @@ pub fn register(name: &str, loader: impl Fn() -> Map + Send + Sync + 'static) {
 
 /// Get a map by name, or None if not found
 pub fn get(name: &str) -> Option<Map> {
-    let registry = MAP_REGISTRY.lock().unwrap();
+    let registry = MAP_REGISTRY.read().unwrap();
     registry
         .as_ref()
         .and_then(|m| m.get(name))
@@ -26,7 +30,7 @@ pub fn get(name: &str) -> Option<Map> {
 
 /// List all registered map names (sorted alphabetically for deterministic ordering)
 pub fn list_maps() -> Vec<String> {
-    let registry = MAP_REGISTRY.lock().unwrap();
+    let registry = MAP_REGISTRY.read().unwrap();
     let mut names: Vec<String> = registry
         .as_ref()
         .map(|m| m.keys().cloned().collect())

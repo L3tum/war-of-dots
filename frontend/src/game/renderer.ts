@@ -1,4 +1,4 @@
-//! WebGPU rendering with fog of war, borders, unit symbols, and path preview
+// WebGPU rendering with fog of war, borders, unit symbols, and path preview
 
 import { GameState } from './game_state';
 import { marchingSquares, type TerrainType } from './terrain';
@@ -852,6 +852,74 @@ export class Renderer {
     const zoom = Math.min(this.canvas.width / mapW, this.canvas.height / mapH) * 0.9;
     this.camera.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
     this.markDataDirty();
+  }
+
+  /** Zoom out so the whole terrain map fits the viewport (10% margin). */
+  private fitMapToTerrain(gameState: GameState): void {
+    const terrain = gameState.terrain;
+    if (!terrain || terrain.length === 0 || terrain[0].length === 0) return;
+    let maxCol = 0;
+    for (const row of terrain) {
+      if (row.length > 0) maxCol = Math.max(maxCol, row.length - 1);
+    }
+    this.fitMapZoom((maxCol + 1) * CELL_SIZE, terrain.length * CELL_SIZE);
+  }
+
+  /**
+   * Center the camera on the player's own territory (own units + cities),
+   * or on the terrain center when there is no own player (spectators).
+   * Used on FullState arrival.
+   */
+  centerCameraOn(gameState: GameState): void {
+    const ownId = gameState.ownPlayerId;
+    if (ownId) {
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+      for (const unit of gameState.units.values()) {
+        if (unit.owner === ownId) {
+          sumX += unit.position.x * CELL_SIZE;
+          sumY += unit.position.y * CELL_SIZE;
+          count++;
+        }
+      }
+      for (const [, city] of gameState.cities) {
+        if (city.owner === ownId) {
+          sumX += city.position[0] * CELL_SIZE;
+          sumY += city.position[1] * CELL_SIZE;
+          count++;
+        }
+      }
+      if (count > 0) {
+        this.camera.x = sumX / count;
+        this.camera.y = sumY / count;
+        this.fitMapToTerrain(gameState);
+        return;
+      }
+    }
+    this.centerOnTerrain(gameState);
+  }
+
+  /** Center the camera on the terrain bounding box (ragged rows handled). */
+  centerOnTerrain(gameState: GameState): void {
+    const terrain = gameState.terrain;
+    if (!terrain || terrain.length === 0 || terrain[0].length === 0) return;
+
+    // Find the bounding box of non-empty terrain rows (handle ragged grids)
+    let minCol = Infinity,
+      maxCol = -Infinity;
+    for (const row of terrain) {
+      if (row.length > 0) {
+        minCol = Math.min(minCol, 0);
+        maxCol = Math.max(maxCol, row.length - 1);
+      }
+    }
+    const minRow = 0;
+    const maxRow = terrain.length - 1;
+
+    this.camera.x = ((minCol + maxCol) / 2 + 0.5) * CELL_SIZE;
+    this.camera.y = ((minRow + maxRow) / 2 + 0.5) * CELL_SIZE;
+    this.fitMapToTerrain(gameState);
   }
 
   renderFrame() {

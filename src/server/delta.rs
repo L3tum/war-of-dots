@@ -468,13 +468,26 @@ impl CityDiff for CityState {
 /// H5: generic over the city type — the live path diffs the engine's plain
 /// `City` snapshot against the engine-owned baseline, the reference path
 /// keeps protocol `CityState`.
-fn city_updates_diff<P: CityDiff, C: CityDiff>(
-    prev_cities: &HashMap<String, P>,
+///
+/// Perf #2: the previous snapshot is threaded as a LOOKUP closure (`id`
+/// → `Option<&P>`) so both storage shapes feed the SAME diff body — the
+/// reference path's keyed `HashMap<String, P>` (`get`) and the live path's
+/// shared `Arc<Vec<City>>` (linear scan by id: city counts are small, ~20,
+/// so C×C id compares are allocation-free and cheaper than the keyed map's
+/// per-tick rebuild the old `prev_cities: HashMap<String, City>` forced).
+fn city_updates_diff<'p, P: CityDiff + 'p, C: CityDiff, F>(
+    prev_lookup: F,
     current_cities: &[C],
-) -> Vec<CityUpdate> {
+) -> Vec<CityUpdate>
+where
+    // The lookup yields a borrow of the PREVIOUS snapshot (environment
+    // lifetime `'p`); the city id it is called with may live any shorter
+    // lifetime (it is borrowed from the CURRENT slice).
+    F: Fn(&str) -> Option<&'p P>,
+{
     let mut city_updates: Vec<CityUpdate> = Vec::new();
     for city in current_cities.iter() {
-        if let Some(prev) = prev_cities.get(city.city_id()) {
+        if let Some(prev) = prev_lookup(city.city_id()) {
             let owner_changed = city.city_owner() != prev.city_owner();
             let level_changed = city.city_level() != prev.city_level();
 
@@ -581,7 +594,7 @@ pub(crate) fn compute_shared_deltas(
     }
 
     // City updates
-    let city_updates = city_updates_diff(prev_cities, current_cities);
+    let city_updates = city_updates_diff(|id| prev_cities.get(id), current_cities);
 
     SharedDeltas {
         border_grid_diff,
@@ -711,11 +724,16 @@ pub(crate) struct TickDiffs {
     /// In-place unit diff (`update_unit_baselines`) — added / removed /
     /// field-level updates + the two per-owner count maps.
     pub units: UnitDiff,
-    /// Current city snapshot — PLAIN engine `City` structs (Arch H2: the
-    /// engine yields engine-owned data; the server converts to wire types
-    /// only inside the diff/commit). The city update list is computed
-    /// against `NetworkBaselines::prev_cities` in the shared compute.
-    pub cities: Vec<City>,
+    /// Current city snapshot — the SHARED `Arc<Vec<City>>` (Perf #2):
+    /// PLAIN engine `City` structs (Arch H2: the engine yields engine-owned
+    /// data; the server converts to wire types only inside the diff/commit)
+    /// published by the tick loop's generation-cached snapshot, rebuilt only
+    /// when a city mutation bumps `Game::city_generation`. The city update
+    /// list is computed against `NetworkBaselines::prev_cities` in the
+    /// shared compute, and the same `Arc` is committed back into the
+    /// baseline (shared allocation — an idle tick commits zero city
+    /// content allocations).
+    pub cities: Arc<Vec<City>>,
     /// Current territory grid (published Arc — allocation-free clone); the
     /// border diff is computed against `NetworkBaselines::prev_border`.
     pub border_grid: Option<Arc<Vec<u8>>>,
@@ -736,7 +754,7 @@ pub(crate) fn compute_shared_deltas_from_diff(
     units: UnitDiff,
     cities: &[City],
     border_grid: Option<&Arc<Vec<u8>>>,
-    prev_cities: &HashMap<String, City>,
+    prev_cities: &Arc<Vec<City>>,
     prev_border_grid: Option<&Arc<Vec<u8>>>,
 ) -> SharedDeltas {
     // Border grid diff (shared across all players) — identical to the
@@ -752,7 +770,14 @@ pub(crate) fn compute_shared_deltas_from_diff(
         units_added: Arc::new(units.added),
         units_removed: Arc::new(units.removed),
         unit_updates: Arc::new(units.updates),
-        city_updates: Arc::new(city_updates_diff(prev_cities, cities)),
+        // Perf #2: the prev snapshot is the shared `Arc<Vec<City>>` — the
+        // city diff looks each current city up by id with a linear scan
+        // (cities ~20; allocation-free) instead of the old per-tick
+        // `HashMap<String, City>` rebuild.
+        city_updates: Arc::new(city_updates_diff(
+            |id| prev_cities.iter().find(|c| c.id == id),
+            cities,
+        )),
         prev_units_by_owner: units.prev_owner_counts,
         current_units_by_owner: units.current_owner_counts,
     }
@@ -1403,20 +1428,33 @@ pub(crate) struct NetworkPhaseResult {
 /// committed there).
 ///
 /// H3: the per-tick shared diff inputs arrive as one structured `TickDiffs`
-/// value (unit diff + city snapshot + border grid) instead of parallel
-/// parameters.
+/// value (unit diff + shared city snapshot `Arc` + border grid) instead of
+/// parallel parameters.
+///
+/// Perf #3: `funds_scratch` is the caller's PERSISTENT per-player funds map
+/// (keys = the stable player-id set, seeded once; values refilled in place
+/// by the caller every tick). The phase reads it as the current-funds input
+/// and hands it to `NetworkBaselines::commit`, which SWAPS it with the
+/// pre-commit baseline — so this phase performs no funds-map allocation
+/// (the old `game.all_player_funds()` built a fresh HashMap bucket table +
+/// P key-String clones every tick).
 pub(crate) fn run_network_phase(
     game: &Game,
     baselines: &mut NetworkBaselines,
     player_ids: &[&str],
     diffs: TickDiffs,
+    funds_scratch: &mut HashMap<String, u32>,
     spliced: bool,
     record_pid: Option<&str>,
 ) -> NetworkPhaseResult {
-    let all_funds = game.all_player_funds();
+    // Perf #3: `funds_scratch` (the caller's persistent map, values
+    // refilled in place) is the current-funds input — no fresh per-tick
+    // `all_player_funds()` HashMap here anymore. It is reborrowed
+    // immutably below for the per-player deltas and handed to `commit`
+    // (the swap) after the last immutable borrow ends.
     // H3: destructure the bundle — the unit diff moves into the shared
-    // compute; the city snapshot + border grid move into the end-of-phase
-    // baseline commit below.
+    // compute; the city snapshot `Arc` + border grid move into the
+    // end-of-phase baseline commit below.
     let TickDiffs {
         units,
         cities,
@@ -1518,7 +1556,7 @@ pub(crate) fn run_network_phase(
         let built = build_delta_inner(
             &baselines.prev_funds,
             prev_vision,
-            &all_funds,
+            funds_scratch,
             &vision_grid,
             grid_width,
             pid,
@@ -1620,52 +1658,82 @@ pub(crate) fn run_network_phase(
 
     // H5: single commit step — every engine-neutral baseline (cities/funds/
     // border + the per-player vision grids) advances in one atomic call.
+    // Perf #2: `cities` is the shared snapshot `Arc` — the tick loop's cache
+    // keeps its own ref, so the baseline and the cache alias the same
+    // `Vec<City>` (an idle tick's commit is a refcount bump, not a clone).
+    // Perf #3: `funds_scratch` is swapped with `prev_funds` (drain-back):
+    // the baseline takes the current values, the scratch receives the
+    // pre-commit map to refill in place next tick.
     // I1: the unit baseline is committed separately by `update_unit_baselines`
     // (server-owned store, Arch H2) — it is no longer rebuilt here.
-    baselines.commit(cities, all_funds, border_grid, vision_commits);
+    baselines.commit(cities, funds_scratch, border_grid, vision_commits);
 
     result
 }
 
 /// Build LLM agent state with filtered units based on vision grid.
+///
+/// Allocation-minimal per call (runs once per second per LLM agent/advisor):
+/// the vision/border grids are read as the engine's flat `Arc<Vec<u8>>`
+/// stores (a refcount bump, not a grid copy) and converted to the LLM-facing
+/// `Vec<Vec<bool>>` / `Vec<Vec<u32>>` shape exactly once each; units are
+/// iterated in place as borrowed [`UnitView`]s (the same 10-component query
+/// and iteration order as `query_all_units`, with no full-world
+/// `Vec<UnitQueryData>` clone) and only the units passing the visibility
+/// filter are materialized into LLM `UnitState`.
 pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameState {
-    let vision_grid = game.vision_grid_2d(player_id).unwrap_or_default();
-    let border_grid = game.border_grid_2d(player_id).unwrap_or_default();
+    // One flat→2D conversion per grid — identical values to
+    // `vision_grid_2d` / `border_grid_2d`, which read the same flat stores
+    // with the same terrain dimensions (and map "no grid yet" to an empty
+    // `Vec::new()` the same way the old `unwrap_or_default()` did).
+    let w = game.terrain_width() as usize;
+    let h = game.terrain_height() as usize;
+    let vision_grid: Vec<Vec<bool>> = match game.vision_grid_flat(player_id) {
+        Some(flat) => (0..h)
+            .map(|y| (0..w).map(|x| flat[y * w + x] != 0).collect())
+            .collect(),
+        None => Vec::new(),
+    };
+    let border_grid: Vec<Vec<u32>> = match game.territory_grid_flat() {
+        Some(flat) => (0..h)
+            .map(|y| (0..w).map(|x| flat[y * w + x] as u32).collect())
+            .collect(),
+        None => Vec::new(),
+    };
 
-    // Arch H2 seam: source the units from the engine's plain `UnitQueryData`
-    // snapshot (no wire hop) — the LLM mapping was previously fed by
-    // `Game::unit_states()` wire types.
-    let units: Vec<crate::llm::agent::UnitState> = game
-        .query_all_units()
-        .iter()
-        .filter(|unit| {
-            let (gx, gy) = (unit.position.0 as usize, unit.position.1 as usize);
-            unit.owner == player_id
-                || (gy < vision_grid.len() && gx < vision_grid[gy].len() && vision_grid[gy][gx])
-        })
-        .map(|u| crate::llm::agent::UnitState {
-            id: u.id.clone(),
-            owner: u.owner.clone(),
-            position: u.position,
-            men: u.men,
-            max_men: u.max_men,
-            organisation: u.organisation,
-            equipment: u
-                .equipment
-                .iter()
-                .zip(u.max_equipment.iter())
-                .map(|(e, me)| crate::llm::agent::EquipmentState {
-                    name: e.name.clone(),
-                    count: e.count,
-                    max_count: me.count,
-                })
-                .collect(),
-            unit_type: u.unit_type.clone(),
-            symbol: u.symbol.clone(),
-            supply_percent: u.supply_percent(),
-            resupply_enabled: u.resupply_enabled,
-        })
-        .collect();
+    // In-place unit pass: borrow each unit, apply the visibility filter, and
+    // only then allocate the LLM `UnitState` (strings copied from the view
+    // exactly as the old `UnitQueryData` mapping did).
+    let mut units: Vec<crate::llm::agent::UnitState> = Vec::new();
+    game.for_each_unit(|entity, u| {
+        let (gx, gy) = (u.position.0 as usize, u.position.1 as usize);
+        if u.owner == player_id
+            || (gy < vision_grid.len() && gx < vision_grid[gy].len() && vision_grid[gy][gx])
+        {
+            units.push(crate::llm::agent::UnitState {
+                id: format!("unit_{}", entity.id()),
+                owner: u.owner.to_string(),
+                position: u.position,
+                men: u.men,
+                max_men: u.max_men,
+                organisation: u.organisation,
+                equipment: u
+                    .equipment
+                    .iter()
+                    .zip(u.max_equipment.iter())
+                    .map(|(e, me)| crate::llm::agent::EquipmentState {
+                        name: e.name.clone(),
+                        count: e.count,
+                        max_count: me.count,
+                    })
+                    .collect(),
+                unit_type: u.unit_type.to_string(),
+                symbol: u.symbol.to_string(),
+                supply_percent: u.supply_percent,
+                resupply_enabled: u.resupply_enabled,
+            });
+        }
+    });
 
     let cities: Vec<crate::llm::agent::CityState> = game.with_cities(|all| {
         all.iter()
@@ -1684,7 +1752,9 @@ pub fn build_llm_state(game: &Game, player_id: &str) -> crate::llm::agent::GameS
             .collect()
     });
 
-    let funds: u32 = game.all_player_funds().get(player_id).copied().unwrap_or(0);
+    // Per-player read (no full-player HashMap; `player_funds` returns 0 for
+    // unknown ids, same as the old `.get(...).copied().unwrap_or(0)`).
+    let funds: u32 = game.player_funds(player_id);
 
     crate::llm::agent::GameState {
         units,
@@ -3213,6 +3283,27 @@ mod tests {
         let (mut game, unit_type) = two_player_game();
         let (mut baselines, mut unit_store) = seeded_baselines(&game);
         let pids = ["player_0", "player_1"];
+        // Perf #3: persistent per-tick funds scratch, keyed by the stable
+        // player-id set (the live tick loop seeds the same way; values are
+        // refilled in place per tick, so zero per-tick map allocation).
+        // The caller refills the scratch just before the network phase —
+        // exactly what the live tick loop does — so the values below start
+        // at the live funds and are refilled before each `run_network_phase`.
+        let mut funds_scratch: HashMap<String, u32> = game
+            .players()
+            .keys()
+            .map(|k| (k.clone(), game.player_funds(k)))
+            .collect();
+        let refill = |game: &Game, scratch: &mut HashMap<String, u32>| {
+            for pid in game.players().keys() {
+                match scratch.get_mut(pid) {
+                    Some(v) => *v = game.player_funds(pid),
+                    None => {
+                        scratch.insert(pid.clone(), game.player_funds(pid));
+                    }
+                }
+            }
+        };
 
         // Recruit a unit for the viewpoint AFTER seeding the baselines, so
         // the first tick produces a guaranteed non-idle delta (units_added).
@@ -3223,15 +3314,17 @@ mod tests {
         game.tick_game();
         let unit_diff = update_unit_baselines(&game, &mut unit_store);
         let current_cities: Vec<City> = game.query_cities();
+        refill(&game, &mut funds_scratch);
         let phase = run_network_phase(
             &game,
             &mut baselines,
             &pids,
             TickDiffs {
                 units: unit_diff,
-                cities: current_cities,
+                cities: Arc::new(current_cities),
                 border_grid: game.territory_grid_flat(),
             },
+            &mut funds_scratch,
             false,
             Some("player_0"),
         );
@@ -3248,15 +3341,17 @@ mod tests {
         game.tick_game();
         let unit_diff = update_unit_baselines(&game, &mut unit_store);
         let current_cities: Vec<City> = game.query_cities();
+        refill(&game, &mut funds_scratch);
         let phase = run_network_phase(
             &game,
             &mut baselines,
             &pids,
             TickDiffs {
                 units: unit_diff,
-                cities: current_cities,
+                cities: Arc::new(current_cities),
                 border_grid: game.territory_grid_flat(),
             },
+            &mut funds_scratch,
             false,
             None,
         );
@@ -3266,15 +3361,17 @@ mod tests {
         game.tick_game();
         let unit_diff = update_unit_baselines(&game, &mut unit_store);
         let current_cities: Vec<City> = game.query_cities();
+        refill(&game, &mut funds_scratch);
         let phase = run_network_phase(
             &game,
             &mut baselines,
             &pids,
             TickDiffs {
                 units: unit_diff,
-                cities: current_cities,
+                cities: Arc::new(current_cities),
                 border_grid: game.territory_grid_flat(),
             },
+            &mut funds_scratch,
             false,
             Some("player_1"),
         );

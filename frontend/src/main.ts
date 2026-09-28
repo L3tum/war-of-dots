@@ -1,4 +1,4 @@
-//! Main frontend entry
+// Main frontend entry
 
 import { GameState } from './game/game_state';
 import { Renderer } from './game/renderer';

@@ -50,8 +50,9 @@ impl Advisor {
         match client.call(state, system, tool_defs).await {
             Ok(tool_calls) => {
                 if let Some(tc) = tool_calls.first() {
-                    // Advisor doesn't execute commands, so use dummy player_id
-                    let (_command, reason) = match tools::tool_call_to_command(tc, "advisor") {
+                    // Advisor doesn't execute actions; ownership is
+                    // server-side only, so no player id is needed here.
+                    let (_action, reason) = match tools::tool_call_to_action(tc) {
                         Ok(res) => res,
                         Err(e) => {
                             tracing::warn!(

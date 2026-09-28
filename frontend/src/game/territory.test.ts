@@ -1,10 +1,10 @@
-//! Differential tests for the flat territory pipeline (Perf #3).
-//!
-//! The reference below is a verbatim copy of the pre-Perf-#3 2-D multi-source
-//! BFS (array-of-arrays grid, per-cell tuple queue). The flat core
-//! (`TerritoryFiller`) and the 2-D `fillTerritory` wrapper must both
-//! reproduce its output bit-for-bit — these tests lock that in on
-//! randomized maps, including production-scale (200×200) inputs.
+// Differential tests for the flat territory pipeline (Perf #3).
+//
+// The reference below is a verbatim copy of the pre-Perf-#3 2-D multi-source
+// BFS (array-of-arrays grid, per-cell tuple queue). The flat core
+// (`TerritoryFiller`) and the 2-D `fillTerritory` wrapper must both
+// reproduce its output bit-for-bit — these tests lock that in on
+// randomized maps, including production-scale (200×200) inputs.
 
 import { describe, it, expect } from 'vitest';
 import { fillTerritory, TerritoryFiller, TERRITORY_NONE, type CityAnchor } from './territory';

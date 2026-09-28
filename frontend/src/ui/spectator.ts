@@ -1,4 +1,4 @@
-//! Spectator view — manages the spectator panel with player filters and reasoning log.
+// Spectator view — manages the spectator panel with player filters and reasoning log.
 
 import { escapeHtml } from './html';
 

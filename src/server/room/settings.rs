@@ -1,27 +1,10 @@
-//! Lobby custom-ruleset helpers: equipment parsing, config -> engine unit
-//! type conversion, default unit types, and client-controlled lobby-settings
-//! validation.
+//! Lobby custom-ruleset helpers: config -> engine unit type conversion,
+//! default unit types, and client-controlled lobby-settings validation.
 
 use crate::config::{EquipmentConfig, UnitTypeConfig as ConfigUnitType};
 use crate::game::economy::UnitType;
 use crate::game::unit::Equipment;
 use crate::server::protocol::{CustomUnitType, LobbySettings};
-
-/// Parse equipment string like "rifles:100:0.5" into an Equipment struct
-/// Supports legacy format "name:count" and new format "name:count:cost_per_item"
-#[allow(dead_code)]
-pub(crate) fn parse_equipment(s: &str) -> crate::game::unit::Equipment {
-    let parts: Vec<&str> = s.split(':').collect();
-    let name = parts[0].to_string();
-    let count: u32 = parts.get(1).and_then(|c| c.parse().ok()).unwrap_or(100);
-    let cost_per_item: f32 = parts.get(2).and_then(|c| c.parse().ok()).unwrap_or(0.0);
-    crate::game::unit::Equipment {
-        name,
-        count,
-        max_count: count,
-        cost_per_item,
-    }
-}
 
 /// Convert standard ruleset config unit types to game unit types
 pub(crate) fn convert_unit_types(unit_types: &[ConfigUnitType]) -> Vec<UnitType> {

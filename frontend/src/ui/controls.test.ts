@@ -1,14 +1,14 @@
-//! Controls tests — unit/city selection, path drawing, zoom clamping, and the
-//! MoveUnit send contract — against a fake canvas (happy-dom + fake GPU).
-//!
-//! NOTE (MoveUnit reachability): in the committed UI flow, a left-click on
-//! empty ground both deselects the unit AND seeds the path, while the
-//! pointerup handler only sends `MoveUnit` when a selection is still active —
-//! so the full click→drag→click sequence can never deliver a MoveUnit from
-//! the browser UI today. That pre-existing interaction gap is flagged for the
-//! frontend owners; this suite therefore exercises the pointerup send
-//! contract directly (selection + drawn path → send) rather than pretending
-//! the end-to-end click flow sends.
+// Controls tests — unit/city selection, path drawing, zoom clamping, and the
+// MoveUnit send contract — against a fake canvas (happy-dom + fake GPU).
+//
+// NOTE (MoveUnit reachability): in the committed UI flow, a left-click on
+// empty ground both deselects the unit AND seeds the path, while the
+// pointerup handler only sends `MoveUnit` when a selection is still active —
+// so the full click→drag→click sequence can never deliver a MoveUnit from
+// the browser UI today. That pre-existing interaction gap is flagged for the
+// frontend owners; this suite therefore exercises the pointerup send
+// contract directly (selection + drawn path → send) rather than pretending
+// the end-to-end click flow sends.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createFakeGpu } from '../test/fake_gpu';

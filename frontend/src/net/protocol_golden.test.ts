@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { decode, encode } from 'cbor-x';
-import { unpackUnitPosition } from './connection';
+import { unpackUnitPosition } from './protocol';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = readFileSync(join(here, '../../../tests/fixtures/protocol_delta_golden.bin'));

@@ -1,4 +1,4 @@
-//! Unit and City info panels with controls for healing, resupply, and upgrades.
+// Unit and City info panels with controls for healing, resupply, and upgrades.
 
 import { GameState } from '../game/game_state';
 import { Connection } from '../net/connection';

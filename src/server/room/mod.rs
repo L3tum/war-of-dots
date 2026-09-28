@@ -109,11 +109,11 @@ impl GameRoom {
             prepared.llm_pairs,
         );
 
-        // --- Spawn advisor tasks (one per enabled advisor) ---
+        // --- Spawn advisor tasks (one per advisor-flag entry) ---
         let advice_rx = llm_tasks::spawn_advisors(
             &mut spawned_handles,
             &prepared.state_broadcasts,
-            &prepared.advisors,
+            &prepared.advisor_enabled,
             prepared.advisor_client_opt,
         );
 
@@ -126,7 +126,7 @@ impl GameRoom {
         tick::TickLoop {
             game: prepared.game,
             players: prepared.players,
-            advisors: prepared.advisors,
+            advisor_enabled: prepared.advisor_enabled,
             server_state,
             state_broadcasts: prepared.state_broadcasts,
             spawned_handles,
@@ -140,7 +140,7 @@ impl GameRoom {
             game_start_time: prepared.game_start_time,
             settings_json: prepared.settings_json,
             record_pid: prepared.record_pid,
-            replay_recorder: prepared.replay_recorder,
+            replay_tx: prepared.replay_tx,
             game_stats,
             spectator_vision,
         }

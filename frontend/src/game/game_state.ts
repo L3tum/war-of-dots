@@ -1,4 +1,4 @@
-//! Game state on the client side
+// Game state on the client side
 
 import { TerrainType } from './terrain';
 import { Unit } from './units';

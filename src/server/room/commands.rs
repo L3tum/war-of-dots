@@ -68,11 +68,11 @@ pub(crate) async fn handle_game_command(
                     .cloned();
                 if let Some(room_arc) = room_arc {
                     let room = room_arc.lock().await;
-                    let _ = room.command_tx.send(Command::RecruitUnit(
-                        city_id.clone(),
-                        unit_type_name.clone(),
-                        player_id,
-                    ));
+                    let _ = room.command_tx.send(Command::RecruitUnit {
+                        city_id: city_id.clone(),
+                        unit_type: unit_type_name.clone(),
+                        owner: player_id,
+                    });
                 }
             }
         }
@@ -137,9 +137,10 @@ pub(crate) async fn handle_game_command(
                     .cloned();
                 if let Some(room_arc) = room_arc {
                     let room = room_arc.lock().await;
-                    let _ = room
-                        .command_tx
-                        .send(Command::UpgradeCity(city_id.clone(), player_id));
+                    let _ = room.command_tx.send(Command::UpgradeCity {
+                        city_id: city_id.clone(),
+                        owner: player_id,
+                    });
                 }
             }
         }
@@ -163,9 +164,10 @@ pub(crate) async fn handle_game_command(
                 drop(server);
                 if let Some(room_arc) = room_arc {
                     let room = room_arc.lock().await;
-                    let _ = room
-                        .command_tx
-                        .send(Command::ToggleAdvisor(player_id, *enabled));
+                    let _ = room.command_tx.send(Command::ToggleAdvisor {
+                        player_id,
+                        enabled: *enabled,
+                    });
                 }
             }
         }
@@ -196,9 +198,10 @@ pub(crate) async fn handle_game_command(
             drop(server);
             if let Some(room_arc) = room_arc {
                 let room = room_arc.lock().await;
-                let _ = room
-                    .command_tx
-                    .send(Command::EmbarkUnit(unit_id.clone(), player_id));
+                let _ = room.command_tx.send(Command::EmbarkUnit {
+                    unit_id: unit_id.clone(),
+                    player_id,
+                });
             }
         }
         ClientMessage::DisembarkUnit { unit_id } => {
@@ -211,9 +214,10 @@ pub(crate) async fn handle_game_command(
             drop(server);
             if let Some(room_arc) = room_arc {
                 let room = room_arc.lock().await;
-                let _ = room
-                    .command_tx
-                    .send(Command::DisembarkUnit(unit_id.clone(), player_id));
+                let _ = room.command_tx.send(Command::DisembarkUnit {
+                    unit_id: unit_id.clone(),
+                    player_id,
+                });
             }
         }
         _ => {}

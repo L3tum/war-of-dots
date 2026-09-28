@@ -1,7 +1,5 @@
-//! WebSocket connection — transport and message dispatch only.
+// WebSocket connection — transport and message dispatch only.
 
-import { decode, encode } from 'cbor-x';
-import { CELL_SIZE } from '../game/config';
 import { TerrainType } from '../game/terrain';
 import {
   GameDeltaMessage,
@@ -15,167 +13,25 @@ import { Unit } from '../game/units';
 import { Spectator } from '../ui/spectator';
 import { Advisor } from '../ui/advisor';
 import { LobbyUI } from '../ui/lobby';
-
-const CBOR = {
-  encode(obj: unknown): Uint8Array {
-    // Strip undefined values before encoding — cbor-x encodes JS `undefined`
-    // as CBOR undefined (0xf7), which serde_cbor on the server does NOT treat
-    // as null.  Removing them ensures missing fields use #[serde(default)].
-    const cleaned = stripUndefined(obj);
-    return encode(cleaned);
-  },
-  decode(data: Uint8Array): unknown {
-    return decode(data);
-  },
-};
-
-/** Convert a flat row-major array to a 2-D array (one row per width). */
-function flatTo2D(flat: number[], width: number): number[][] {
-  const h = Math.ceil(flat.length / width);
-  const grid: number[][] = new Array(h);
-  for (let y = 0; y < h; y++) {
-    const row = new Array(width);
-    for (let x = 0; x < width; x++) row[x] = flat[y * width + x];
-    grid[y] = row;
-  }
-  return grid;
-}
-
-/** Convert a flat row-major byte array to a 2-D boolean array. */
-function flatTo2DBools(flat: number[], width: number): boolean[][] {
-  const h = Math.ceil(flat.length / width);
-  const grid: boolean[][] = new Array(h);
-  for (let y = 0; y < h; y++) {
-    const row = new Array(width);
-    for (let x = 0; x < width; x++) row[x] = flat[y * width + x] !== 0;
-    grid[y] = row;
-  }
-  return grid;
-}
+import { setDisconnectedOverlay, showLobbyInfo, transitionToGameUI } from '../ui/game_ui';
+import {
+  applyCells,
+  applyEquipmentCounts,
+  cborDecode,
+  cborEncode,
+  flatTo2D,
+  flatTo2DBools,
+  mapSizeFromTerrain,
+  unpackUnitPosition,
+} from './protocol';
 
 /**
- * I4: number of index bits needed to pack a row-major cell index for a grid
- * of `cells` cells — must match the server's `grid_index_bits`
- * (`ceil(log2(cells))`). Returns `null` when the grid is too large to pack
- * (an 8-bit value and the index must share a u32, i.e. at most 2^24 cells;
- * such grids always ship in the full-grid form).
- */
-function gridIndexBits(cells: number): number | null {
-  if (cells <= 1) return 0;
-  let bits = 1;
-  while (1 << bits < cells) bits += 1;
-  return bits <= 24 ? bits : null;
-}
-
-/**
- * I4: apply a packed changed-cell list (sparse grid diff) to an existing 2-D
- * grid in place. Each entry packs the NEW value and the row-major cell index
- * into one u32: `(value << bits) | index`, with `bits` derived from the grid
- * dimensions — the client-side inverse of the server's `diff_grid`. Mutates
- * `grid`; returns false (with no mutation) when there is no usable baseline
- * grid — the sparse form always requires the previous grid, which the client
- * holds from the last full state/diff.
- */
-export function applyCells(
-  grid: number[][] | boolean[][],
-  cells: number[],
-  width: number,
-  toBool: boolean,
-): boolean {
-  if (width === 0 || grid.length === 0 || grid[0] === undefined) return false;
-  const bits = gridIndexBits(grid.length * width);
-  if (bits === null) return false;
-  const mask = bits === 0 ? 0 : (1 << bits) - 1;
-  for (const packed of cells) {
-    const index = bits === 0 ? 0 : packed & mask;
-    const value = (bits === 0 ? packed : packed >> bits) & 0xff;
-    const row = grid[Math.floor(index / width)];
-    const col = index % width;
-    if (row === undefined || col >= row.length) continue;
-    if (toBool) (row as boolean[])[col] = value !== 0;
-    else (row as number[])[col] = value;
-  }
-  return true;
-}
-
-/**
- * I3: quantization steps per map axis for packed unit positions — each axis
- * is a `u16` quantized to 65,536 steps ACROSS THE FULL MAP (see the server's
- * `UNIT_POSITION_STEPS` / `pack_unit_position`). This constant MUST stay in
- * lockstep with `src/server/protocol.rs`.
- */
-export const UNIT_POSITION_STEPS = 65_536;
-
-/**
- * I3: decode a packed unit position (single `u32`: `x_q << 16 | y_q`, each
- * axis quantized to `u16` over the full map) back to cell coordinates. This is
- * the client-side inverse of the server's `pack_unit_position` — pass the
- * same `map_size` (terrain width, height in cells) the server packed with.
- */
-export function unpackUnitPosition(
-  packed: number,
-  mapSize: { width: number; height: number },
-): { x: number; y: number } {
-  const xq = packed >>> 16;
-  const yq = packed & 0xffff;
-  return {
-    x: (xq * mapSize.width) / UNIT_POSITION_STEPS,
-    y: (yq * mapSize.height) / UNIT_POSITION_STEPS,
-  };
-}
-
-/**
- * I3: map size in cells from the client's 2-D terrain grid (rows × cols), or
- * `null` when the grid is not ready — packed unit positions cannot be decoded
- * until the full state has arrived.
- */
-export function mapSizeFromTerrain(terrain: unknown[][]): { width: number; height: number } | null {
-  const height = terrain.length;
-  const first = height > 0 ? terrain[0] : undefined;
-  const width = first !== undefined ? first.length : 0;
-  return width > 0 && height > 0 ? { width, height } : null;
-}
-
-/**
- * I3: apply a per-slot equipment COUNTS update (in `UnitState.equipment` slot
- * order) to a unit, keeping slot names and `cost_per_item` from the
- * once-per-lifetime full state. Returns `false` when the counts do not line up
- * with the full-state slot table (different length) — the caller should keep
- * the previous equipment rather than corrupt slot order.
- */
-export function applyEquipmentCounts(
-  unit: { equipment: import('../generated/protocol').EquipmentState[] },
-  counts: number[],
-): boolean {
-  if (unit.equipment.length !== counts.length) return false;
-  unit.equipment = unit.equipment.map((slot, i) => ({ ...slot, count: counts[i] }));
-  return true;
-}
-
-/** Re-export for replay player. */
-export { flatTo2D, flatTo2DBools };
-
-/** Recursively remove `undefined` values from plain objects and arrays.
- * Exported so tests assert the exact helper the wire path uses (instead of a
- * duplicated copy). */
-export function stripUndefined(value: unknown): unknown {
-  if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(stripUndefined);
-  const result: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(value)) {
-    if (val !== undefined) {
-      result[key] = stripUndefined(val);
-    }
-  }
-  return result;
-}
-
-/**
- * WebSocket connection manager.
+ * WebSocket connection manager — transport + dispatch only.
  *
- * Handles the transport layer (WebSocket open/close/reconnect) and
- * message dispatch. Does NOT handle game logic — that is delegated
- * to GameState, Renderer, LobbyUI, etc.
+ * Handles the transport layer (WebSocket open/close/reconnect, Hello
+ * handshake) and routes decoded ServerMessage variants to the game/UI
+ * modules. Wire encode/decode lives in ./protocol, page-level DOM chrome in
+ * ../ui/game_ui, and camera setup in Renderer.
  *
  * Message format: CBOR-encoded protocol buffers.
  * - Client → Server: ClientMessage variants
@@ -194,7 +50,6 @@ export class Connection {
   // before the ack are queued (bounded); a rejected handshake is fatal
   // (no reconnect storm against a server that will never accept us).
   private static readonly PROTOCOL_VERSION = 1;
-  private static readonly FEATURES = 0; // no feature bits requested in v1
   private helloAcked = false;
   private handshakeFailed = false;
   private pendingSends: Array<Record<string, unknown>> = [];
@@ -237,7 +92,7 @@ export class Connection {
     this.ws.onopen = () => {
       console.log('Connected to server');
       this.reconnectDelay = 1000; // reset delay on success
-      this.showDisconnected(false);
+      setDisconnectedOverlay(false);
       // WP3: Hello MUST be the first message (spectator connections are
       // read-only and use a different server endpoint that has no
       // handshake).
@@ -246,7 +101,8 @@ export class Connection {
         this.sendRaw({
           Hello: {
             protocol_version: Connection.PROTOCOL_VERSION,
-            features: Connection.FEATURES,
+            // v1 requests no feature bits; the field stays on the wire (byte-pinned).
+            features: 0,
           },
         });
       }
@@ -258,7 +114,7 @@ export class Connection {
         if (data instanceof ArrayBuffer) {
           const uint8 = new Uint8Array(data);
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const msg = CBOR.decode(uint8) as ServerMessage & Record<string, any>;
+          const msg = cborDecode(uint8) as ServerMessage & Record<string, any>;
           this.handleServerMessage(msg);
         } else if (typeof data === 'string') {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -276,7 +132,7 @@ export class Connection {
         if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
           console.log('Disconnected');
         }
-        this.showDisconnected(true);
+        setDisconnectedOverlay(true);
         this.reconnect();
       } catch (err) {
         console.error('Error in onclose handler:', err);
@@ -286,7 +142,7 @@ export class Connection {
     this.ws.onerror = (err) => {
       try {
         console.error('WebSocket error', err);
-        this.showDisconnected(true);
+        setDisconnectedOverlay(true);
       } catch (handlerErr) {
         console.error('Error in onerror handler:', handlerErr);
       }
@@ -315,15 +171,8 @@ export class Connection {
 
   private sendRaw(message: Record<string, unknown>) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const encoded = CBOR.encode(message);
+      const encoded = cborEncode(message);
       this.ws.send(encoded);
-    }
-  }
-
-  private showDisconnected(isDisconnected: boolean) {
-    const overlay = document.getElementById('disconnected-overlay');
-    if (overlay) {
-      overlay.style.display = isDisconnected ? 'flex' : 'none';
     }
   }
 
@@ -346,9 +195,6 @@ export class Connection {
       // version. Flush any sends that raced the ack.
       if (msg.HelloAck) {
         this.helloAcked = true;
-        if (msg.HelloAck.features) {
-          console.log('[WS] negotiated features:', msg.HelloAck.features);
-        }
         const pending = this.pendingSends;
         this.pendingSends = [];
         for (const m of pending) this.sendRaw(m);
@@ -359,7 +205,7 @@ export class Connection {
         // protocol version / Hello not first).
         console.error('Handshake rejected by server:', msg.Error?.message);
         this.handshakeFailed = true;
-        this.showDisconnected(true);
+        setDisconnectedOverlay(true);
         return;
       }
       // The server uses Rust enum serialization: { FullState: {...} }, { DeltaState: {...} }
@@ -381,33 +227,14 @@ export class Connection {
           this.lobbyUI.enableStartButton();
         }
       } else if (msg.LobbyCreated) {
-        // Hide game-over overlay if showing
-        const overlay = document.getElementById('game-over-overlay');
-        if (overlay) overlay.classList.add('hidden');
-
-        // Set lobby code and show waiting room
-        const codeDisplay = document.getElementById('lobby-code-display');
-        if (codeDisplay) codeDisplay.textContent = msg.LobbyCreated.lobby_code;
-
-        // Delegate to LobbyUI for tab/panel management
-        if (this.lobbyUI) {
-          this.lobbyUI.showTab('info');
-        }
+        // Enter the waiting room: hide any game-over overlay, show the lobby
+        // code, switch to the info tab.
+        showLobbyInfo(msg.LobbyCreated.lobby_code, this.lobbyUI);
       } else if (msg.LobbyJoined) {
-        // Hide game-over overlay if showing
-        const overlay = document.getElementById('game-over-overlay');
-        if (overlay) overlay.classList.add('hidden');
-
-        // Mirror LobbyCreated: set the code display so a joining player can
-        // read/share the lobby code (previously the guest's display stayed
-        // blank after a successful join).
-        const codeDisplay = document.getElementById('lobby-code-display');
-        if (codeDisplay) codeDisplay.textContent = msg.LobbyJoined.lobby_code;
-
-        // Delegate to LobbyUI for tab/panel management
-        if (this.lobbyUI) {
-          this.lobbyUI.showTab('info');
-        }
+        // Mirror LobbyCreated: a joining player gets the same waiting-room
+        // treatment (previously the guest's code display stayed blank after a
+        // successful join).
+        showLobbyInfo(msg.LobbyJoined.lobby_code, this.lobbyUI);
       } else if (msg.LobbyUpdate) {
         if (this.lobbyUI) {
           this.lobbyUI.updatePlayers(msg.LobbyUpdate.players);
@@ -469,96 +296,13 @@ export class Connection {
       }
 
       // Center camera on the player's own territory (or map center for spectators)
-      this.centerCamera();
+      this.renderer.centerCameraOn(this.gameState);
 
       // Hide lobby and show game UI
-      this.transitionToGameUI();
+      transitionToGameUI(this.lobbyUI);
     } catch (err) {
       console.error('Error applying full state:', err);
     }
-  }
-
-  /** Center camera: on own territory when playing, on map center for spectators. */
-  private centerCamera(): void {
-    const ownId = this.gameState.ownPlayerId;
-    if (ownId) {
-      let sumX = 0;
-      let sumY = 0;
-      let count = 0;
-      for (const unit of this.gameState.units.values()) {
-        if (unit.owner === ownId) {
-          sumX += unit.position.x * CELL_SIZE;
-          sumY += unit.position.y * CELL_SIZE;
-          count++;
-        }
-      }
-      for (const [, city] of this.gameState.cities) {
-        if (city.owner === ownId) {
-          sumX += city.position[0] * CELL_SIZE;
-          sumY += city.position[1] * CELL_SIZE;
-          count++;
-        }
-      }
-      if (count > 0) {
-        this.renderer.camera.x = sumX / count;
-        this.renderer.camera.y = sumY / count;
-        this.fitMapZoom();
-        return;
-      }
-    }
-    this.centerCameraOnTerrain();
-  }
-
-  /** Zoom out so the whole map fits the viewport (with a 10% margin). */
-  private fitMapZoom(): void {
-    const terrain = this.gameState.terrain;
-    if (!terrain || terrain.length === 0 || terrain[0].length === 0) return;
-    let maxCol = 0;
-    for (const row of terrain) {
-      if (row.length > 0) maxCol = Math.max(maxCol, row.length - 1);
-    }
-    const mapW = (maxCol + 1) * CELL_SIZE;
-    const mapH = terrain.length * CELL_SIZE;
-    this.renderer.fitMapZoom(mapW, mapH);
-  }
-
-  /** Center the camera on the terrain map */
-  private centerCameraOnTerrain(): void {
-    const terrain = this.gameState.terrain;
-    if (!terrain || terrain.length === 0 || terrain[0].length === 0) return;
-
-    // Find the bounding box of non-empty terrain rows (handle ragged grids)
-    let minCol = Infinity,
-      maxCol = -Infinity;
-    for (const row of terrain) {
-      if (row.length > 0) {
-        minCol = Math.min(minCol, 0);
-        maxCol = Math.max(maxCol, row.length - 1);
-      }
-    }
-    const minRow = 0;
-    const maxRow = terrain.length - 1;
-
-    const centerX = ((minCol + maxCol) / 2 + 0.5) * CELL_SIZE;
-    const centerY = ((minRow + maxRow) / 2 + 0.5) * CELL_SIZE;
-
-    this.renderer.camera.x = centerX;
-    this.renderer.camera.y = centerY;
-    this.fitMapZoom();
-  }
-
-  /** Hide lobby panel and show game UI elements */
-  private transitionToGameUI(): void {
-    // Hide lobby panel
-    this.lobbyUI?.hide();
-
-    // Show stats panel
-    const statsPanel = document.getElementById('stats-panel');
-    if (statsPanel) statsPanel.classList.remove('hidden');
-
-    // Show city labels container
-    const cityLabels = document.getElementById('city-labels');
-    if (cityLabels) cityLabels.classList.remove('hidden');
   }
 
   private applyDelta(delta: GameDeltaMessage) {

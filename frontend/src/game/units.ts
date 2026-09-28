@@ -1,4 +1,4 @@
-//! Unit representation for client (rendering wrapper around server-generated types)
+// Unit representation for client (rendering wrapper around server-generated types)
 
 import {
   UnitState as ServerUnitState,

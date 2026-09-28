@@ -1,5 +1,5 @@
-//! Spectator UI tests — reason log rendering, per-player filter, caps,
-//! game-over overlay and replay link, clearAll.
+// Spectator UI tests — reason log rendering, per-player filter, caps,
+// game-over overlay and replay link, clearAll.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Spectator } from './spectator';

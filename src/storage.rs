@@ -1,4 +1,21 @@
 //! SQLite storage for game metadata, leaderboards
+//!
+//! **Sync core / async wrappers split (Arch #12):** the on-disk schema and
+//! all SQL live in the sync methods below (`record_game_end`,
+//! `get_leaderboards`, `list_game_metadata`, `find_replay_path`,
+//! `upsert_player_names`, and the free function `persist_game_end`). They
+//! guard the single `sqlite::Connection` with a short-lived `std::sync::Mutex`
+//! and are safe to call from any sync context — in particular the tick task
+//! (see `persist_game_end`), which runs on a worker thread and must not pay
+//! the `spawn_blocking` hop on its end-of-game path.
+//!
+//! The `*_async` wrappers are for async contexts (axum handlers, the lobby
+//! start flow). They route the identical blocking work through
+//! `tokio::task::spawn_blocking` so the SQLite mutex is only ever held on a
+//! blocking-pool thread, never on an async runtime worker. `Storage` is
+//! `Clone`-via-`Arc`, so it moves into the blocking task cheaply; the
+//! connection itself stays single-owned (one `Connection` behind one
+//! `Mutex`), which is what SQLite's serialized threading model wants.
 
 use sqlite::{State, Value};
 use std::collections::HashMap;
@@ -7,6 +24,8 @@ use std::sync::{Arc, Mutex};
 
 /// Re-export player stats from game module
 pub use crate::game::game::PlayerGameStats;
+
+use crate::game::game::Game;
 
 pub struct Storage {
     pub db: Arc<Mutex<sqlite::Connection>>,
@@ -254,6 +273,239 @@ impl Storage {
         }
         Ok(stats)
     }
+
+    /// All game-end rows, newest first (`end_time DESC`) — the sync core
+    /// behind `list_replays` (handlers/replay.rs). Degrades to an empty
+    /// list (with a log) on a poisoned/failed DB, matching the handler's
+    /// pre-refactor behavior.
+    pub fn list_game_metadata(&self) -> Vec<GameMetadataRecord> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!(%e, "Failed to acquire DB lock for game_metadata list");
+                return Vec::new();
+            }
+        };
+        let mut stmt = match db.prepare(
+            "SELECT id, players, winner, start_time, end_time FROM game_metadata ORDER BY end_time DESC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%e, "Failed to prepare game_metadata list query");
+                return Vec::new();
+            }
+        };
+        let mut records = Vec::new();
+        while let Ok(State::Row) = stmt.next() {
+            records.push(GameMetadataRecord {
+                id: stmt.read(0).unwrap_or_default(),
+                players_json: stmt.read(1).unwrap_or_default(),
+                winner: stmt.read(2).unwrap_or_default(),
+                start_time: stmt.read(3).unwrap_or(0),
+                end_time: stmt.read(4).unwrap_or(0),
+            });
+        }
+        records
+    }
+
+    /// Look up the persisted replay path for `game_id` (sync core behind the
+    /// `/ws/replay` resolver). Returns `None` for missing rows, empty paths,
+    /// or a failed DB — the handler maps `None` to "Replay not found".
+    pub fn find_replay_path(&self, game_id: &str) -> Option<String> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!(%e, "Failed to acquire DB lock for replay lookup");
+                return None;
+            }
+        };
+        let mut stmt = match db.prepare("SELECT replay_path FROM game_metadata WHERE id = ?") {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%e, game_id = %game_id, "Failed to prepare replay lookup");
+                return None;
+            }
+        };
+        let params = [Value::String(game_id.to_string())];
+        if stmt.bind(params.as_slice()).is_err() {
+            tracing::error!(game_id = %game_id, "Failed to bind game_id");
+            return None;
+        }
+        if matches!(stmt.next(), Ok(State::Row)) {
+            stmt.read(0).ok().filter(|p: &String| !p.is_empty())
+        } else {
+            None
+        }
+    }
+
+    /// Insert-or-replace player display names (`player_names` table).
+    ///
+    /// Sync core for the start-flow name registration (room/start.rs): the
+    /// initial lock failure is the only fatal one (mirrors the pre-refactor
+    /// early `return` in `start_game`); per-row prepare/bind/execute
+    /// failures are logged and skipped — a bad name row must not abort a
+    /// game start.
+    pub fn upsert_player_names(&self, names: &[(String, String)]) -> Result<(), String> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(e) => return Err(e.to_string()),
+        };
+        for (player_id, name) in names {
+            let name_json = serde_json::to_string(name).unwrap_or(format!("\"{}\"", name));
+            let mut stmt = match db
+                .prepare("INSERT OR REPLACE INTO player_names (player_id, name) VALUES (?, ?)")
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(%e, player_id = %player_id, "Failed to prepare player_names insert");
+                    continue;
+                }
+            };
+            let params: Vec<Value> =
+                vec![Value::String(player_id.clone()), Value::String(name_json)];
+            if let Err(e) = stmt.bind(params.as_slice()) {
+                tracing::error!(%e, player_id = %player_id, "Failed to bind player_names params");
+                continue;
+            }
+            if let Err(e) = stmt.next() {
+                tracing::error!(%e, player_id = %player_id, "Failed to insert player_names");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One `game_metadata` row as the replay list needs it. `players_json` is
+/// the verbatim `players` column (a JSON string array) — the list handler
+/// deserializes it, keeping the JSON shape in one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameMetadataRecord {
+    pub id: String,
+    pub players_json: String,
+    pub winner: String,
+    pub start_time: i64,
+    pub end_time: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Async wrappers (Arch #12): identical blocking work, off the runtime.
+// ---------------------------------------------------------------------------
+
+impl Storage {
+    /// Async entry point for `get_leaderboards` (axum handlers, lobby UI).
+    /// Runs the sync core on the blocking pool so the `std::sync::Mutex`
+    /// around the single connection is never held by an async worker.
+    pub async fn get_leaderboards_async(&self) -> Result<Vec<PlayerStat>, String> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.get_leaderboards())
+            .await
+            .map_err(|e| format!("leaderboards task panicked: {e}"))?
+    }
+
+    /// Async entry point for `record_game_end` (same split as above; the tick
+    /// task keeps calling the sync `record_game_end` via `persist_game_end`
+    /// — it already runs on a worker thread).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_game_end_async(
+        &self,
+        game_id: &str,
+        start_time: u64,
+        end_time: u64,
+        settings_json: &str,
+        winners: &[&str],
+        players: &[&str],
+        player_stats: &HashMap<String, PlayerGameStats>,
+        is_standard_ruleset: bool,
+    ) {
+        let storage = self.clone();
+        let game_id = game_id.to_string();
+        let settings_json = settings_json.to_string();
+        let winners: Vec<String> = winners.iter().map(|s| s.to_string()).collect();
+        let players: Vec<String> = players.iter().map(|s| s.to_string()).collect();
+        let player_stats = player_stats.clone();
+        tokio::task::spawn_blocking(move || {
+            let winners_ref: Vec<&str> = winners.iter().map(|s| s.as_str()).collect();
+            let players_ref: Vec<&str> = players.iter().map(|s| s.as_str()).collect();
+            storage.record_game_end(
+                &game_id,
+                start_time,
+                end_time,
+                &settings_json,
+                &winners_ref,
+                &players_ref,
+                &player_stats,
+                is_standard_ruleset,
+            )
+        })
+        .await
+        .map_err(|e| tracing::error!(%e, "record_game_end blocking task panicked"))
+        .ok();
+    }
+
+    /// Async entry point for `list_game_metadata` (the `/replays` handler).
+    pub async fn list_game_metadata_async(&self) -> Vec<GameMetadataRecord> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.list_game_metadata())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Async entry point for `find_replay_path` (the `/ws/replay` resolver).
+    pub async fn find_replay_path_async(&self, game_id: &str) -> Option<String> {
+        let storage = self.clone();
+        let game_id = game_id.to_string();
+        tokio::task::spawn_blocking(move || storage.find_replay_path(&game_id))
+            .await
+            .ok()?
+    }
+
+    /// Async entry point for `upsert_player_names` (the start flow).
+    pub async fn upsert_player_names_async(
+        &self,
+        names: &[(String, String)],
+    ) -> Result<(), String> {
+        let storage = self.clone();
+        let names = names.to_vec();
+        tokio::task::spawn_blocking(move || storage.upsert_player_names(&names))
+            .await
+            .map_err(|e| format!("player_names task panicked: {e}"))?
+    }
+}
+
+/// Persist the game-end record (wall-clock start/end + the in-play settings
+/// JSON) when a game terminates. All four end paths — draw, last player
+/// standing, abandoned (no humans left), and room empty — share this.
+///
+/// **Moved verbatim from `handlers/http.rs`** (Arch #8): it is a storage
+/// concern, and it is called from the tick task, which runs on a worker
+/// thread — so this stays a SYNC function (no `spawn_blocking` hop on the
+/// end-of-game path; see the module docs for the sync/async split). The
+/// signature is unchanged: `crate::storage::persist_game_end` is the new
+/// canonical path.
+#[allow(clippy::too_many_arguments)]
+pub fn persist_game_end(
+    storage: &Storage,
+    room_id: &str,
+    game_start_time: u64,
+    settings_json: &str,
+    winners: &[&str],
+    player_ids: &[&str],
+    game: &Game,
+) {
+    let end_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    storage.record_game_end(
+        room_id,
+        game_start_time,
+        end_time,
+        settings_json,
+        winners,
+        player_ids,
+        game.player_stats(),
+        game.settings().use_standard_ruleset,
+    );
 }
 
 pub struct PlayerStat {
@@ -267,6 +519,7 @@ pub struct PlayerStat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::game::GameSettings;
 
     fn temp_storage() -> (Storage, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("wod-storage-{}", uuid::Uuid::new_v4()));
@@ -576,6 +829,234 @@ mod tests {
         assert_eq!(p1.games_won, 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Arch #12 regression: the async wrappers must not deadlock under
+    /// concurrency. N concurrent `get_leaderboards_async` calls share the ONE
+    /// connection behind ONE `std::sync::Mutex`; each call runs on the
+    /// blocking pool, so the mutex is only ever contested between blocking
+    /// threads (short critical sections), never held by an async worker that
+    /// could then block the runtime. All tasks must complete and agree.
+    #[tokio::test]
+    async fn concurrent_get_leaderboards_async_does_not_deadlock() {
+        let (storage, dir) = temp_storage();
+        // Seed a couple of standard-ruleset games so the JOIN has rows.
+        let settings_json = r#"{"map":"default","settings":{}}"#;
+        for (i, id) in ["p0", "p1"].iter().enumerate() {
+            let mut stats = HashMap::new();
+            stats.insert(
+                id.to_string(),
+                PlayerGameStats {
+                    units_recruited: 1,
+                    units_lost: i as u32,
+                    cities_captured: 0,
+                    funds_spent: 1,
+                    funds_earned: 1,
+                },
+            );
+            storage.record_game_end(
+                &format!("seed-{id}"),
+                1_700_000_000,
+                1_700_000_300,
+                settings_json,
+                &[id],
+                &[id],
+                &stats,
+                true,
+            );
+        }
+
+        const N: usize = 16;
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let storage = storage.clone();
+            handles.push(tokio::spawn(async move {
+                storage
+                    .get_leaderboards_async()
+                    .await
+                    .expect("leaderboard query must succeed")
+            }));
+        }
+        let mut boards = Vec::new();
+        for h in handles {
+            boards.push(h.await.expect("task must join (no deadlock)"));
+        }
+        // Every concurrent call sees the same two players.
+        for board in &boards {
+            let ids: Vec<&str> = board.iter().map(|b| b.player_id.as_str()).collect();
+            assert!(ids.contains(&"p0"), "missing p0 in {ids:?}");
+            assert!(ids.contains(&"p1"), "missing p1 in {ids:?}");
+            assert_eq!(board.len(), 2, "exactly the seeded players: {ids:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The async wrappers must be behavior-identical to the sync core:
+    /// record via `record_game_end_async`, read back through
+    /// `get_leaderboards_async` / `list_game_metadata_async` /
+    /// `find_replay_path_async` / `upsert_player_names_async`.
+    #[tokio::test]
+    async fn async_wrappers_roundtrip_match_sync_core() {
+        let (storage, dir) = temp_storage();
+        let settings_json = r#"{"map":"default","settings":{}}"#;
+        let mut stats = HashMap::new();
+        stats.insert(
+            "player_0".to_string(),
+            PlayerGameStats {
+                units_recruited: 5,
+                units_lost: 2,
+                cities_captured: 1,
+                funds_spent: 50,
+                funds_earned: 90,
+            },
+        );
+        storage
+            .record_game_end_async(
+                "game-async-1",
+                1_700_000_000,
+                1_700_000_600,
+                settings_json,
+                &["player_0"],
+                &["player_0", "player_1"],
+                &stats,
+                true,
+            )
+            .await;
+
+        // Leaderboard sees the standard-ruleset game.
+        let boards = storage
+            .get_leaderboards_async()
+            .await
+            .expect("async leaderboard query");
+        assert!(
+            boards.iter().any(|b| b.player_id == "player_0"),
+            "async leaderboard must see the recorded player ({} boards)",
+            boards.len()
+        );
+
+        // Replay list sees the row, newest first, with the stored players JSON.
+        let records = storage.list_game_metadata_async().await;
+        assert_eq!(records.len(), 1, "exactly one recorded game: {records:?}");
+        assert_eq!(records[0].id, "game-async-1");
+        assert_eq!(records[0].players_json, r#"["player_0","player_1"]"#);
+        assert_eq!(records[0].winner, r#""player_0""#);
+        assert_eq!(records[0].start_time, 1_700_000_000);
+        assert_eq!(records[0].end_time, 1_700_000_600);
+
+        // The replay resolver finds the persisted path.
+        let path = storage
+            .find_replay_path_async("game-async-1")
+            .await
+            .expect("replay path must resolve");
+        assert!(
+            path.ends_with("game-async-1.jsonl"),
+            "unexpected path: {path}"
+        );
+        assert!(
+            storage
+                .find_replay_path_async("missing-game")
+                .await
+                .is_none(),
+            "unknown game id must resolve to None"
+        );
+
+        // Name upsert lands in player_names (visible through the leaderboard JOIN).
+        storage
+            .upsert_player_names_async(&[("player_0".to_string(), "Alice".to_string())])
+            .await
+            .expect("name upsert must succeed");
+        let boards = storage
+            .get_leaderboards_async()
+            .await
+            .expect("leaderboard query");
+        // The name column is a JSON string (see upsert_player_names_is_idempotent).
+        assert_eq!(
+            boards
+                .iter()
+                .find(|b| b.player_id == "player_0")
+                .unwrap()
+                .name,
+            r#""Alice""#
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `upsert_player_names` is idempotent (INSERT OR REPLACE): re-writing a
+    /// name updates the row, and the sync core reports `Ok`.
+    #[test]
+    fn upsert_player_names_is_idempotent() {
+        let (storage, dir) = temp_storage();
+        storage
+            .upsert_player_names(&[("player_0".to_string(), "Alice".to_string())])
+            .expect("first upsert");
+        storage
+            .upsert_player_names(&[("player_0".to_string(), "Alicia".to_string())])
+            .expect("second upsert");
+
+        let db = storage.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT name FROM player_names WHERE player_id = ?")
+            .unwrap();
+        stmt.bind([Value::String("player_0".to_string())].as_slice())
+            .unwrap();
+        assert!(matches!(stmt.next(), Ok(State::Row)), "row must exist");
+        let name: String = stmt.read(0).unwrap();
+        assert_eq!(name, r#""Alicia""#, "the name column is a JSON string");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `persist_game_end` (moved from handlers/http.rs, Arch #8) must write
+    /// the game-end row exactly as the old HTTP-handler location did: real
+    /// wall-clock `end_time`, verbatim settings JSON, winner + players.
+    #[test]
+    fn persist_game_end_writes_metadata_row() {
+        let (storage, _dir) = temp_storage();
+        let map = crate::map::map_config::load_default_map();
+        let settings = GameSettings {
+            starting_funds: 100,
+            initial_manpower: 1000,
+            funds_per_city: 1.0,
+            recruitment_rate: 1.0,
+            game_speed: 1.0,
+            use_standard_ruleset: true,
+            unit_types: vec![],
+            city_upgrade_settings: crate::config::CityUpgradeSettings::default(),
+            water_speed: 0.5,
+            influence: crate::game::game::InfluenceSettings::default(),
+        };
+        let game = crate::game::game::Game::new(map, settings, 2);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        persist_game_end(
+            &storage,
+            "game-persist-1",
+            1_700_000_000,
+            r#"{"map":"default"}"#,
+            &["player_0"],
+            &["player_0", "player_1"],
+            &game,
+        );
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let records = storage.list_game_metadata();
+        assert_eq!(records.len(), 1, "one game-end row: {records:?}");
+        let rec = &records[0];
+        assert_eq!(rec.id, "game-persist-1");
+        assert_eq!(rec.start_time, 1_700_000_000);
+        assert!(
+            (before as i64..=after as i64).contains(&rec.end_time),
+            "end_time must be the real wall clock ({before}..={after}), got {}",
+            rec.end_time
+        );
+        assert_eq!(rec.winner, r#""player_0""#);
     }
 
     /// Temp storage without opening (for the error-path tests): a unique dir

@@ -1,4 +1,4 @@
-//! Lobby UI — lobby creation, joining, and leaderboard display.
+// Lobby UI — lobby creation, joining, and leaderboard display.
 
 import { Connection } from '../net/connection';
 import { CustomUnitType, LeaderboardEntry, LobbySettings } from '../generated/protocol';

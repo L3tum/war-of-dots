@@ -62,7 +62,7 @@ cells in any order — yields a **bit-identical** `safe` grid, and hence identic
 
 Collect after each step:
 ```
-./run-stresstest.sh 11w2s<N> --bench-detailed encirclement --bench-prev=./reports/stress_11detailed.html
+./run-stresstest.sh 11w2s<N> --bench-detailed encirclement --bench-prev=<prior 11w2s detailed report>
 ```
 
 ### ① Drop per-cell `/` and `%` (cheap, ship with ② or standalone)

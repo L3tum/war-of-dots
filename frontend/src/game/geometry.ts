@@ -1,4 +1,4 @@
-//! Pure geometry helpers shared by the renderer (and its tests).
+// Pure geometry helpers shared by the renderer (and its tests).
 
 import { TERRITORY_NONE } from './territory';
 

@@ -1,4 +1,4 @@
-//! Connection message dispatch tests.
+// Connection message dispatch tests.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { decode, encode } from 'cbor-x';
@@ -8,7 +8,7 @@ import {
   mapSizeFromTerrain,
   stripUndefined,
   unpackUnitPosition,
-} from './connection';
+} from './protocol';
 import { Connection } from './connection';
 import { CELL_SIZE } from '../game/config';
 import { GameState } from '../game/game_state';

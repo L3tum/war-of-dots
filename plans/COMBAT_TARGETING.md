@@ -5,11 +5,11 @@ per-unit target** (`attacking: Option<Entity>`), so combat resolves a concrete
 attacker→target edge, and (optionally) fold the spatial scan into combat to delete
 the `nearby_enemies` system + `NearbyEnemies` component.
 
-Companion to `plans/SIMD_ANAL.md` (cross-linked). This redesign changes what combat
+Companion to `SIMD_ANAL.md` (cross-linked; file removed from the repo in the 2026-09 hygiene sweep). This redesign changes what combat
 iterates over and reshapes the combat distance loop, so any SIMD work on those paths
 (`SIMD_ANAL.md` §1 / §4.4) must be **re-measured after this lands**.
 
-- **Companion plan:** `plans/SIMD_ANAL.md` — **now superseded** by the post-redesign
+- **Companion plan:** `SIMD_ANAL.md` (removed from repo) — **now superseded** by the post-redesign
   re-analysis **`plans/deep-plan-20260821-231145.md`** (the "re-measure after it
   lands" is complete there; it re-anchors the audit to HEAD and re-ranks the
   SIMD recommendations as R1–R7).

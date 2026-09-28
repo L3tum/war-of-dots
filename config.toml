@@ -10,6 +10,9 @@ enabled = true
 starting_funds = 2000
 initial_manpower = 2000
 funds_per_city = 1.0
+# Ticks per second (valid range 0.1-600, enforced at config load — a
+# zero/negative/NaN value would produce a 0 ms tick interval and spin
+# the tick loop at 100% CPU).
 game_speed = 60
 recruitment_rate = 10
 water_speed = 1.2

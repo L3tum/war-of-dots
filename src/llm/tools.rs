@@ -1,7 +1,7 @@
-//! Tool definitions and command conversion for LLM agents
+//! Tool definitions and action conversion for LLM agents
 
+use super::actions::LlmAction;
 use super::agent::{Tool, ToolCall};
-use crate::server::room::Command;
 
 /// Get all available game tools for LLM
 pub fn get_game_tools() -> Vec<Tool> {
@@ -162,23 +162,20 @@ fn parse_move_path(args: &serde_json::Value) -> anyhow::Result<Vec<(f32, f32)>> 
     Ok(path)
 }
 
-/// Convert a ToolCall into a Command, extracting the reason string.
-/// Returns (Command, reason). `player_id` is used for actions that need the owner.
+/// Convert a ToolCall into an LlmAction, extracting the reason string.
+/// Returns (LlmAction, reason). The action carries no player id — the
+/// server attaches ownership when it maps actions into room commands.
 ///
 /// All LLM-supplied fields are validated: a missing or mistyped field yields an
 /// `Err` (the caller logs and skips the action) instead of panicking.
-pub fn tool_call_to_command(tc: &ToolCall, player_id: &str) -> anyhow::Result<(Command, String)> {
+pub fn tool_call_to_action(tc: &ToolCall) -> anyhow::Result<(LlmAction, String)> {
     let args = &tc.arguments;
     match tc.name.as_str() {
         "move_troop" => {
             let unit_id = required_str(args, tc.name.as_str(), "troop_id")?;
             let path = parse_move_path(args)?;
             Ok((
-                Command::MoveTroop {
-                    unit_id,
-                    owner_id: player_id.to_string(),
-                    path,
-                },
+                LlmAction::MoveTroop { unit_id, path },
                 optional_reason(args),
             ))
         }
@@ -186,7 +183,7 @@ pub fn tool_call_to_command(tc: &ToolCall, player_id: &str) -> anyhow::Result<(C
             let city_id = required_str(args, tc.name.as_str(), "city_id")?;
             let unit_type = required_str(args, tc.name.as_str(), "unit_type")?;
             Ok((
-                Command::RecruitUnit(city_id, unit_type, player_id.to_string()),
+                LlmAction::RecruitUnit { city_id, unit_type },
                 optional_reason(args),
             ))
         }
@@ -194,11 +191,7 @@ pub fn tool_call_to_command(tc: &ToolCall, player_id: &str) -> anyhow::Result<(C
             let unit_id = required_str(args, tc.name.as_str(), "unit_id")?;
             let enabled = required_bool(args, tc.name.as_str(), "enabled")?;
             Ok((
-                Command::ToggleHealing {
-                    unit_id,
-                    owner_id: player_id.to_string(),
-                    enabled,
-                },
+                LlmAction::ToggleHealing { unit_id, enabled },
                 optional_reason(args),
             ))
         }
@@ -206,20 +199,13 @@ pub fn tool_call_to_command(tc: &ToolCall, player_id: &str) -> anyhow::Result<(C
             let unit_id = required_str(args, tc.name.as_str(), "unit_id")?;
             let enabled = required_bool(args, tc.name.as_str(), "enabled")?;
             Ok((
-                Command::ToggleResupply {
-                    unit_id,
-                    owner_id: player_id.to_string(),
-                    enabled,
-                },
+                LlmAction::ToggleResupply { unit_id, enabled },
                 optional_reason(args),
             ))
         }
         "upgrade_city" => {
             let city_id = required_str(args, tc.name.as_str(), "city_id")?;
-            Ok((
-                Command::UpgradeCity(city_id, player_id.to_string()),
-                optional_reason(args),
-            ))
+            Ok((LlmAction::UpgradeCity { city_id }, optional_reason(args)))
         }
         _ => anyhow::bail!("Unknown tool: {}", tc.name),
     }
@@ -246,15 +232,10 @@ mod tests {
             "move_troop",
             serde_json::json!({"troop_id": "t1", "path": [[0, 1], [2, 3]], "reason": "push"}),
         );
-        let (cmd, reason) = tool_call_to_command(&c, "p1").expect("valid move_troop");
-        match cmd {
-            Command::MoveTroop {
-                unit_id,
-                owner_id,
-                path,
-            } => {
+        let (action, reason) = tool_call_to_action(&c).expect("valid move_troop");
+        match action {
+            LlmAction::MoveTroop { unit_id, path } => {
                 assert_eq!(unit_id, "t1");
-                assert_eq!(owner_id, "p1");
                 assert_eq!(path, vec![(0.0, 1.0), (2.0, 3.0)]);
             }
             other => panic!("expected MoveTroop, got {other:?}"),
@@ -265,7 +246,7 @@ mod tests {
     #[test]
     fn move_troop_missing_field_errs() {
         let c = tc("move_troop", serde_json::json!({"path": [[0, 1]]}));
-        let err = tool_call_to_command(&c, "p1").expect_err("missing troop_id must err");
+        let err = tool_call_to_action(&c).expect_err("missing troop_id must err");
         assert!(err.to_string().contains("troop_id"), "got: {err}");
     }
 
@@ -275,14 +256,14 @@ mod tests {
             "move_troop",
             serde_json::json!({"troop_id": 42, "path": "not-an-array"}),
         );
-        let err = tool_call_to_command(&c, "p1").expect_err("mistyped fields must err");
+        let err = tool_call_to_action(&c).expect_err("mistyped fields must err");
         assert!(err.to_string().contains("troop_id"), "got: {err}");
 
         let c2 = tc(
             "move_troop",
             serde_json::json!({"troop_id": "t1", "path": "nope"}),
         );
-        let err2 = tool_call_to_command(&c2, "p1").expect_err("non-array path must err");
+        let err2 = tool_call_to_action(&c2).expect_err("non-array path must err");
         assert!(err2.to_string().contains("path"), "got: {err2}");
 
         // coordinate pair with a non-number
@@ -290,7 +271,7 @@ mod tests {
             "move_troop",
             serde_json::json!({"troop_id": "t1", "path": [[0, "x"]]}),
         );
-        let err3 = tool_call_to_command(&c3, "p1").expect_err("non-number coord must err");
+        let err3 = tool_call_to_action(&c3).expect_err("non-number coord must err");
         assert!(err3.to_string().contains("path[0][1]"), "got: {err3}");
     }
 
@@ -302,12 +283,11 @@ mod tests {
             "recruit_unit",
             serde_json::json!({"city_id": "c9", "unit_type": "infantry", "reason": "replace"}),
         );
-        let (cmd, reason) = tool_call_to_command(&c, "p1").expect("valid recruit_unit");
-        match cmd {
-            Command::RecruitUnit(city, unit_type, owner) => {
-                assert_eq!(city, "c9");
+        let (action, reason) = tool_call_to_action(&c).expect("valid recruit_unit");
+        match action {
+            LlmAction::RecruitUnit { city_id, unit_type } => {
+                assert_eq!(city_id, "c9");
                 assert_eq!(unit_type, "infantry");
-                assert_eq!(owner, "p1");
             }
             other => panic!("expected RecruitUnit, got {other:?}"),
         }
@@ -317,11 +297,11 @@ mod tests {
     #[test]
     fn recruit_unit_missing_field_errs() {
         let c = tc("recruit_unit", serde_json::json!({"unit_type": "infantry"}));
-        let err = tool_call_to_command(&c, "p1").expect_err("missing city_id must err");
+        let err = tool_call_to_action(&c).expect_err("missing city_id must err");
         assert!(err.to_string().contains("city_id"), "got: {err}");
 
         let c2 = tc("recruit_unit", serde_json::json!({"city_id": "c9"}));
-        let err2 = tool_call_to_command(&c2, "p1").expect_err("missing unit_type must err");
+        let err2 = tool_call_to_action(&c2).expect_err("missing unit_type must err");
         assert!(err2.to_string().contains("unit_type"), "got: {err2}");
     }
 
@@ -331,7 +311,7 @@ mod tests {
             "recruit_unit",
             serde_json::json!({"city_id": 7, "unit_type": ["infantry"]}),
         );
-        let err = tool_call_to_command(&c, "p1").expect_err("mistyped fields must err");
+        let err = tool_call_to_action(&c).expect_err("mistyped fields must err");
         assert!(err.to_string().contains("city_id"), "got: {err}");
     }
 
@@ -343,15 +323,10 @@ mod tests {
             "toggle_healing",
             serde_json::json!({"unit_id": "u2", "enabled": true, "reason": "rest"}),
         );
-        let (cmd, reason) = tool_call_to_command(&c, "p1").expect("valid toggle_healing");
-        match cmd {
-            Command::ToggleHealing {
-                unit_id,
-                owner_id,
-                enabled,
-            } => {
+        let (action, reason) = tool_call_to_action(&c).expect("valid toggle_healing");
+        match action {
+            LlmAction::ToggleHealing { unit_id, enabled } => {
                 assert_eq!(unit_id, "u2");
-                assert_eq!(owner_id, "p1");
                 assert!(enabled);
             }
             other => panic!("expected ToggleHealing, got {other:?}"),
@@ -362,11 +337,11 @@ mod tests {
     #[test]
     fn toggle_healing_missing_field_errs() {
         let c = tc("toggle_healing", serde_json::json!({"enabled": true}));
-        let err = tool_call_to_command(&c, "p1").expect_err("missing unit_id must err");
+        let err = tool_call_to_action(&c).expect_err("missing unit_id must err");
         assert!(err.to_string().contains("unit_id"), "got: {err}");
 
         let c2 = tc("toggle_healing", serde_json::json!({"unit_id": "u2"}));
-        let err2 = tool_call_to_command(&c2, "p1").expect_err("missing enabled must err");
+        let err2 = tool_call_to_action(&c2).expect_err("missing enabled must err");
         assert!(err2.to_string().contains("enabled"), "got: {err2}");
     }
 
@@ -376,7 +351,7 @@ mod tests {
             "toggle_healing",
             serde_json::json!({"unit_id": 5, "enabled": "yes"}),
         );
-        let err = tool_call_to_command(&c, "p1").expect_err("mistyped fields must err");
+        let err = tool_call_to_action(&c).expect_err("mistyped fields must err");
         assert!(err.to_string().contains("unit_id"), "got: {err}");
     }
 
@@ -388,15 +363,10 @@ mod tests {
             "toggle_resupply",
             serde_json::json!({"unit_id": "u3", "enabled": false}),
         );
-        let (cmd, reason) = tool_call_to_command(&c, "p1").expect("valid toggle_resupply");
-        match cmd {
-            Command::ToggleResupply {
-                unit_id,
-                owner_id,
-                enabled,
-            } => {
+        let (action, reason) = tool_call_to_action(&c).expect("valid toggle_resupply");
+        match action {
+            LlmAction::ToggleResupply { unit_id, enabled } => {
                 assert_eq!(unit_id, "u3");
-                assert_eq!(owner_id, "p1");
                 assert!(!enabled);
             }
             other => panic!("expected ToggleResupply, got {other:?}"),
@@ -407,11 +377,11 @@ mod tests {
     #[test]
     fn toggle_resupply_missing_field_errs() {
         let c = tc("toggle_resupply", serde_json::json!({"enabled": false}));
-        let err = tool_call_to_command(&c, "p1").expect_err("missing unit_id must err");
+        let err = tool_call_to_action(&c).expect_err("missing unit_id must err");
         assert!(err.to_string().contains("unit_id"), "got: {err}");
 
         let c2 = tc("toggle_resupply", serde_json::json!({"unit_id": "u3"}));
-        let err2 = tool_call_to_command(&c2, "p1").expect_err("missing enabled must err");
+        let err2 = tool_call_to_action(&c2).expect_err("missing enabled must err");
         assert!(err2.to_string().contains("enabled"), "got: {err2}");
     }
 
@@ -421,7 +391,7 @@ mod tests {
             "toggle_resupply",
             serde_json::json!({"unit_id": null, "enabled": 1}),
         );
-        let err = tool_call_to_command(&c, "p1").expect_err("mistyped fields must err");
+        let err = tool_call_to_action(&c).expect_err("mistyped fields must err");
         assert!(err.to_string().contains("unit_id"), "got: {err}");
     }
 
@@ -433,11 +403,10 @@ mod tests {
             "upgrade_city",
             serde_json::json!({"city_id": "c4", "reason": "income"}),
         );
-        let (cmd, reason) = tool_call_to_command(&c, "p1").expect("valid upgrade_city");
-        match cmd {
-            Command::UpgradeCity(city, owner) => {
-                assert_eq!(city, "c4");
-                assert_eq!(owner, "p1");
+        let (action, reason) = tool_call_to_action(&c).expect("valid upgrade_city");
+        match action {
+            LlmAction::UpgradeCity { city_id } => {
+                assert_eq!(city_id, "c4");
             }
             other => panic!("expected UpgradeCity, got {other:?}"),
         }
@@ -447,14 +416,14 @@ mod tests {
     #[test]
     fn upgrade_city_missing_field_errs() {
         let c = tc("upgrade_city", serde_json::json!({}));
-        let err = tool_call_to_command(&c, "p1").expect_err("missing city_id must err");
+        let err = tool_call_to_action(&c).expect_err("missing city_id must err");
         assert!(err.to_string().contains("city_id"), "got: {err}");
     }
 
     #[test]
     fn upgrade_city_mistyped_field_errs() {
         let c = tc("upgrade_city", serde_json::json!({"city_id": ["c4"]}));
-        let err = tool_call_to_command(&c, "p1").expect_err("mistyped city_id must err");
+        let err = tool_call_to_action(&c).expect_err("mistyped city_id must err");
         assert!(err.to_string().contains("city_id"), "got: {err}");
     }
 
@@ -463,7 +432,7 @@ mod tests {
     #[test]
     fn unknown_tool_errs() {
         let c = tc("teleport", serde_json::json!({}));
-        let err = tool_call_to_command(&c, "p1").expect_err("unknown tool must err");
+        let err = tool_call_to_action(&c).expect_err("unknown tool must err");
         assert!(err.to_string().contains("Unknown tool"), "got: {err}");
     }
 }

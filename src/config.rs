@@ -243,11 +243,44 @@ fn default_funds_per_city() -> f32 {
 fn default_game_speed() -> f32 {
     60.0
 }
+
+/// Bug #4: valid range for `standard_ruleset.game_speed` (ticks/second),
+/// validated at config load. Mirrors the semantics of the client-facing
+/// validation in `server::room::settings::validate_custom_settings` (a
+/// floor, a ceiling, and NaN handled explicitly — NaN fails both range
+/// comparisons). A non-finite, zero, or negative tick rate turns the
+/// room's tick interval — `(1000.0 / game_speed).ceil() as u64` in
+/// `room::setup` — into 0 ms: a tick loop that spins at 100% CPU. The
+/// ceiling keeps the interval from going sub-millisecond (600 t/s =
+/// 1.67 ms/tick is already beyond any LAN RTS need; the default is 60).
+pub const GAME_SPEED_MIN: f32 = 0.1;
+pub const GAME_SPEED_MAX: f32 = 600.0;
 fn default_recruitment_rate() -> f32 {
     10.0
 }
 fn default_water_speed() -> f32 {
     1.2
+}
+
+impl StandardRuleset {
+    /// Bug #4: load-time validation of `game_speed`. Returns a clear error
+    /// message naming the offending value when the tick rate would produce
+    /// a non-positive or sub-millisecond tick interval (0 ms → a 100% CPU
+    /// spin in the room tick loop). See `GAME_SPEED_MIN`/`GAME_SPEED_MAX`.
+    pub fn validate_game_speed(&self) -> Option<String> {
+        let speed = self.game_speed;
+        if !speed.is_finite() {
+            return Some(format!(
+                "standard_ruleset.game_speed = {speed} must be a finite number of ticks/second"
+            ));
+        }
+        if !(GAME_SPEED_MIN..=GAME_SPEED_MAX).contains(&speed) {
+            return Some(format!(
+                "standard_ruleset.game_speed = {speed} is out of range (must be {GAME_SPEED_MIN}..={GAME_SPEED_MAX} ticks/second)"
+            ));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -391,6 +424,18 @@ pub fn load(path: &str) -> Result<Config, crate::errors::ConfigError> {
         toml::from_str(&content).map_err(|source| crate::errors::ConfigError::Parse {
             source: Box::new(source),
         })?;
+    // Bug #4: reject a game_speed that would produce a 0 ms tick interval
+    // before the server can start (see validate_game_speed). Reuses
+    // ConfigError::Parse — the failure IS a config-file problem, and the
+    // message names the offending value.
+    if let Some(detail) = config.standard_ruleset.validate_game_speed() {
+        return Err(crate::errors::ConfigError::Parse {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                detail,
+            )),
+        });
+    }
     Ok(config.resolve())
 }
 
@@ -782,5 +827,113 @@ mod tests {
         assert!(
             influence_radius_warnings(&crate::game::game::InfluenceSettings::default()).is_empty()
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Bug #4: game_speed validation (0 / negative / NaN / inf → 0 ms tick spin)
+    // ---------------------------------------------------------------------------
+
+    fn toml_with_game_speed(speed: &str) -> String {
+        format!(
+            r#"
+[llm]
+
+[standard_ruleset]
+enabled = true
+unit_types = []
+game_speed = {speed}
+
+[storage]
+database_path = ":memory:"
+replay_path = "replays"
+"#,
+        )
+    }
+
+    fn validate_speed(speed: &str) -> Option<String> {
+        let cfg: Config = toml::from_str(&toml_with_game_speed(speed)).expect("parse");
+        cfg.standard_ruleset.validate_game_speed()
+    }
+
+    /// game_speed = 0 must be rejected with a message naming the value —
+    /// 0 ticks/s yields interval (1000/0).ceil() = inf → `as u64` = 0 ms,
+    /// a 100% CPU tick spin.
+    #[test]
+    fn game_speed_zero_rejected() {
+        let err = validate_speed("0").expect("0 must be rejected");
+        assert!(err.contains("game_speed"), "{err}");
+        assert!(err.contains("0"), "the bad value must be named: {err}");
+    }
+
+    #[test]
+    fn game_speed_negative_rejected() {
+        let err = validate_speed("-1").expect("negative must be rejected");
+        assert!(err.contains("game_speed"), "{err}");
+        assert!(err.contains("-1"), "the bad value must be named: {err}");
+    }
+
+    #[test]
+    fn game_speed_inf_rejected() {
+        let err = validate_speed("inf").expect("inf must be rejected");
+        assert!(err.contains("game_speed"), "{err}");
+        assert!(
+            err.contains("finite"),
+            "the non-finiteness must be named: {err}"
+        );
+    }
+
+    /// NaN is set structurally (independent of TOML's nan literal support):
+    /// it fails both range comparisons, so finiteness is checked explicitly.
+    #[test]
+    fn game_speed_nan_rejected() {
+        let mut cfg: Config = toml::from_str(&toml_with_game_speed("60")).unwrap();
+        cfg.standard_ruleset.game_speed = f32::NAN;
+        let err = cfg
+            .standard_ruleset
+            .validate_game_speed()
+            .expect("NaN must be rejected");
+        assert!(err.contains("finite"), "{err}");
+    }
+
+    /// The ceiling mirrors the client-range semantics: beyond it the tick
+    /// interval goes sub-millisecond.
+    #[test]
+    fn game_speed_above_ceiling_rejected() {
+        let err = validate_speed("1000").expect("1000 t/s must be rejected");
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn game_speed_60_accepted() {
+        assert!(validate_speed("60").is_none(), "the default must be valid");
+    }
+
+    #[test]
+    fn game_speed_boundaries_accepted() {
+        assert!(validate_speed("0.1").is_none(), "floor is inclusive");
+        assert!(validate_speed("600").is_none(), "ceiling is inclusive");
+    }
+
+    /// The full `load()` path (file on disk) must reject a bad value with
+    /// an error that names the setting and the value.
+    #[test]
+    fn load_rejects_zero_game_speed_with_named_error() {
+        let path = std::env::temp_dir().join(format!("wod-cfg-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, toml_with_game_speed("0")).unwrap();
+        let err = load(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("game_speed"),
+            "the setting must be named: {msg}"
+        );
+        assert!(msg.contains("0"), "the bad value must be named: {msg}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_shipped_config_toml() {
+        // The shipped config.toml (game_speed = 60) must still load.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml");
+        assert!(load(path).is_ok(), "shipped config.toml must load");
     }
 }

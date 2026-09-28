@@ -1,4 +1,4 @@
-//! Shared configuration constants for the game frontend
+// Shared configuration constants for the game frontend
 
 /** Size of each terrain cell in world units */
 export const CELL_SIZE = 32;

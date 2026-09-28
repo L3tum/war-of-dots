@@ -1,5 +1,5 @@
-//! UnitInfoUI tests — unit/city info panels, action buttons and their wire
-//! messages, upgrade gating (level/funds), and per-frame refresh sync.
+// UnitInfoUI tests — unit/city info panels, action buttons and their wire
+// messages, upgrade gating (level/funds), and per-frame refresh sync.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { GameState } from '../game/game_state';

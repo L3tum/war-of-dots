@@ -1,7 +1,6 @@
 //! Protocol extensions on the engine `Game`: full-state builders
-//! (`full_state`, `full_state_for`, `full_state_with_player_id`,
-//! `full_state_with_vision`, `build_full_state`) and the `City` ->
-//! `CityState` conversion.
+//! (`full_state_with_player_id`, `full_state_with_vision`, `build_full_state`)
+//! and the `City` -> `CityState` conversion.
 
 use crate::game::game::Game;
 use crate::server::delta::wire_unit_states;
@@ -20,20 +19,7 @@ impl From<&crate::game::economy::City> for CityState {
 }
 
 /// Determine the winner of the game — the last player with units/cities
-#[allow(dead_code)]
 impl Game {
-    fn full_state(&self) -> GameStateMessage {
-        // Use the first player's vision/border for now (backward compatibility)
-        self.full_state_for(self.players().keys().next().map(|s| s.as_str()))
-    }
-
-    fn full_state_for(&self, player_id: Option<&str>) -> GameStateMessage {
-        let (vision_grid, border_grid) = player_id
-            .map(|pid| (self.vision_grid_2d(pid), self.border_grid_2d(pid)))
-            .unwrap_or((None, None));
-        self.build_full_state(vision_grid, border_grid, player_id)
-    }
-
     pub(crate) fn full_state_with_player_id(&self, player_id: &str) -> GameStateMessage {
         let (vision_grid, border_grid) = (
             self.vision_grid_2d(player_id),

@@ -1,4 +1,4 @@
-//! Camera controls, unit selection, and path drawing UI
+// Camera controls, unit selection, and path drawing UI
 
 import { Renderer } from '../game/renderer';
 import { Connection } from '../net/connection';

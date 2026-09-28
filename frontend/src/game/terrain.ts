@@ -1,5 +1,5 @@
-//! Terrain rendering — per-cell flat-standing terrain with deterministic color
-//! variation, water coastlines, and mountain shading for a richer map.
+// Terrain rendering — per-cell flat-standing terrain with deterministic color
+// variation, water coastlines, and mountain shading for a richer map.
 
 export type TerrainType = 'Plains' | 'Hills' | 'Forest' | 'Water' | 'Mountain';
 

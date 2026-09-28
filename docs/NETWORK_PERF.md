@@ -1,6 +1,6 @@
 # Network Perf — Deferred Items
 
-From `plans/deep-plan-1788916975781-789f68.md` (network-layer performance round). These items were deferred with explicit re-entry triggers — revisit only when the trigger fires.
+From the network-layer performance deep-plan round. These items were deferred with explicit re-entry triggers — revisit only when the trigger fires.
 
 ## Deferral triggers
 

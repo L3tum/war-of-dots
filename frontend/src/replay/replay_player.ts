@@ -1,4 +1,4 @@
-//! Replay playback on client — loads JSONL replay files and renders frame-by-frame
+// Replay playback on client — loads JSONL replay files and renders frame-by-frame
 
 import { GameState } from '../game/game_state';
 import { Renderer } from '../game/renderer';
@@ -11,7 +11,7 @@ import {
   flatTo2DBools,
   mapSizeFromTerrain,
   unpackUnitPosition,
-} from '../net/connection';
+} from '../net/protocol';
 
 export class ReplayPlayer {
   private canvas: HTMLCanvasElement;

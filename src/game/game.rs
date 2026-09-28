@@ -1,6 +1,7 @@
 //! Game facade — holds the ECS world, settings, and dispatches systems.
 
-use super::spatial;
+use super::entities::EntityRegistry;
+use super::work_state::TickWorkState;
 use crate::config::CityUpgradeSettings;
 use crate::game::components::*;
 use crate::game::economy::{City, UnitType};
@@ -159,70 +160,23 @@ pub struct Game {
     player_stats: HashMap<String, PlayerGameStats>,
     prev_unit_counts: HashMap<String, usize>,
     last_surrender_check_tick: u64,
-    /// Maps string unit IDs ("unit_123") -> hecs::Entity
-    entity_registry: HashMap<String, hecs::Entity>,
-    /// Reverse lookup: hecs::Entity -> string unit ID — O(1) dead entity cleanup
-    entity_reverse: HashMap<hecs::Entity, String>,
-    /// Pre-allocated combat scratch, cleared and reused each tick.
-    combat_scratch: systems::combat::CombatScratch,
-    /// Pre-allocated supply/attrition scratch, cleared and reused each tick.
-    supply_scratch: systems::supply::SupplyScratch,
-    /// Spatial grid buffers for the combat mover-scan (target acquisition),
-    /// resized on growth and reused each tick (no per-tick heap allocation at
-    /// steady state). Built/updated by movement, consumed by combat.
-    grid_index_scratch: spatial::GridIndexScratch,
-    /// Reused scratch buffers for the encirclement flood-fill.
-    encirclement_scratch: systems::encirclement::EncirclementScratch,
-    /// Economy scratch: (player_id, funds_earned) per player, cleared and reused
-    /// each economy tick instead of building a fresh HashMap.
-    economy_earned: Vec<(String, u32)>,
-    /// Unit-type name -> index into `settings.unit_types`, built once at
-    /// `Game::new` so the supply system does not rebuild the map every tick.
-    unit_types_index: HashMap<String, usize>,
-    /// Sum of `max_count` across each unit type's equipment template — one
-    /// entry per index into `settings.unit_types`. The per-unit equipment
-    /// `needed` denominator is invariant (built from this template at spawn,
-    /// never mutated), so supply reads this instead of re-summing per unit per
-    /// tick (S-1). Same order as `settings.unit_types`.
-    unit_type_total_max_equipment: Vec<f32>,
-    /// Pre-allocated movement scratch, cleared and reused each tick. Holds the
-    /// mover records that movement system uses.
-    movement_scratch: systems::movement::MovementScratch,
-    /// Pre-allocated water scratch, cleared and reused each tick.
-    water_scratch: systems::water::WaterScratch,
-    /// Number of units that moved in the most recent tick (from movement.rs).
-    /// Used by benchmark/status reporting to gauge spatialty work.
-    last_mover_count: usize,
-    /// Number of engaged pairs in the most recent tick (from combat.rs).
-    /// Used by benchmark/status reporting to gauge combat activity.
-    last_engaged_pairs: usize,
-    /// Persistent "units_by_player no longer matches the ECS" flag — set by
-    /// movement, unit death, and recruitment; cleared only when a rebuild
-    /// actually runs. (Not part of the per-tick ctx_dirty, which is reset at
-    /// the top of every tick and would lose sets made between ticks or after
-    /// the rebuild point.)
-    units_by_player_stale: bool,
-    /// Persisted TickContext, built once and updated incrementally.
-    ctx: TickContext,
-    /// Tracks which TickContext fields need updating this tick.
-    ctx_dirty: TickContextDirty,
-    /// Persistent "game state changed since last influence run" flag. Set by
-    /// movement, city capture, unit death, successful recruitment, and
-    /// assign_city_owner. Cleared only when influence actually runs. NOT part
-    /// of the per-tick ctx_dirty (which is reset at the top of every tick).
-    influence_dirty: bool,
-    /// Set when influence runs, cleared when encirclement runs. Encirclement's
-    /// inputs (borders grids, cities, units_by_player) only change via an
-    /// influence run, so this is a faithful "encirclement inputs changed since
-    /// last run" signal. Invariants: (i) every cities_changed source also sets
-    /// influence_dirty; (ii) CITY_CAPTURE_TICK_INTERVAL % INFLUENCE_TICK_INTERVAL
-    /// == 0, so the influence block always services a change before the
-    /// encirclement block in the same tick.
-    encirclement_dirty: bool,
-    /// Pre-allocated influence scratch, cleared and reused each influence run.
-    influence_scratch: systems::influence::InfluenceScratch,
-    /// Pre-allocated death-cleanup scratch, cleared and reused each run.
-    death_cleanup_scratch: systems::death_cleanup::DeathCleanupScratch,
+    /// Perf #2: monotonic city-generation counter. Bumped by EVERY city
+    /// mutation site (`assign_city_owner`, `upgrade_city`, and the
+    /// `city_capture` result in `tick_game`) so the server's tick loop can
+    /// tell "cities unchanged this tick" (O(1) u64 compare) without cloning
+    /// the full `Vec<City>` snapshot (`query_cities` — C city String
+    /// allocations per tick, idle or not). Initial assignment at game start
+    /// also flows through `assign_city_owner` (room setup), so every
+    /// post-construction write bumps this. Wrapping is safe: the server
+    /// compares against the generation its cache was built at, and 2^64
+    /// mutations is beyond any game's lifetime.
+    city_generation: u64,
+    /// String unit ID <-> hecs::Entity bidirectional registry
+    /// (see [`crate::game::entities::EntityRegistry`]).
+    registry: EntityRegistry,
+    /// Tick-loop work state: pre-allocated scratch, dirtiness flags, and the
+    /// persistent TickContext (see [`crate::game::work_state::TickWorkState`]).
+    work: TickWorkState,
 }
 
 /// Combat-targeting snapshot: how many units are holding an explicit combat
@@ -528,15 +482,7 @@ impl Game {
 
         for i in 0..num_players {
             let player_id = format!("player_{i}");
-            players.insert(
-                player_id.clone(),
-                Player::new(
-                    player_id.clone(),
-                    format!("Player {}", i + 1),
-                    true,
-                    settings.starting_funds,
-                ),
-            );
+            players.insert(player_id.clone(), Player::new(format!("Player {}", i + 1)));
             player_stats.insert(player_id.clone(), PlayerGameStats::default());
             funds.insert(player_id, settings.starting_funds);
         }
@@ -580,55 +526,28 @@ impl Game {
             }
         }
 
-        // Build initial TickContext before world is moved into Self
-        let ctx = TickContext::build_initial(&world, world_entity);
-        // Cache unit-type name -> index once (settings is moved into Self below,
-        // so build the map first). Supply indexes straight into settings.unit_types.
-        let unit_types_index: HashMap<String, usize> = settings
-            .unit_types
-            .iter()
-            .enumerate()
-            .map(|(i, ut)| (ut.name.clone(), i))
-            .collect();
-        // S-1: precompute the invariant equipment `needed` denominator per unit
-        // type (sum of the template's max_count). Supply reads this instead of
-        // re-summing max_equipment for every unit every tick.
-        let unit_type_total_max_equipment: Vec<f32> = settings
-            .unit_types
-            .iter()
-            .map(|ut| ut.equipment.iter().map(|e| e.max_count as f32).sum())
-            .collect();
+        // Build the tick work state (persistent scratch, dirtiness flags,
+        // initial TickContext, settings-derived unit-type indexes) before
+        // world/settings are moved into Self.
+        let work = TickWorkState::new(&world, world_entity, &settings);
 
         Self {
             world,
             world_entity,
             settings,
-            unit_types_index,
-            unit_type_total_max_equipment,
             players,
             tick: 0,
             running: false,
             player_stats,
             prev_unit_counts: HashMap::new(),
             last_surrender_check_tick: 0,
-            entity_registry: HashMap::new(),
-            entity_reverse: HashMap::new(),
-            combat_scratch: systems::combat::CombatScratch::new(),
-            supply_scratch: systems::supply::SupplyScratch::new(),
-            grid_index_scratch: spatial::GridIndexScratch::default(),
-            encirclement_scratch: systems::encirclement::EncirclementScratch::new(),
-            economy_earned: Vec::new(),
-            movement_scratch: systems::movement::MovementScratch::default(),
-            water_scratch: systems::water::WaterScratch::default(),
-            last_mover_count: 0,
-            last_engaged_pairs: 0,
-            ctx,
-            ctx_dirty: TickContextDirty::default(),
-            units_by_player_stale: false,
-            influence_dirty: true,
-            encirclement_dirty: true,
-            influence_scratch: systems::influence::InfluenceScratch::new(),
-            death_cleanup_scratch: systems::death_cleanup::DeathCleanupScratch::default(),
+            registry: EntityRegistry::default(),
+            work,
+            // Perf #2: cities created here are `owner: None, level: 1`;
+            // the first mutation (setup's assign_city_owner round-robin) is
+            // what bumps the counter, and the server's snapshot cache is
+            // built AFTER that, so no bump is needed at construction.
+            city_generation: 0,
         }
     }
 
@@ -640,14 +559,14 @@ impl Game {
     #[cfg(feature = "microbenchmarks")]
     #[allow(dead_code)]
     pub fn last_mover_count(&self) -> usize {
-        self.last_mover_count
+        self.work.last_mover_count
     }
 
     /// Number of engaged combat pairs in the most recent tick (combat.rs).
     #[cfg(feature = "microbenchmarks")]
     #[allow(dead_code)]
     pub fn last_engaged_pairs(&self) -> usize {
-        self.last_engaged_pairs
+        self.work.last_engaged_pairs
     }
 
     /// Allocation-free count of units (same entity set as `query_all_units`),
@@ -720,13 +639,18 @@ impl Game {
     /// Test-only: expose the persistent influence dirty flag.
     #[cfg(test)]
     pub fn influence_dirty_for_test(&self) -> bool {
-        self.influence_dirty
+        self.work.influence_dirty
     }
 
     /// Test-only: total number of units grouped in ctx.units_by_player.
     #[cfg(test)]
     pub fn ctx_unit_count_for_test(&self) -> usize {
-        self.ctx.units_by_player.values().map(|v| v.len()).sum()
+        self.work
+            .ctx
+            .units_by_player
+            .values()
+            .map(|v| v.len())
+            .sum()
     }
 
     /// Snapshot of combat targeting: how many units hold an explicit combat
@@ -753,14 +677,14 @@ impl Game {
     #[allow(dead_code)]
     pub fn combat_diag(&self) -> CombatDiag {
         CombatDiag {
-            candidates: self.combat_scratch.candidates,
-            attackers: self.combat_scratch.attackers,
-            targets_dead: self.combat_scratch.targets_dead,
-            targets_gone: self.combat_scratch.targets_gone,
-            targets_same_owner: self.combat_scratch.targets_same_owner,
-            targets_out_of_range: self.combat_scratch.targets_out_of_range,
-            targets_skipped_mutual: self.combat_scratch.targets_skipped_mutual,
-            engagements: self.combat_scratch.engagements,
+            candidates: self.work.combat_scratch.candidates,
+            attackers: self.work.combat_scratch.attackers,
+            targets_dead: self.work.combat_scratch.targets_dead,
+            targets_gone: self.work.combat_scratch.targets_gone,
+            targets_same_owner: self.work.combat_scratch.targets_same_owner,
+            targets_out_of_range: self.work.combat_scratch.targets_out_of_range,
+            targets_skipped_mutual: self.work.combat_scratch.targets_skipped_mutual,
+            engagements: self.work.combat_scratch.engagements,
         }
     }
 
@@ -769,12 +693,12 @@ impl Game {
     #[allow(dead_code)]
     pub fn movement_diag(&self) -> MovementDiag {
         MovementDiag {
-            changes: self.movement_scratch.changes_len(),
-            scans: self.movement_scratch.diag_scans,
-            blocked: self.movement_scratch.diag_blocked,
-            noop_skipped: self.movement_scratch.diag_noop_skipped,
-            cooldown_skipped: self.movement_scratch.diag_cooldown,
-            movers: self.last_mover_count,
+            changes: self.work.movement_scratch.changes_len(),
+            scans: self.work.movement_scratch.diag_scans,
+            blocked: self.work.movement_scratch.diag_blocked,
+            noop_skipped: self.work.movement_scratch.diag_noop_skipped,
+            cooldown_skipped: self.work.movement_scratch.diag_cooldown,
+            movers: self.work.last_mover_count,
         }
     }
 
@@ -783,8 +707,8 @@ impl Game {
     #[allow(dead_code)]
     pub fn supply_diag(&self) -> SupplyDiag {
         SupplyDiag {
-            blocked_funds: self.supply_scratch.diag_blocked_funds,
-            blocked_mp: self.supply_scratch.diag_blocked_mp,
+            blocked_funds: self.work.supply_scratch.diag_blocked_funds,
+            blocked_mp: self.work.supply_scratch.diag_blocked_mp,
         }
     }
 
@@ -798,7 +722,7 @@ impl Game {
         #[cfg(any(debug_assertions, feature = "debug-overlay"))]
         let guard = DebugSystemGuard::new(&mut self.world, self.world_entity);
 
-        self.ctx_dirty = TickContextDirty::default();
+        self.work.reset_per_tick();
 
         // Economy: only every ECONOMY_TICK_INTERVAL ticks
         if self
@@ -813,19 +737,14 @@ impl Game {
                     &mut self.world,
                     self.world_entity,
                     self.settings.funds_per_city,
-                    &mut self.economy_earned,
+                    &mut self.work.economy_earned,
                 )
             );
             // Track funds_earned in player stats
-            for (pid, amount) in &self.economy_earned {
+            for (pid, amount) in &self.work.economy_earned {
                 if let Some(stats) = self.player_stats.get_mut(pid) {
                     stats.funds_earned += amount;
                 }
-            }
-            // Read funds directly from world for player update
-            for (pid, player) in self.players.iter_mut() {
-                let f = self.world.player_funds(self.world_entity, pid);
-                player.funds = f;
             }
         }
 
@@ -833,12 +752,16 @@ impl Game {
             "water",
             &mut self.world,
             self.world_entity,
-            systems::water::run(&mut self.world, self.world_entity, &mut self.water_scratch)
+            systems::water::run(
+                &mut self.world,
+                self.world_entity,
+                &mut self.work.water_scratch
+            )
         );
 
         // Movement returns count of units that moved this tick. It also builds
         // the tick's one spatial grid (pre-move positions) into
-        // `self.grid_index_scratch` — consumed by the occupancy gate, combat's
+        // `self.work.grid_index_scratch` — consumed by the occupancy gate, combat's
         // mover-scan / target acquisition, and city capture.
         let mover_count = tick_system!(
             "movement",
@@ -848,19 +771,19 @@ impl Game {
                 &mut self.world,
                 self.world_entity,
                 &self.settings,
-                &mut self.movement_scratch,
-                &self.ctx,
-                &mut self.grid_index_scratch,
+                &mut self.work.movement_scratch,
+                &self.work.ctx,
+                &mut self.work.grid_index_scratch,
             )
         );
-        self.last_mover_count = mover_count;
+        self.work.last_mover_count = mover_count;
 
         // ── AFTER movement: rebuild units_by_player when a consumer needs it ──
         // Owner map: always current (updated incrementally in recruit_unit).
         // units_by_player: only rebuild on consumer ticks AND only if positions changed.
         if mover_count > 0 {
-            self.units_by_player_stale = true;
-            self.influence_dirty = true;
+            self.work.units_by_player_stale = true;
+            self.work.influence_dirty = true;
         }
         let is_consumer_tick = self
             .tick
@@ -868,10 +791,10 @@ impl Game {
             || self
                 .tick
                 .is_multiple_of(super::constants::CITY_CAPTURE_TICK_INTERVAL);
-        if is_consumer_tick && self.units_by_player_stale {
+        if is_consumer_tick && self.work.units_by_player_stale {
             tick_system!("tickcontext", &mut self.world, self.world_entity, {
-                self.ctx.rebuild_units_by_player(&self.world);
-                self.units_by_player_stale = false;
+                self.work.ctx.rebuild_units_by_player(&self.world);
+                self.work.units_by_player_stale = false;
             });
         }
 
@@ -881,7 +804,7 @@ impl Game {
         // O(n × c) with bounded c) — folded in from the deleted
         // `nearby_enemies` system (Phase 2, plans/COMBAT_TARGETING.md §8.8).
         let combat_dead: Vec<hecs::Entity> = {
-            let ctx = &self.ctx;
+            let ctx = &self.work.ctx;
             tick_system!(
                 "combat",
                 &mut self.world,
@@ -889,16 +812,16 @@ impl Game {
                 systems::combat::run(
                     &mut self.world,
                     self.world_entity,
-                    &mut self.combat_scratch,
+                    &mut self.work.combat_scratch,
                     &self.settings,
                     ctx,
-                    &self.unit_types_index,
-                    &self.grid_index_scratch,
+                    &self.work.unit_types_index,
+                    &self.work.grid_index_scratch,
                 )
             )
         };
         // Expose engaged-pair count for benchmark/status reporting.
-        self.last_engaged_pairs = self.combat_scratch.engaged_pairs();
+        self.work.last_engaged_pairs = self.work.combat_scratch.engaged_pairs();
 
         // Supply + Attrition (merged): runs after combat so it sees post-combat
         // men/equipment; returns units that reached 0 men for death cleanup.
@@ -910,10 +833,10 @@ impl Game {
                 &mut self.world,
                 self.world_entity,
                 &self.settings,
-                &mut self.supply_scratch,
-                &self.ctx,
-                &self.unit_types_index,
-                &self.unit_type_total_max_equipment,
+                &mut self.work.supply_scratch,
+                &self.work.ctx,
+                &self.work.unit_types_index,
+                &self.work.unit_type_total_max_equipment,
             )
         );
 
@@ -929,13 +852,19 @@ impl Game {
                 &mut self.world,
                 self.world_entity,
                 &mut self.player_stats,
-                &self.ctx,
-                &self.grid_index_scratch,
+                &self.work.ctx,
+                &self.work.grid_index_scratch,
             )
         );
         if !cities_changed.is_empty() {
-            self.ctx_dirty.cities_changed = true;
-            self.influence_dirty = true;
+            self.work.ctx_dirty.cities_changed = true;
+            self.work.influence_dirty = true;
+            // Perf #2: city_capture wrote new owners into the world cities —
+            // advance the generation so the server's cached city snapshot
+            // rebuilds on the next tick (the write above is the only city
+            // mutation inside tick_game; captures are the third mutation
+            // site after assign_city_owner and upgrade_city).
+            self.city_generation = self.city_generation.wrapping_add(1);
         }
 
         // Influence: merged vision + border in one pass (every INFLUENCE_TICK_INTERVAL ticks)
@@ -944,12 +873,12 @@ impl Game {
             .is_multiple_of(super::constants::INFLUENCE_TICK_INTERVAL)
         {
             // Update cities before influence reads them if they changed
-            if self.ctx_dirty.cities_changed {
-                self.ctx.update_cities(&self.world, self.world_entity);
-                self.ctx_dirty.cities_changed = false;
+            if self.work.ctx_dirty.cities_changed {
+                self.work.ctx.update_cities(&self.world, self.world_entity);
+                self.work.ctx_dirty.cities_changed = false;
             }
-            if self.influence_dirty {
-                let ctx = &self.ctx;
+            if self.work.influence_dirty {
+                let ctx = &self.work.ctx;
                 tick_system!(
                     "influence",
                     &mut self.world,
@@ -958,13 +887,13 @@ impl Game {
                         &mut self.world,
                         ctx,
                         self.tick,
-                        &mut self.influence_scratch,
+                        &mut self.work.influence_scratch,
                         true,
                         &self.settings.influence,
                     )
                 );
-                self.influence_dirty = false;
-                self.encirclement_dirty = true; // encirclement inputs changed
+                self.work.influence_dirty = false;
+                self.work.encirclement_dirty = true; // encirclement inputs changed
             }
             // else: skip compute + allocations; existing Arcs stay valid
         }
@@ -977,9 +906,9 @@ impl Game {
             // NOTE: cities_changed is always serviced by the influence block above
             // (30 % 3 == 0 ⇒ every encirclement tick is an influence tick that ran
             // first), so it is always false here.
-            debug_assert!(!self.ctx_dirty.cities_changed);
-            if self.encirclement_dirty {
-                let ctx = &self.ctx;
+            debug_assert!(!self.work.ctx_dirty.cities_changed);
+            if self.work.encirclement_dirty {
+                let ctx = &self.work.ctx;
                 tick_system!(
                     "encirclement",
                     &mut self.world,
@@ -988,10 +917,10 @@ impl Game {
                         &mut self.world,
                         ctx,
                         self.tick,
-                        &mut self.encirclement_scratch,
+                        &mut self.work.encirclement_scratch,
                     )
                 );
-                self.encirclement_dirty = false;
+                self.work.encirclement_dirty = false;
             }
         }
 
@@ -1021,8 +950,8 @@ impl Game {
             systems::death_cleanup::run(
                 &mut self.world,
                 &[&combat_dead[..], &supply_dead[..], &surrender_dead[..]],
-                &mut self.entity_reverse,
-                &mut self.death_cleanup_scratch,
+                &mut self.registry.entity_reverse,
+                &mut self.work.death_cleanup_scratch,
             )
         );
 
@@ -1032,8 +961,8 @@ impl Game {
         // consumer tick and mark influence stale so the grids don't keep
         // projecting dead units (staleness fix).
         if death_count > 0 {
-            self.units_by_player_stale = true;
-            self.influence_dirty = true;
+            self.work.units_by_player_stale = true;
+            self.work.influence_dirty = true;
         }
 
         self.track_unit_losses();
@@ -1132,28 +1061,27 @@ impl Game {
 
         let entity = self.world.spawn_unit(unit_type, owner, pos);
         let unit_id = format!("unit_{}", entity.id());
-        self.entity_registry.insert(unit_id.clone(), entity);
-        self.entity_reverse.insert(entity, unit_id.clone());
+        self.registry.insert(unit_id.clone(), entity);
 
         // Incrementally update the owner map (O(1) insert, no ECS query needed)
-        let player_idx = if let Some(&idx) = self.ctx.player_id_to_index.get(owner) {
+        let player_idx = if let Some(&idx) = self.work.ctx.player_id_to_index.get(owner) {
             idx
         } else {
-            let idx = self.ctx.next_player_idx;
-            self.ctx.next_player_idx += 1;
-            self.ctx.player_id_to_index.insert(owner.to_string(), idx);
+            let idx = self.work.ctx.next_player_idx;
+            self.work.ctx.next_player_idx += 1;
+            self.work
+                .ctx
+                .player_id_to_index
+                .insert(owner.to_string(), idx);
             idx
         };
-        self.ctx.owner_set(entity, player_idx);
+        self.work.ctx.owner_set(entity, player_idx);
 
         // New unit isn't in ctx.units_by_player yet — force a rebuild on the
         // next consumer tick and mark influence stale (staleness fix).
-        self.units_by_player_stale = true;
-        self.influence_dirty = true;
+        self.work.units_by_player_stale = true;
+        self.work.influence_dirty = true;
 
-        if let Some(player) = self.players.get_mut(owner) {
-            player.units.push(unit_id.clone());
-        }
         if let Some(stats) = self.player_stats.get_mut(owner) {
             stats.units_recruited += 1;
             stats.funds_spent += unit_type.recruitment_cost;
@@ -1179,8 +1107,7 @@ impl Game {
 
     /// Get the owner of a unit by its string ID.
     pub fn get_unit_owner(&self, unit_id: &str) -> Option<String> {
-        let entity = self.entity_registry.get(unit_id)?;
-        let entity = *entity;
+        let entity = self.registry.get(unit_id)?;
         self.world
             .get::<&UnitOwner>(entity)
             .ok()
@@ -1221,8 +1148,7 @@ impl Game {
         if !self.valid_move_path(&path) {
             return;
         }
-        if let Some(entity) = self.entity_registry.get(unit_id) {
-            let entity = *entity;
+        if let Some(entity) = self.registry.get(unit_id) {
             if let Ok((up,)) = self.world.query_one_mut::<(&mut UnitPath,)>(entity) {
                 up.path = path.into_iter().collect();
             }
@@ -1234,8 +1160,7 @@ impl Game {
         if self.get_unit_owner(unit_id).as_deref() != Some(owner) {
             return;
         }
-        if let Some(entity) = self.entity_registry.get(unit_id) {
-            let entity = *entity;
+        if let Some(entity) = self.registry.get(unit_id) {
             if let Ok((flags,)) = self.world.query_one_mut::<(&mut UnitFlags,)>(entity) {
                 flags.healing = enabled;
             }
@@ -1247,8 +1172,7 @@ impl Game {
         if self.get_unit_owner(unit_id).as_deref() != Some(owner) {
             return;
         }
-        if let Some(entity) = self.entity_registry.get(unit_id) {
-            let entity = *entity;
+        if let Some(entity) = self.registry.get(unit_id) {
             if let Ok((flags,)) = self.world.query_one_mut::<(&mut UnitFlags,)>(entity) {
                 flags.resupply_enabled = enabled;
             }
@@ -1294,12 +1218,16 @@ impl Game {
         if let Some(funds) = wb.funds.funds.get_mut(owner) {
             *funds = funds.saturating_sub(cost);
         }
+        // Perf #2: level (and the level-derived supply_range) changed —
+        // advance the generation so the server's cached city snapshot
+        // rebuilds on the next tick.
+        self.city_generation = self.city_generation.wrapping_add(1);
         Ok(())
     }
 
     pub fn embark_unit(&mut self, unit_id: &str, player_id: &str) {
-        let entity = match self.entity_registry.get(unit_id) {
-            Some(e) => *e,
+        let entity = match self.registry.get(unit_id) {
+            Some(e) => e,
             None => return,
         };
         let owner = match self.world.get::<&UnitOwner>(entity) {
@@ -1392,8 +1320,8 @@ impl Game {
     }
 
     pub fn disembark_unit(&mut self, unit_id: &str, player_id: &str) {
-        let entity = match self.entity_registry.get(unit_id) {
-            Some(e) => *e,
+        let entity = match self.registry.get(unit_id) {
+            Some(e) => e,
             None => return,
         };
         let owner = match self.world.get::<&UnitOwner>(entity) {
@@ -1605,8 +1533,14 @@ impl Game {
             // ctx_dirty.cities_changed flag set here would be wiped at the top
             // of the next tick_game) and mark influence stale so the grids
             // reflect the new owner (staleness fix).
-            self.ctx.update_cities(&self.world, self.world_entity);
-            self.influence_dirty = true;
+            self.work.ctx.update_cities(&self.world, self.world_entity);
+            self.work.influence_dirty = true;
+            // Perf #2: a city write landed — advance the generation so the
+            // server's cached city snapshot rebuilds on the next tick.
+            // (Bumped even when the new owner equals the old one: a no-op
+            // re-assignment is rarer than an actual change and the extra
+            // one-shot snapshot rebuild is negligible.)
+            self.city_generation = self.city_generation.wrapping_add(1);
         }
         changed
     }
@@ -1943,6 +1877,13 @@ impl Game {
     pub fn players(&self) -> &HashMap<String, Player> {
         &self.players
     }
+    /// Perf #2: current city-generation counter (see `city_generation` on
+    /// `Game`). The server's tick loop compares this against the generation
+    /// its cached `Arc<Vec<City>>` snapshot was built at: equal ⇒ reuse the
+    /// cache (zero clone), different ⇒ rebuild from `query_cities`.
+    pub fn city_generation(&self) -> u64 {
+        self.city_generation
+    }
     pub fn settings(&self) -> &GameSettings {
         &self.settings
     }
@@ -2188,7 +2129,7 @@ mod tests {
 
         let ut = basic_unit_type();
         let unit_id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
-        assert!(game.entity_registry.contains_key(&unit_id));
+        assert!(game.registry.entity_registry.contains_key(&unit_id));
 
         // Before any tick: the new unit is not yet grouped, influence is dirty.
         assert_eq!(game.ctx_unit_count_for_test(), 0);
@@ -2291,7 +2232,7 @@ mod tests {
         // Force death deterministically: men <= 0 → the surrender sweep (every
         // 30 ticks) returns it for death_cleanup. Supply skips zero-men units,
         // so the 0 is stable in the meantime. Run until it is reaped.
-        let entity = game.entity_registry[&unit_id];
+        let entity = game.registry.entity_registry[&unit_id];
         {
             let (stats,) = game
                 .world
@@ -2533,7 +2474,7 @@ mod tests {
         // Identical bookkeeping to the gated path: id registered, owner set,
         // resources deducted.
         assert!(
-            game.entity_registry.contains_key(&id),
+            game.registry.entity_registry.contains_key(&id),
             "bypass must register the unit id"
         );
         assert_eq!(
@@ -2569,7 +2510,7 @@ mod tests {
         assert!(game.recruit_unit("city_0", &ut, "player_0").is_none());
 
         // The unit moves away (relocate its position far from the city).
-        let entity = *game.entity_registry.get(&id).unwrap();
+        let entity = *game.registry.entity_registry.get(&id).unwrap();
         let (pos,) = game
             .world
             .query_one_mut::<(&mut crate::game::components::UnitPosition,)>(entity)
@@ -2644,12 +2585,12 @@ mod tests {
     fn unit_type_total_max_equipment_matches_templates() {
         let game = Game::new(test_map(), test_settings(), 1);
         assert_eq!(
-            game.unit_type_total_max_equipment.len(),
+            game.work.unit_type_total_max_equipment.len(),
             game.settings.unit_types.len()
         );
         for (i, ut) in game.settings.unit_types.iter().enumerate() {
             let sum: f32 = ut.equipment.iter().map(|e| e.max_count as f32).sum();
-            assert_eq!(game.unit_type_total_max_equipment[i], sum);
+            assert_eq!(game.work.unit_type_total_max_equipment[i], sum);
         }
     }
 
@@ -2790,13 +2731,17 @@ mod tests {
                 3 => {
                     // Kill the third unit (removed); its freed id is never
                     // re-recruited in this test.
-                    let entity = *game.entity_registry.get(id_c.as_deref().unwrap()).unwrap();
+                    let entity = *game
+                        .registry
+                        .entity_registry
+                        .get(id_c.as_deref().unwrap())
+                        .unwrap();
                     game.world.despawn(entity).unwrap();
                 }
                 5 => {
                     // Owner change — not a digest field: no update on either
                     // path, but the per-owner counts move.
-                    let entity = *game.entity_registry.get(&id_a).unwrap();
+                    let entity = *game.registry.entity_registry.get(&id_a).unwrap();
                     let (owner_c,) = game
                         .world
                         .query_one_mut::<(&mut UnitOwner,)>(entity)
@@ -2806,7 +2751,7 @@ mod tests {
                 6 => {
                     // men change → digest change → a unit_updates entry,
                     // diffed against the re-owned baseline.
-                    let entity = *game.entity_registry.get(&id_a).unwrap();
+                    let entity = *game.registry.entity_registry.get(&id_a).unwrap();
                     let (stats_c,) = game
                         .world
                         .query_one_mut::<(&mut UnitStats,)>(entity)
@@ -2910,7 +2855,7 @@ mod tests {
         let id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
         let _ = crate::server::delta::update_unit_baselines(&game, &mut store); // seed the baseline
 
-        let entity = *game.entity_registry.get(&id).unwrap();
+        let entity = *game.registry.entity_registry.get(&id).unwrap();
         let (owner_c,) = game
             .world
             .query_one_mut::<(&mut UnitOwner,)>(entity)
@@ -2955,7 +2900,7 @@ mod tests {
         let id = game.recruit_unit("city_0", &ut, "player_0").unwrap();
         let _ = crate::server::delta::update_unit_baselines(&game, &mut store); // added
 
-        let entity = *game.entity_registry.get(&id).unwrap();
+        let entity = *game.registry.entity_registry.get(&id).unwrap();
         game.world.despawn(entity).unwrap();
         let diff = crate::server::delta::update_unit_baselines(&game, &mut store);
         assert_eq!(
@@ -2991,7 +2936,7 @@ mod tests {
 
         // Kill it, then recruit at the same city: hecs reuses the just-freed
         // id at gen+1 (the same slot, a new incarnation).
-        let entity = *game.entity_registry.get(&id_a).unwrap();
+        let entity = *game.registry.entity_registry.get(&id_a).unwrap();
         game.world.despawn(entity).unwrap();
         let id_b = game.recruit_unit("city_0", &ut, "player_0").unwrap();
         assert_eq!(id_a, id_b, "hecs must reuse the freed entity id");
@@ -3035,7 +2980,7 @@ mod tests {
 
     /// Read the unit's current waypoint path from the ECS.
     fn unit_path(game: &Game, unit_id: &str) -> Vec<(f32, f32)> {
-        let entity = game.entity_registry[unit_id];
+        let entity = game.registry.entity_registry[unit_id];
         let mut q = game.world.query_one::<(&UnitPath,)>(entity);
         q.get().map(|(up,)| up.path.to_vec()).unwrap_or_default()
     }

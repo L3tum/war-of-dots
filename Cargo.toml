@@ -40,6 +40,9 @@ bench-alloc = []
 
 [dev-dependencies]
 dhat = "0.3"
+# HTTP handler tests (handlers/http.rs): one-shot requests against a real
+# GameServer via `tower::ServiceExt::oneshot`.
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "console_client"

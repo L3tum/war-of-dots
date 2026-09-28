@@ -1,4 +1,4 @@
-//! Lobby UI tests — tab switching, settings collection, leaderboard display.
+// Lobby UI tests — tab switching, settings collection, leaderboard display.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { LobbyUI } from './lobby';

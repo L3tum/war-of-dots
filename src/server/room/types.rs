@@ -165,6 +165,12 @@ pub fn egress_vec(msg: EgressMessage, ring: &DeltaRing) -> Option<Vec<u8>> {
 }
 
 /// Commands that can be sent to a game room.
+///
+/// In-memory only (no serde derive — nothing wire-facing depends on the
+/// variant shapes): player handlers, the LLM task mapper
+/// (`llm_tasks::action_to_command`) and spectator joins construct them;
+/// the tick loop consumes them. Multi-field variants use named fields;
+/// `AddSpectator` keeps its single-field tuple shape.
 #[derive(Debug)]
 pub enum Command {
     MoveTroop {
@@ -172,7 +178,11 @@ pub enum Command {
         owner_id: String,
         path: Vec<(f32, f32)>,
     },
-    RecruitUnit(String, String, String), // city_id, unit_type_name, owner
+    RecruitUnit {
+        city_id: String,
+        unit_type: String,
+        owner: String,
+    },
     ToggleHealing {
         unit_id: String,
         owner_id: String,
@@ -183,10 +193,22 @@ pub enum Command {
         owner_id: String,
         enabled: bool,
     },
-    UpgradeCity(String, String),   // city_id, owner
-    ToggleAdvisor(String, bool),   // player_id, enabled
-    EmbarkUnit(String, String),    // unit_id, player_id
-    DisembarkUnit(String, String), // unit_id, player_id
+    UpgradeCity {
+        city_id: String,
+        owner: String,
+    },
+    ToggleAdvisor {
+        player_id: String,
+        enabled: bool,
+    },
+    EmbarkUnit {
+        unit_id: String,
+        player_id: String,
+    },
+    DisembarkUnit {
+        unit_id: String,
+        player_id: String,
+    },
     AddSpectator(PlayerSender),
 }
 
@@ -211,14 +233,6 @@ impl PlayerConnection {
             PlayerConnection::Spectator { tx } => tx,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn tx_mut(&mut self) -> &mut PlayerSender {
-        match self {
-            PlayerConnection::Player { tx, .. } => tx,
-            PlayerConnection::Spectator { tx } => tx,
-        }
-    }
 }
 
 /// Unified sender that can send to either mpsc channel or WebSocket.
@@ -227,8 +241,6 @@ impl PlayerConnection {
 /// reliable messages are queued unboundedly and never dropped.
 pub enum PlayerSender {
     Tcp(TcpEgress),
-    #[allow(dead_code)]
-    Websocket(Arc<dyn Fn(Bytes) -> Result<(), ()> + Send + Sync>),
     /// No connection (LLM-only player)
     None,
 }
@@ -237,7 +249,6 @@ impl std::fmt::Debug for PlayerSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlayerSender::Tcp(_) => f.debug_tuple("PlayerSender::Tcp").finish(),
-            PlayerSender::Websocket(_) => f.debug_tuple("PlayerSender::Websocket").finish(),
             PlayerSender::None => f.debug_tuple("PlayerSender::None").finish(),
         }
     }
@@ -247,7 +258,6 @@ impl Clone for PlayerSender {
     fn clone(&self) -> Self {
         match self {
             PlayerSender::Tcp(e) => PlayerSender::Tcp(e.clone()),
-            PlayerSender::Websocket(f) => PlayerSender::Websocket(Arc::clone(f)),
             PlayerSender::None => PlayerSender::None,
         }
     }
@@ -261,7 +271,6 @@ impl PlayerSender {
                 let seq = e.ring.push(data);
                 e.tx.send(EgressMessage::Delta(seq)).map_err(|_| ())
             }
-            PlayerSender::Websocket(f) => f(data.into()),
             PlayerSender::None => Ok(()), // No connection, silently ignore
         }
     }
@@ -270,7 +279,6 @@ impl PlayerSender {
     fn push_reliable(&self, data: Bytes) -> Result<(), ()> {
         match self {
             PlayerSender::Tcp(e) => e.tx.send(EgressMessage::Reliable(data)).map_err(|_| ()),
-            PlayerSender::Websocket(f) => f(data),
             PlayerSender::None => Ok(()), // No connection, silently ignore
         }
     }
@@ -291,9 +299,7 @@ impl PlayerSender {
     /// M3/W7: request a connection close from the egress side (a delta
     /// encode failed — a half frame is unrecoverable, so end the stream
     /// instead of leaving the peer desynced). Best-effort: if the channel
-    /// is already closed (peer gone), there is nothing to do. The `Websocket`
-    /// closure variant has no close hook (legacy, unused by the live game
-    /// path) and is a no-op.
+    /// is already closed (peer gone), there is nothing to do.
     pub fn close(&self) {
         if let PlayerSender::Tcp(e) = self {
             let _ = e.tx.send(EgressMessage::Close);

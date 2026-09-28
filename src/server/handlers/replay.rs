@@ -151,33 +151,10 @@ pub(crate) async fn handle_replay_ws(
 
     // 2) Resolve the recorded file through the DB (parameterized query),
     //    then verify the stored path stays inside the replay directory.
-    //    Clone `Storage` out of the server guard first so the guard is
-    //    dropped before we hold the inner (std) DB mutex.
+    //    The lookup runs on the blocking pool (Arch #12) — the std DB
+    //    mutex is held on a worker thread, never by this async task.
     let storage = server_state.lock().await.storage.clone();
-    let stored: Option<String> = match storage.db.lock() {
-        Ok(db) => match db.prepare("SELECT replay_path FROM game_metadata WHERE id = ?") {
-            Ok(mut stmt) => {
-                use sqlite::Value;
-                let params = [Value::String(game_id.clone())];
-                if stmt.bind(params.as_slice()).is_err() {
-                    tracing::error!(game_id = %game_id, "Failed to bind game_id");
-                    None
-                } else if matches!(stmt.next(), Ok(sqlite::State::Row)) {
-                    stmt.read(0).ok().filter(|p: &String| !p.is_empty())
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                tracing::error!(%e, game_id = %game_id, "Failed to prepare replay lookup");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::error!(%e, "Failed to acquire DB lock for replay lookup");
-            None
-        }
-    };
+    let stored: Option<String> = storage.find_replay_path_async(&game_id).await;
 
     let file_path = {
         let server = server_state.lock().await;
@@ -358,37 +335,25 @@ mod tests {
 pub(crate) async fn list_replays(
     State(state): State<Arc<Mutex<GameServer>>>,
 ) -> axum::Json<Vec<ReplayInfo>> {
-    let server = state.lock().await;
-    let storage = server.storage.clone();
-    let db = match storage.db.lock() {
-        Ok(d) => d,
-        Err(_) => return axum::Json(Vec::new()),
-    };
-    let mut stmt = match db.prepare(
-        "SELECT id, players, winner, start_time, end_time FROM game_metadata ORDER BY end_time DESC"
-    ) {
-        Ok(s) => s,
-        Err(_) => return axum::Json(Vec::new()),
-    };
+    // The query runs on the blocking pool (Arch #12) — the std DB mutex is
+    // held on a worker thread, never by this async task. A failed DB degrades
+    // to an empty list (sync core behavior, as before).
+    let storage = state.lock().await.storage.clone();
+    let records = storage.list_game_metadata_async().await;
     let mut replays = Vec::new();
-    while let Ok(sqlite::State::Row) = stmt.next() {
-        let id: String = stmt.read(0).unwrap_or_default();
-        let players_str: String = stmt.read(1).unwrap_or_default();
-        let winner: String = stmt.read(2).unwrap_or_default();
-        let start_time: i64 = stmt.read(3).unwrap_or(0);
-        let end_time: i64 = stmt.read(4).unwrap_or(0);
-        let players: Vec<String> = serde_json::from_str(&players_str).unwrap_or_default();
-        let duration = if start_time < end_time {
-            end_time - start_time
+    for record in records {
+        let players: Vec<String> = serde_json::from_str(&record.players_json).unwrap_or_default();
+        let duration = if record.start_time < record.end_time {
+            record.end_time - record.start_time
         } else {
             0
         };
         replays.push(ReplayInfo {
-            game_id: id,
-            winner,
+            game_id: record.id,
+            winner: record.winner,
             players,
-            start_time,
-            end_time,
+            start_time: record.start_time,
+            end_time: record.end_time,
             duration,
         });
     }

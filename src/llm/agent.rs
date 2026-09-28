@@ -1,5 +1,6 @@
 //! LLM agent interface with structured tool calling
 
+use super::actions::LlmAction;
 use serde::{Deserialize, Serialize};
 
 /// LLM agent configuration
@@ -138,12 +139,14 @@ impl LlmAgent {
         )
     }
 
-    /// Execute one step: call the LLM and return commands to execute
+    /// Execute one step: call the LLM and return actions to execute.
+    /// Actions carry no ownership — the server attaches the agent's
+    /// player id when it maps them into room commands.
     pub async fn step(
         &mut self,
         client: &LlmClient,
         state: &GameState,
-    ) -> anyhow::Result<Vec<crate::server::room::Command>> {
+    ) -> anyhow::Result<Vec<LlmAction>> {
         // Use time-based delay instead of turn count
         let now = std::time::Instant::now();
         if now.duration_since(self.last_call_time) < self.thinking_delay {
@@ -165,11 +168,11 @@ impl LlmAgent {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        let mut commands = Vec::new();
+        let mut actions = Vec::new();
         for tc in &tool_calls {
-            match crate::llm::tools::tool_call_to_command(tc, &self.id) {
-                Ok((action_str, reason)) => {
-                    commands.push(action_str);
+            match crate::llm::tools::tool_call_to_action(tc) {
+                Ok((action, reason)) => {
+                    actions.push(action);
                     if !reason.is_empty() {
                         self.reason_log.push(ReasonEntry {
                             timestamp,
@@ -194,6 +197,6 @@ impl LlmAgent {
             }
         }
 
-        Ok(commands)
+        Ok(actions)
     }
 }

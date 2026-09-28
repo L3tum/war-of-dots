@@ -1,11 +1,15 @@
-//! Recording fake WebGPU device for headless (happy-dom) renderer tests.
-//!
-//! There is no ready-made `GPUDevice` mock package (checked: vitest-webgl-canvas-mock
-//! covers WebGL only; `webgpu`/`bun-webgpu` are real Dawn-backed GPUs), so this
-//! doubles only the API surface the renderer actually calls and RECORDS the
-//! `queue.writeBuffer` / `queue.writeTexture` payloads and the render-pass draw
-//! sequence — the authoritative geometry output that assertions read.
+// Recording fake WebGPU device for headless (happy-dom) renderer tests.
+//
+// There is no ready-made `GPUDevice` mock package (checked: vitest-webgl-canvas-mock
+// covers WebGL only; `webgpu`/`bun-webgpu` are real Dawn-backed GPUs), so this
+// doubles only the API surface the renderer actually calls and RECORDS the
+// `queue.writeBuffer` / `queue.writeTexture` payloads and the render-pass draw
+// sequence — the authoritative geometry output that assertions read.
 
+// Test-only fake WebGPU surface: the fakes deliberately mirror the loose,
+// browser-global shape of the WebGPU IDL (e.g. `globalThis as any` in
+// setupFakeGpu) instead of re-declaring every member — the real, fully-typed
+// definitions live in src/types/webgpu.d.ts.
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 export interface WriteBufferCall {

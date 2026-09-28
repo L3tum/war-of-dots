@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -21,12 +22,12 @@ use crate::server::delta::{
     update_unit_baselines, NetworkPhaseResult, TickDiffs, UnitBaselineStore,
 };
 use crate::server::game_server::GameServer;
-use crate::server::handlers::http::persist_game_end;
 use crate::server::protocol::{
     encode_message, encode_message_with_hint, estimate_delta_size, ServerMessage,
 };
 use crate::server::room::spectator::SpectatorUnionCache;
-use crate::server::room::types::{Command, DebugGameStats, PlayerConnection};
+use crate::server::room::types::{Command, DebugGameStats, PlayerConnection, PlayerSender};
+use crate::storage::{persist_game_end, Storage};
 
 /// The per-game tick task's state — exactly the locals the inline
 /// `tokio::spawn(async move { ... })` closure in `GameRoom::new`
@@ -34,7 +35,12 @@ use crate::server::room::types::{Command, DebugGameStats, PlayerConnection};
 pub(crate) struct TickLoop {
     pub(super) game: Game,
     pub(super) players: Vec<PlayerConnection>,
-    pub(super) advisors: std::collections::HashMap<String, crate::llm::advisor::Advisor>,
+    /// HIGH #1: per-player advisor enable flags, shared (by `Arc`) with
+    /// every spawned advisor task. `ToggleAdvisor` writes the flag;
+    /// each advisor task reads it before every 60 s LLM call. Disabled
+    /// by default (setup.rs). Replaces the dead `HashMap<String, Advisor>`
+    /// — the spawned tasks never read it, so the toggle did nothing.
+    pub(super) advisor_enabled: std::collections::HashMap<String, Arc<AtomicBool>>,
     pub(super) server_state: Arc<Mutex<GameServer>>,
     pub(super) state_broadcasts: std::collections::HashMap<
         String,
@@ -46,14 +52,245 @@ pub(crate) struct TickLoop {
     pub(super) cmd_rx: mpsc::UnboundedReceiver<Command>,
     pub(super) spectator_cap: usize,
     pub(super) interval_ms: u64,
-    pub(super) storage_clone: crate::storage::Storage,
+    pub(super) storage_clone: Storage,
     pub(super) room_id: String,
     pub(super) game_start_time: u64,
     pub(super) settings_json: String,
     pub(super) record_pid: Option<String>,
-    pub(super) replay_recorder: Option<std::io::BufWriter<std::fs::File>>,
+    /// Arch #13: line-oriented sender to the dedicated replay writer task
+    /// ([`replay_writer_task`]) — the tick task no longer touches the
+    /// `BufWriter<File>` itself. Channel ordering = file ordering.
+    pub(super) replay_tx: Option<mpsc::UnboundedSender<String>>,
     pub(super) game_stats: Arc<std::sync::Mutex<DebugGameStats>>,
     pub(super) spectator_vision: bool,
+}
+
+/// Arch #5: the single game-end path shared by ALL four terminal branches
+/// (draw, last player standing, abandoned, room empty). Each branch calls
+/// this and then `break`s.
+///
+/// `remove_room: true` everywhere (HIGH #2): finished rooms must leave
+/// `server.games`. The old Draw / last-player-standing branches skipped the
+/// removal, so dead rooms sat in the map forever and the spectator handler
+/// could pick one — its `AddSpectator` send then failed silently (`.ok()`)
+/// and the spectator WebSocket stayed open with no room behind it.
+///
+/// Persists the game-end record through the SYNC `persist_game_end` (there is
+/// no async variant of it; `crate::storage`'s module docs keep the tick task
+/// on the sync path — it already runs on a worker thread, and game end is a
+/// once-per-game event, not a per-tick one), broadcasts `GameOver` to every
+/// remaining connection (a no-op when the room is empty), removes the room
+/// from `server.games`, and aborts the spawned LLM agent/advisor handles.
+#[allow(clippy::too_many_arguments)]
+async fn finish_game(
+    players: &mut [PlayerConnection],
+    spawned_handles: Vec<tokio::task::JoinHandle<()>>,
+    server_state: &Arc<Mutex<GameServer>>,
+    storage: &Storage,
+    room_id: &str,
+    game_start_time: u64,
+    settings_json: &str,
+    winners: &[&str],
+    player_ids: &[&str],
+    game: &Game,
+    winner: &str,
+    message: &str,
+    remove_room: bool,
+) {
+    persist_game_end(
+        storage,
+        room_id,
+        game_start_time,
+        settings_json,
+        winners,
+        player_ids,
+        game,
+    );
+    if !players.is_empty() {
+        let msg = ServerMessage::GameOver {
+            winner: winner.to_string(),
+            game_id: room_id.to_string(),
+            message: message.to_string(),
+        };
+        let encoded = Bytes::from(encode_message(&msg));
+        for player in players.iter() {
+            let _ = player.tx().send_reliable(encoded.clone()).await;
+        }
+    }
+    if remove_room {
+        let server = server_state.lock().await;
+        let mut games = server.games.lock().await;
+        games.remove(room_id);
+    }
+    for handle in spawned_handles {
+        handle.abort();
+    }
+}
+
+/// Arch #4: the split between what a [`Command`] can apply against the game
+/// object synchronously and what needs tick-local context (the advisor flag
+/// map, the spectator cap + `players` ownership).
+enum CommandOutcome {
+    /// Fully applied synchronously against `game` — nothing more to do.
+    Applied,
+    /// Needs the tick task's `advisor_enabled` flag map (HIGH #1).
+    ToggleAdvisor { player_id: String, enabled: bool },
+    /// Needs the tick task's `players` (its sole owner) + the spectator cap.
+    AddSpectator(PlayerSender),
+}
+
+/// Arch #4: single synchronous half of the command dispatch, shared by
+/// BOTH `select!` arms (the per-tick `try_recv` drain and the blocking
+/// `recv` arm). Game-object commands are applied here; everything else is
+/// returned as a [`CommandOutcome`] for [`dispatch_outcome`].
+fn apply_command(cmd: Command, game: &mut Game) -> CommandOutcome {
+    match cmd {
+        Command::MoveTroop {
+            unit_id,
+            owner_id,
+            path,
+        } => {
+            // Ownership is enforced inside game.move_troops (single check).
+            game.move_troops(&unit_id, &owner_id, path);
+            CommandOutcome::Applied
+        }
+        Command::RecruitUnit {
+            city_id,
+            unit_type: unit_type_name,
+            owner,
+        } => {
+            if let Some(unit_type) = game
+                .settings()
+                .unit_types
+                .iter()
+                .find(|u| u.name == unit_type_name)
+                .cloned()
+            {
+                let _ = game.recruit_unit(&city_id, &unit_type, &owner);
+            }
+            CommandOutcome::Applied
+        }
+        Command::ToggleHealing {
+            unit_id,
+            owner_id,
+            enabled,
+        } => {
+            game.toggle_healing(&unit_id, &owner_id, enabled);
+            CommandOutcome::Applied
+        }
+        Command::ToggleResupply {
+            unit_id,
+            owner_id,
+            enabled,
+        } => {
+            game.toggle_resupply(&unit_id, &owner_id, enabled);
+            CommandOutcome::Applied
+        }
+        Command::UpgradeCity { city_id, owner } => {
+            let _ = game.upgrade_city(&city_id, &owner);
+            CommandOutcome::Applied
+        }
+        Command::EmbarkUnit { unit_id, player_id } => {
+            game.embark_unit(&unit_id, &player_id);
+            CommandOutcome::Applied
+        }
+        Command::DisembarkUnit { unit_id, player_id } => {
+            game.disembark_unit(&unit_id, &player_id);
+            CommandOutcome::Applied
+        }
+        // Tick-local: the advisor flag map lives in the tick task.
+        Command::ToggleAdvisor { player_id, enabled } => {
+            CommandOutcome::ToggleAdvisor { player_id, enabled }
+        }
+        // Tick-local: `players` is owned by the tick task (Sec L2 cap).
+        Command::AddSpectator(sender) => CommandOutcome::AddSpectator(sender),
+    }
+}
+
+/// Arch #4: tick-local follow-up for the [`CommandOutcome`]s that
+/// [`apply_command`] cannot apply against the game object. Both `select!`
+/// arms call `apply_command` + this, so the dispatch is one code path with
+/// identical behavior in both arms.
+async fn dispatch_outcome(
+    outcome: CommandOutcome,
+    players: &mut Vec<PlayerConnection>,
+    game: &Game,
+    advisor_enabled: &std::collections::HashMap<String, Arc<AtomicBool>>,
+    spectator_cap: usize,
+) {
+    match outcome {
+        CommandOutcome::Applied => {}
+        CommandOutcome::ToggleAdvisor { player_id, enabled } => {
+            // HIGH #1: the shared flag — each spawned advisor task reads
+            // this exact `Arc` before every 60 s iteration. Unknown pids
+            // are a no-op (same as the old `advisors.get_mut` miss).
+            if let Some(flag) = advisor_enabled.get(&player_id) {
+                flag.store(enabled, Ordering::Relaxed);
+            }
+        }
+        CommandOutcome::AddSpectator(sender) => {
+            // Sec L2: per-game spectator cap (the tick
+            // task is the sole owner of `players`).
+            add_spectator_capped(spectator_cap, players, game, sender).await;
+        }
+    }
+}
+
+/// Arch #13: the dedicated replay writer task — keeps the JSONL file IO
+/// (BufWriter + flushes) off the async tick path. The tick task owns
+/// [`TickLoop::replay_tx`] (line-oriented); this task owns the
+/// `BufWriter<File>`, writes each line as it arrives, and flushes on its
+/// own ~1 s cadence (replacing the old in-tick every-60-ticks flush).
+/// The terminal `game_end` marker arrives as the LAST line before the tick
+/// task drops its sender, so channel ordering guarantees it is written
+/// last; on channel close the task flushes and exits.
+///
+/// Deliberately NOT in `spawned_handles`: the game-end path aborts those
+/// handles, and this task must survive them to write + flush the terminal
+/// marker. Its `JoinHandle` is dropped at spawn (dropping a tokio handle
+/// does not abort the task — same as today's handles).
+pub(crate) async fn replay_writer_task(
+    path: std::path::PathBuf,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) {
+    // Best-effort: a disk failure degrades to "no replay", never a broken
+    // game (the tick task's sends then just fail and are ignored).
+    let mut rec = match std::fs::File::create(&path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), %e, "replay: cannot create file");
+            return;
+        }
+    };
+    let mut flush_interval = tokio::time::interval(Duration::from_secs(1));
+    flush_interval.tick().await; // the first tick fires immediately — skip it
+    let mut header_flushed = false;
+    loop {
+        tokio::select! {
+            line = rx.recv() => match line {
+                Some(line) => {
+                    let _ = writeln!(rec, "{line}");
+                    if !header_flushed {
+                        // Flush the header (full_state) immediately so the
+                        // file is playable even if the process dies
+                        // mid-game (the old setup-side flush guarantee).
+                        let _ = rec.flush();
+                        header_flushed = true;
+                    }
+                }
+                None => {
+                    // Channel closed — the tick task is gone and every line
+                    // (including the terminal game_end marker) is written;
+                    // final flush, then exit.
+                    let _ = rec.flush();
+                    return;
+                }
+            },
+            _ = flush_interval.tick() => {
+                let _ = rec.flush();
+            }
+        }
+    }
 }
 
 impl TickLoop {
@@ -65,7 +302,7 @@ impl TickLoop {
         let TickLoop {
             game,
             players,
-            advisors,
+            advisor_enabled,
             server_state,
             state_broadcasts,
             spawned_handles,
@@ -79,7 +316,7 @@ impl TickLoop {
             game_start_time,
             settings_json,
             record_pid,
-            mut replay_recorder,
+            replay_tx,
             game_stats,
             spectator_vision,
         } = self;
@@ -106,8 +343,30 @@ impl TickLoop {
         // (replaces the per-tick `prev_units` HashMap rebuild).
         let mut unit_baselines = UnitBaselineStore::default();
         init_unit_baselines(&game, &mut unit_baselines);
+        // Perf #2: city snapshot cache — the per-tick `query_cities()` full
+        // clone (C city String allocations EVERY tick, idle or not) is
+        // replaced by a generation-checked `Arc` cache: the `Arc<Vec<City>>`
+        // is rebuilt only when `Game::city_generation` moves (a city was
+        // captured, upgraded, or re-assigned), and an unchanged tick
+        // reuses the cached Arc (one refcount bump, zero content clone).
+        // The baseline commit aliases the same Arc (shared allocation), so
+        // the old per-tick commit re-clone is gone as well.
+        let mut city_cache: Option<Arc<Vec<crate::game::economy::City>>> = None;
+        let mut city_cache_gen: u64 = 0;
+        // Perf #3: persistent per-tick funds scratch map. Keys are the
+        // stable player-id set (seeded once — the player set is fixed at
+        // game start; a defensive insert-if-missing below keeps this
+        // correct even if that ever changes); values are refilled IN PLACE
+        // every tick, so the per-tick `all_player_funds()` allocation
+        // (fresh HashMap bucket table + P key-String clones) is gone.
+        // `NetworkBaselines::commit` swaps this scratch with `prev_funds`
+        // (drain-back), so it is refilled next tick, never reallocated.
+        let mut funds_scratch: std::collections::HashMap<String, u32> = game
+            .players()
+            .keys()
+            .map(|k| (k.clone(), game.player_funds(k)))
+            .collect();
         let mut players = players;
-        let mut advisors = advisors;
         // I8: lazy cache for the spectator union vision grid — recomputed
         // only when the pid list changes or any per-player vision grid Arc
         // changes (the influence double-buffer flips ALL published Arcs on
@@ -148,44 +407,18 @@ impl TickLoop {
                     }
 
                     // --- Process commands from LLM agents & players (non-blocking) ---
+                    // Arch #4: one dispatch path shared with the blocking
+                    // `recv` arm below — identical behavior in both.
                     while let Ok(cmd) = cmd_rx.try_recv() {
-                        match cmd {
-                            Command::MoveTroop { unit_id, owner_id, path } => {
-                                // Ownership is enforced inside game.move_troops (single check).
-                                game.move_troops(&unit_id, &owner_id, path);
-                            }
-                            Command::RecruitUnit(city_id, unit_type_name, owner) => {
-                                if let Some(unit_type) = game.settings().unit_types.iter().find(|u| u.name == unit_type_name).cloned() {
-                                    let _ = game.recruit_unit(&city_id, &unit_type, &owner);
-                                }
-                            }
-                            Command::ToggleHealing { unit_id, owner_id, enabled } => {
-                                game.toggle_healing(&unit_id, &owner_id, enabled);
-                            }
-                            Command::ToggleResupply { unit_id, owner_id, enabled } => {
-                                game.toggle_resupply(&unit_id, &owner_id, enabled);
-                            }
-                            Command::UpgradeCity(city_id, owner) => {
-                                let _ = game.upgrade_city(&city_id, &owner);
-                            }
-                            Command::ToggleAdvisor(pid, enabled) => {
-                                if let Some(advisor) = advisors.get_mut(&pid) {
-                                    advisor.set_enabled(enabled);
-                                }
-                            }
-                            Command::AddSpectator(sender) => {
-                                // Sec L2: per-game spectator cap (the tick
-                                // task is the sole owner of `players`).
-                                add_spectator_capped(spectator_cap, &mut players, &game, sender)
-                                    .await;
-                            }
-                            Command::EmbarkUnit(unit_id, pid) => {
-                                game.embark_unit(&unit_id, &pid);
-                            }
-                            Command::DisembarkUnit(unit_id, pid) => {
-                                game.disembark_unit(&unit_id, &pid);
-                            }
-                        }
+                        let outcome = apply_command(cmd, &mut game);
+                        dispatch_outcome(
+                            outcome,
+                            &mut players,
+                            &game,
+                            &advisor_enabled,
+                            spectator_cap,
+                        )
+                        .await;
                     }
 
                     // --- Run game systems ---
@@ -204,7 +437,24 @@ impl TickLoop {
                     // H5: plain engine city snapshot (engine-owned data —
                     // the server converts to wire types only inside the
                     // diff/commit).
-                    let current_cities: Vec<crate::game::economy::City> = game.query_cities();
+                    // Perf #2: generation-checked cache — if no city
+                    // mutation bumped `city_generation` since the cache was
+                    // built, reuse the cached `Arc<Vec<City>>` (refcount
+                    // bump only); else rebuild from `query_cities`. The
+                    // shared Arc is moved into `TickDiffs` below (the cache
+                    // keeps its own ref) and committed back into the
+                    // baseline, which now aliases the same allocation.
+                    let city_gen = game.city_generation();
+                    let current_cities: Arc<Vec<crate::game::economy::City>> =
+                        match &city_cache {
+                            Some(cached) if city_cache_gen == city_gen => Arc::clone(cached),
+                            _ => {
+                                let fresh = Arc::new(game.query_cities());
+                                city_cache = Some(Arc::clone(&fresh));
+                                city_cache_gen = city_gen;
+                                fresh
+                            }
+                        };
 
                     // Update live debug stats (read by /debug/stats)
                     {
@@ -283,7 +533,12 @@ impl TickLoop {
                             .copied()
                     }).flatten();
                     if active_count == 0 {
-                        persist_game_end(
+                        // Arch #5: unified game-end (HIGH #2: room removed
+                        // from server.games like every other end branch).
+                        finish_game(
+                            &mut players,
+                            spawned_handles,
+                            &server_state,
                             &storage_clone,
                             &room_id,
                             game_start_time,
@@ -291,19 +546,11 @@ impl TickLoop {
                             &[""],
                             &player_ids,
                             &game,
-                        );
-                        let msg = ServerMessage::GameOver {
-                            winner: "Draw".to_string(),
-                            game_id: room_id.clone(),
-                            message: "⚖️ Draw — all players eliminated".to_string(),
-                        };
-                        let encoded = Bytes::from(encode_message(&msg));
-                        for player in &players {
-                            let _ = player.tx().send_reliable(encoded.clone()).await;
-                        }
-                        for handle in spawned_handles {
-                            handle.abort();
-                        }
+                            "Draw",
+                            "⚖️ Draw — all players eliminated",
+                            true,
+                        )
+                        .await;
                         break;
                     }
                     if total_players > 1 && active_count == 1 {
@@ -311,7 +558,12 @@ impl TickLoop {
                         let winner_name = game.players().get(winner_id)
                             .map(|p| p.name.clone())
                             .unwrap_or_else(|| winner_id.to_string());
-                        persist_game_end(
+                        // Arch #5: unified game-end (HIGH #2: room removed
+                        // from server.games like every other end branch).
+                        finish_game(
+                            &mut players,
+                            spawned_handles,
+                            &server_state,
                             &storage_clone,
                             &room_id,
                             game_start_time,
@@ -319,19 +571,11 @@ impl TickLoop {
                             &[winner_id],
                             &player_ids,
                             &game,
-                        );
-                        let msg = ServerMessage::GameOver {
-                            winner: winner_name,
-                            game_id: room_id.clone(),
-                            message: "Game over — last player standing wins".to_string(),
-                        };
-                        let encoded = Bytes::from(encode_message(&msg));
-                        for player in &players {
-                            let _ = player.tx().send_reliable(encoded.clone()).await;
-                        }
-                        for handle in spawned_handles {
-                            handle.abort();
-                        }
+                            &winner_name,
+                            "Game over — last player standing wins",
+                            true,
+                        )
+                        .await;
                         break;
                     }
 
@@ -348,6 +592,25 @@ impl TickLoop {
                         })
                         .collect();
 
+                    // Perf #3: refill the persistent funds scratch IN PLACE
+                    // (values only — the key Strings survive the `commit`
+                    // swap, so a steady-state tick performs zero funds-map
+                    // allocation). The old `all_player_funds()` call inside
+                    // `run_network_phase` built a fresh HashMap + P key
+                    // clones every tick for this exact data.
+                    for pid in game.players().keys() {
+                        match funds_scratch.get_mut(pid) {
+                            Some(v) => *v = game.player_funds(pid),
+                            // Defensive: a player id missing from the
+                            // scratch (the player set is fixed at game
+                            // start, so this never fires in steady state).
+                            None => {
+                                funds_scratch
+                                    .insert(pid.clone(), game.player_funds(pid));
+                            }
+                        }
+                    }
+
                     // H3: the per-tick shared diff inputs flow as one
                     // structured value (unit diff + city snapshot +
                     // border grid) instead of parallel parameters.
@@ -361,6 +624,7 @@ impl TickLoop {
                         &mut baselines,
                         &regular_pids,
                         tick_diffs,
+                        &mut funds_scratch,
                         true, // W9 splice path: on — A/B confirmed ~1.5% off the network phase (byte-for-byte verified encoder)
                         record_pid.as_deref(),
                     );
@@ -368,23 +632,14 @@ impl TickLoop {
                     // Replay: log the recording viewpoint's delta for this
                     // tick (idle ticks build no delta — nothing was sent
                     // on the wire either, so nothing is logged).
-                    // Perf #2: NO per-tick flush — the BufWriter buffers in
-                    // userspace and we flush on a cadence below (~1 s,
-                    // aligned with the state-snapshot ticks), at game end,
-                    // and on drop. Crash durability: the last <1 s of
-                    // deltas may be lost; the replay viewer tolerates a
-                    // missing terminal marker, and the JSONL shape is
-                    // unchanged (frontend replay paths are byte-pinned).
+                    // Arch #13: line-oriented send to the dedicated writer
+                    // task — no in-tick BufWriter, no in-tick flush (the
+                    // writer flushes on its own ~1 s cadence). The send is
+                    // a cheap short-line allocation, bounded by tick count.
                     let recorded_delta = phase.recorded_delta.take();
-                    if let Some(rec) = replay_recorder.as_mut() {
-                        if let Some(d) = &recorded_delta {
-                            if let Ok(v) = serde_json::to_value(d) {
-                                let _ = writeln!(rec, "{{\"delta\":{}}}", v);
-                            }
-                        }
-                        // Perf #2: cadence flush (every 60 ticks ≈ 1 s).
-                        if tick_count.is_multiple_of(60) {
-                            let _ = rec.flush();
+                    if let (Some(d), Some(tx)) = (&recorded_delta, replay_tx.as_ref()) {
+                        if let Ok(v) = serde_json::to_value(d) {
+                            let _ = tx.send(format!("{{\"delta\":{}}}", v));
                         }
                     }
 
@@ -530,9 +785,14 @@ impl TickLoop {
                         .filter(|p| matches!(p, PlayerConnection::Player { .. }))
                         .count();
                     if human_count == 0 {
+                        // Arch #5: unified game-end (this branch already
+                        // removed the room; the behavior is unchanged).
                         let winner_id = game.determine_winner();
                         let player_ids: Vec<&str> = game.players().keys().map(|s| s.as_str()).collect();
-                        persist_game_end(
+                        finish_game(
+                            &mut players,
+                            spawned_handles,
+                            &server_state,
                             &storage_clone,
                             &room_id,
                             game_start_time,
@@ -540,31 +800,25 @@ impl TickLoop {
                             &[winner_id.as_deref().unwrap_or("")],
                             &player_ids,
                             &game,
-                        );
-                        let msg = ServerMessage::GameOver {
-                            winner: "Abandoned".to_string(),
-                            game_id: room_id.clone(),
-                            message: "Game abandoned — no human players remaining".to_string(),
-                        };
-                        let encoded = Bytes::from(encode_message(&msg));
-                        for player in &players {
-                            let _ = player.tx().send_reliable(encoded.clone()).await;
-                        }
-                        {
-                            let server = server_state.lock().await;
-                            let mut games = server.games.lock().await;
-                            games.remove(&room_id);
-                        }
-                        for handle in spawned_handles {
-                            handle.abort();
-                        }
+                            "Abandoned",
+                            "Game abandoned — no human players remaining",
+                            true,
+                        )
+                        .await;
                         break;
                     }
 
                     if players.is_empty() {
+                        // Arch #5: unified game-end (this branch already
+                        // removed the room; no GameOver is sent — there is
+                        // no one left in the room, so `finish_game`'s send
+                        // loop is a no-op here).
                         let winner_id = game.determine_winner();
                         let player_ids: Vec<&str> = game.players().keys().map(|s| s.as_str()).collect();
-                        persist_game_end(
+                        finish_game(
+                            &mut players,
+                            spawned_handles,
+                            &server_state,
                             &storage_clone,
                             &room_id,
                             game_start_time,
@@ -572,53 +826,28 @@ impl TickLoop {
                             &[winner_id.as_deref().unwrap_or("")],
                             &player_ids,
                             &game,
-                        );
-                        let server = server_state.lock().await;
-                        let mut games = server.games.lock().await;
-                        games.remove(&room_id);
-                        for handle in spawned_handles {
-                            handle.abort();
-                        }
+                            "Abandoned",
+                            "Game abandoned — no human players remaining",
+                            true,
+                        )
+                        .await;
                         break;
                     }
                 }
                 // Blocking command recv for non-tick-driven commands (player connections)
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(Command::MoveTroop { unit_id, owner_id, path }) => {
-                            // Ownership is enforced inside game.move_troops (single check).
-                            game.move_troops(&unit_id, &owner_id, path);
-                        }
-                        Some(Command::RecruitUnit(city_id, unit_type_name, owner)) => {
-                            if let Some(unit_type) = game.settings().unit_types.iter().find(|u| u.name == unit_type_name).cloned() {
-                                let _ = game.recruit_unit(&city_id, &unit_type, &owner);
-                            }
-                        }
-                        Some(Command::ToggleHealing { unit_id, owner_id, enabled }) => {
-                            game.toggle_healing(&unit_id, &owner_id, enabled);
-                        }
-                        Some(Command::ToggleResupply { unit_id, owner_id, enabled }) => {
-                            game.toggle_resupply(&unit_id, &owner_id, enabled);
-                        }
-                        Some(Command::UpgradeCity(city_id, owner)) => {
-                            let _ = game.upgrade_city(&city_id, &owner);
-                        }
-                        Some(Command::ToggleAdvisor(pid, enabled)) => {
-                            if let Some(advisor) = advisors.get_mut(&pid) {
-                                advisor.set_enabled(enabled);
-                            }
-                        }
-                        Some(Command::AddSpectator(sender)) => {
-                            // Sec L2: per-game spectator cap (the tick
-                            // task is the sole owner of `players`).
-                            add_spectator_capped(spectator_cap, &mut players, &game, sender)
-                                .await;
-                        }
-                        Some(Command::EmbarkUnit(unit_id, pid)) => {
-                            game.embark_unit(&unit_id, &pid);
-                        }
-                        Some(Command::DisembarkUnit(unit_id, pid)) => {
-                            game.disembark_unit(&unit_id, &pid);
+                        // Arch #4: same dispatch as the tick arm above.
+                        Some(cmd) => {
+                            let outcome = apply_command(cmd, &mut game);
+                            dispatch_outcome(
+                                outcome,
+                                &mut players,
+                                &game,
+                                &advisor_enabled,
+                                spectator_cap,
+                            )
+                            .await;
                         }
                         None => break,
                     }
@@ -626,16 +855,21 @@ impl TickLoop {
             }
         }
 
-        // Replay: terminal marker (best-effort — the game is over either
-        // way; the loop has already aborted all spawned tasks).
-        if let Some(rec) = replay_recorder.as_mut() {
+        // Replay: terminal marker (Arch #13) — sent as the LAST line before
+        // the sender is dropped, so the channel preserves ordering and the
+        // writer task (NOT in spawned_handles, so it survives the game-end
+        // aborts above) writes it after the spawned handles are aborted,
+        // then flushes on channel close. Best-effort — the game is over
+        // either way.
+        if let Some(tx) = replay_tx.as_ref() {
             let end_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let _ = writeln!(rec, "{{\"event\":\"game_end\",\"time\":{}}}", end_time);
-            let _ = rec.flush();
+            let _ = tx.send(format!("{{\"event\":\"game_end\",\"time\":{}}}", end_time));
         }
+        // `replay_tx` is dropped here (end of `run`), closing the channel:
+        // the writer task sees `None`, flushes, and exits.
     }
 
     /// Wraps [`TickLoop::run`] in the same `tokio::spawn` the inline

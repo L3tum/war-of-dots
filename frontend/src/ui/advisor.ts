@@ -1,4 +1,4 @@
-//! Advisor panel — displays advisor suggestions and manages the enable/disable toggle.
+// Advisor panel — displays advisor suggestions and manages the enable/disable toggle.
 
 import { escapeHtml } from './html';
 

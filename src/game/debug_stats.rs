@@ -37,7 +37,7 @@ impl DebugSystemGuard {
         }
     }
     /// Release builds record no tick timing; the stub keeps call sites
-    /// (and the struct fields, used by `SystemTimer`) uniform.
+    /// uniform.
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     pub fn new(_world: &mut World, world_entity: hecs::Entity) -> Self {
         Self {
@@ -75,20 +75,6 @@ impl DebugSystemGuard {
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     pub fn finish(self, _world: &mut World) {}
 
-    /// Record timing for a specific system.
-    #[cfg(any(debug_assertions, feature = "debug-overlay"))]
-    pub fn record_system(&self, world: &mut World, system_name: &str, duration_ms: f64) {
-        if let Some(wb) = world.world_data_mut(self.world_entity) {
-            let ds = &mut wb.debug_stats;
-            let timings = &mut ds.system_timings;
-            let entry = timings.entry(system_name.to_string()).or_default();
-            entry.record(duration_ms);
-        }
-    }
-    /// Release builds record no system timings; this is a no-op.
-    #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
-    pub fn record_system(&self, _world: &mut World, _system_name: &str, _duration_ms: f64) {}
-
     /// Record timing for a specific system sub-part (detailed benchmark mode).
     #[allow(dead_code)] // Used in debug/benchmark builds via feature flags
     #[cfg(any(debug_assertions, feature = "debug-overlay"))]
@@ -113,27 +99,6 @@ impl DebugSystemGuard {
     #[allow(dead_code)] // Kept in lockstep with the debug implementation above
     #[cfg(not(any(debug_assertions, feature = "debug-overlay")))]
     pub fn record_detailed(&self, _world: &mut World, _key: &str, _duration_ms: f64) {}
-}
-
-/// Helper to measure system execution time.
-pub struct SystemTimer {
-    pub name: String,
-    pub start: Instant,
-}
-
-impl SystemTimer {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            start: Instant::now(),
-        }
-    }
-
-    pub fn finish(self, guard: &DebugSystemGuard, world: &mut World) -> f64 {
-        let duration = self.start.elapsed().as_secs_f64() * 1000.0;
-        guard.record_system(world, &self.name, duration);
-        duration
-    }
 }
 
 /// Helper to measure sub-part timing within a system (detailed benchmark mode).

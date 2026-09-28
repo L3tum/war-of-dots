@@ -1,25 +1,16 @@
-//! Player state: funds, units, vision
+//! Player display state.
+//!
+//! Player resources (funds, units) live in ECS components and the `Game`
+//! internals; this struct carries only the display name the server reads
+//! (e.g. the GameOver winner lookup in `server/room/tick.rs`).
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Player {
-    pub id: String,
     pub name: String,
-    pub is_human: bool,
-    pub funds: u32,
-    pub units: Vec<String>, // unit ids
-    pub cities_owned: Vec<String>,
 }
 
 impl Player {
-    pub fn new(id: String, name: String, is_human: bool, starting_funds: u32) -> Self {
-        Player {
-            id,
-            name,
-            is_human,
-            funds: starting_funds,
-            units: Vec::new(),
-            cities_owned: Vec::new(),
-        }
+    pub fn new(name: String) -> Self {
+        Player { name }
     }
 }

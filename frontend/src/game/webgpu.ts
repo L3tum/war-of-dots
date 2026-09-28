@@ -1,5 +1,5 @@
-//! Shared WebGPU bootstrap — the single adapter + device acquisition sequence
-//! used by every page path (live game, live replay/spectator WebSocket).
+// Shared WebGPU bootstrap — the single adapter + device acquisition sequence
+// used by every page path (live game, live replay/spectator WebSocket).
 
 /**
  * Request a high-performance WebGPU adapter and a device from it.

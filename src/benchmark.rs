@@ -700,6 +700,24 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                 net_baselines.commit_vision(String::new(), Arc::new(v));
             }
         }
+        // Perf #3: persistent per-tick funds scratch (same pattern as the
+        // live tick loop) — keys are the stable player-id set, values are
+        // refilled in place per tick; `commit` swaps it with the baseline
+        // (drain-back), so no fresh funds HashMap is allocated per tick.
+        let mut funds_scratch: std::collections::HashMap<String, u32> = player_ids
+            .iter()
+            .map(|k| (k.clone(), game.player_funds(k)))
+            .collect();
+        let refill_funds = |game: &Game, scratch: &mut std::collections::HashMap<String, u32>| {
+            for pid in game.players().keys() {
+                match scratch.get_mut(pid) {
+                    Some(v) => *v = game.player_funds(pid),
+                    None => {
+                        scratch.insert(pid.clone(), game.player_funds(pid));
+                    }
+                }
+            }
+        };
 
         // Warmup (with AI to warm up caches & archetypes)
         for _ in 0..BENCH_WARMUP_TICKS {
@@ -709,15 +727,17 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
             // H5: plain engine city snapshot (the server converts to wire
             // types only inside the diff/commit).
             let current_cities: Vec<crate::game::economy::City> = game.query_cities();
+            refill_funds(&game, &mut funds_scratch);
             let phase = run_network_phase(
                 &game,
                 &mut net_baselines,
                 &player_id_strs,
                 TickDiffs {
                     units: unit_diff,
-                    cities: current_cities,
+                    cities: Arc::new(current_cities),
                     border_grid: game.territory_grid_flat(),
                 },
+                &mut funds_scratch,
                 config.bench_splice,
                 None, // no replay recording in the benchmark
             );
@@ -786,6 +806,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                     // H5: plain engine city snapshot (the server converts to
                     // wire types only inside the diff/commit).
                     let current_cities: Vec<crate::game::economy::City> = game.query_cities();
+                    // Perf #3: refill the persistent funds scratch in place
+                    // (the live tick loop does the same just before the
+                    // network phase; kept inside the timing block so the
+                    // measurement matches the live tick's profile).
+                    refill_funds(&game, &mut funds_scratch);
                     // B0 attribution note: `territory_grid_flat` is an
                     // allocation-free Arc clone; fetching it OUTSIDE the
                     // snapshot sub-window matches its pre-H3 placement
@@ -803,9 +828,10 @@ pub fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResults {
                             &player_id_strs,
                             TickDiffs {
                                 units: unit_diff,
-                                cities: current_cities,
+                                cities: Arc::new(current_cities),
                                 border_grid,
                             },
+                            &mut funds_scratch,
                             config.bench_splice,
                             None, // no replay recording in the benchmark
                         ),

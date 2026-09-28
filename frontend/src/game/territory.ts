@@ -1,15 +1,15 @@
-//! Client-side territory fill for display purposes.
-//!
-//! The server sends a border grid where most cells are 255 (unclaimed) and only
-//! cells within a small influence radius of a city/unit carry a player index.
-//! For visual purposes, we fill the gaps via multi-source BFS so that borders
-//! appear as contiguous territory regions rather than disconnected blobs.
-//!
-//! Hot path (the renderer, Perf #3): `TerritoryFiller.fill()` — flat row-major
-//! `Uint8Array`s with grow-only reusable scratch and zero per-cell allocation,
-//! so the fill can run at update rate without GC pressure. `fillTerritory`
-//! keeps the historical 2-D array-of-arrays signature for tests and one-off
-//! callers (it delegates to the same flat core).
+// Client-side territory fill for display purposes.
+//
+// The server sends a border grid where most cells are 255 (unclaimed) and only
+// cells within a small influence radius of a city/unit carry a player index.
+// For visual purposes, we fill the gaps via multi-source BFS so that borders
+// appear as contiguous territory regions rather than disconnected blobs.
+//
+// Hot path (the renderer, Perf #3): `TerritoryFiller.fill()` — flat row-major
+// `Uint8Array`s with grow-only reusable scratch and zero per-cell allocation,
+// so the fill can run at update rate without GC pressure. `fillTerritory`
+// keeps the historical 2-D array-of-arrays signature for tests and one-off
+// callers (it delegates to the same flat core).
 
 export const TERRITORY_NONE = 255;
 

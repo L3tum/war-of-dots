@@ -12,10 +12,14 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Maximum payload per frame. The largest real frame is a full-state /
-/// grid-dirty delta (~64 KB in the stress profile); 256 KB leaves headroom
-/// while bounding the per-frame allocation a peer can demand.
-pub const MAX_FRAME_SIZE: usize = 256 * 1024;
+/// Maximum payload per frame. The default map's FullState is ~280 KB of
+/// CBOR (200×200 grid, cities, units); handcrafted maps from `maps/` can
+/// be larger still. 2 MB leaves ~7× headroom over the largest known frame
+/// while still bounding the per-frame allocation a peer can demand (the
+/// original 256 KB cap predates the default map's growth and silently
+/// broke every raw-TCP game start: the egress loop died on the FullState
+/// write and the tick loop abandoned the game within one tick).
+pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
 /// Read exactly one frame: 4-byte BE length, then that many payload bytes.
 ///

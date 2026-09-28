@@ -129,18 +129,23 @@ async fn main() -> anyhow::Result<()> {
     // Detect bench args provided without --benchmark to prevent silent hangs.
     #[cfg(feature = "microbenchmarks")]
     if !cli.benchmark {
-        let has_bench_args = cli.bench_units != 20
-            || cli.bench_players != 4
-            || cli.bench_ticks != 500
-            || cli.bench_seed != 0
-            || !cli.bench_detailed.is_empty()
-            || cli.bench_html.is_some()
-            || cli.bench_prev.is_some()
-            || cli.bench_initial_units.is_some()
-            || cli.bench_map_size != 200
-            || cli.bench_cities != 12
-            || cli.bench_recruiting != 2000
-            || cli.bench_spectator;
+        // Detect "the user passed a bench flag" by comparing the real parse
+        // against a baseline parse of no args (pure defaults). The
+        // `default_value`s above are the single source of truth — no default
+        // is restated here, so the check can't drift out of sync with them.
+        let baseline = Cli::try_parse_from(["war-of-dots"]).expect("empty arg list always parses");
+        let has_bench_args = cli.bench_units != baseline.bench_units
+            || cli.bench_players != baseline.bench_players
+            || cli.bench_ticks != baseline.bench_ticks
+            || cli.bench_seed != baseline.bench_seed
+            || cli.bench_detailed != baseline.bench_detailed
+            || cli.bench_html != baseline.bench_html
+            || cli.bench_prev != baseline.bench_prev
+            || cli.bench_initial_units != baseline.bench_initial_units
+            || cli.bench_map_size != baseline.bench_map_size
+            || cli.bench_cities != baseline.bench_cities
+            || cli.bench_recruiting != baseline.bench_recruiting
+            || cli.bench_spectator != baseline.bench_spectator;
 
         if has_bench_args {
             eprintln!("error: bench arguments provided without --benchmark flag");
@@ -201,4 +206,61 @@ async fn main() -> anyhow::Result<()> {
     game_server.run().await?;
 
     Ok(())
+}
+
+// Regression guard for the bench-presence check above: a pure-default parse
+// must not be flagged, a value equal to its default must not be flagged
+// (indistinguishable from not passing — matches the original `!= default`
+// semantics), and a non-default value must be flagged.
+#[cfg(test)]
+#[cfg(feature = "microbenchmarks")]
+mod bench_arg_detection_tests {
+    use clap::Parser;
+
+    fn has_bench_args(cli: &super::Cli) -> bool {
+        let baseline = super::Cli::try_parse_from(["war-of-dots"]).unwrap();
+        cli.bench_units != baseline.bench_units
+            || cli.bench_players != baseline.bench_players
+            || cli.bench_ticks != baseline.bench_ticks
+            || cli.bench_seed != baseline.bench_seed
+            || cli.bench_detailed != baseline.bench_detailed
+            || cli.bench_html != baseline.bench_html
+            || cli.bench_prev != baseline.bench_prev
+            || cli.bench_initial_units != baseline.bench_initial_units
+            || cli.bench_map_size != baseline.bench_map_size
+            || cli.bench_cities != baseline.bench_cities
+            || cli.bench_recruiting != baseline.bench_recruiting
+            || cli.bench_spectator != baseline.bench_spectator
+    }
+
+    #[test]
+    fn pure_defaults_are_not_flagged() {
+        let cli = super::Cli::try_parse_from(["war-of-dots"]).unwrap();
+        assert!(
+            !has_bench_args(&cli),
+            "no args must not look like bench args"
+        );
+    }
+
+    #[test]
+    fn explicit_value_equal_to_default_is_not_flagged() {
+        // Passing --bench-ticks 500 (== its default) is indistinguishable from
+        // not passing it, so it is NOT flagged — exactly matching the original
+        // `cli.bench_ticks != 500` behavior (a value equal to the default is a
+        // no-op, so there is nothing to warn about).
+        let cli = super::Cli::try_parse_from(["war-of-dots", "--bench-ticks", "500"]).unwrap();
+        assert!(
+            !has_bench_args(&cli),
+            "value equal to default must not be flagged"
+        );
+    }
+
+    #[test]
+    fn explicit_non_default_value_is_flagged() {
+        let cli = super::Cli::try_parse_from(["war-of-dots", "--bench-units", "7"]).unwrap();
+        assert!(
+            has_bench_args(&cli),
+            "explicit --bench-units must be detected"
+        );
+    }
 }

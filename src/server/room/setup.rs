@@ -1,20 +1,21 @@
 //! Setup phase of `GameRoom::new`, extracted verbatim from `mod.rs`:
 //! game creation (Game::new + start), city assignment, starting recruits,
-//! replay-recorder init (Option<BufWriter<File>>), `settings_json`, the
-//! initial FullState send to each player, LLM client/agent creation
-//! (`llm_pairs`), plus channel creation and a few scalars. `prepare_game`
-//! bundles everything `llm_tasks::spawn_llm_agents`,
-//! `llm_tasks::spawn_advisors` and the `tick::TickLoop` literal consume
-//! into a [`PreparedRoom`].
+//! replay-recorder init (the line-oriented sender to the dedicated writer
+//! task in `tick.rs`), `settings_json`, the initial FullState send to each
+//! player, LLM client/agent creation (`llm_pairs`), plus channel creation
+//! and a few scalars. `prepare_game` bundles everything
+//! `llm_tasks::spawn_llm_agents`, `llm_tasks::spawn_advisors` and the
+//! `tick::TickLoop` literal consume into a [`PreparedRoom`].
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use super::tick::replay_writer_task;
 use super::{Command, LlmPlayerConfig, PlayerConnection};
 use crate::config::Config;
 use crate::game::game::{Game, GameSettings};
-use crate::llm::advisor::Advisor;
 use crate::llm::agent::{GameState, LlmAgent};
 use crate::llm::clients::LlmClient;
 use crate::map::map::Map;
@@ -28,14 +29,19 @@ use crate::storage::Storage;
 pub(crate) struct PreparedRoom {
     pub(super) game: Game,
     pub(super) players: Vec<PlayerConnection>,
-    pub(super) replay_recorder: Option<std::io::BufWriter<std::fs::File>>,
+    /// Arch #13: line-oriented sender to the dedicated replay writer task
+    /// (`tick::replay_writer_task`), which owns the `BufWriter<File>`.
+    /// `None` when the game is not recorded (pure-LLM, no human viewpoint).
+    pub(super) replay_tx: Option<mpsc::UnboundedSender<String>>,
     pub(super) record_pid: Option<String>,
     pub(super) settings_json: String,
     pub(super) llm_pairs: Vec<(LlmAgent, LlmClient)>,
     pub(super) cmd_tx: mpsc::UnboundedSender<Command>,
     pub(super) cmd_rx: mpsc::UnboundedReceiver<Command>,
     pub(super) state_broadcasts: HashMap<String, tokio::sync::broadcast::Sender<GameState>>,
-    pub(super) advisors: HashMap<String, Advisor>,
+    /// HIGH #1: per-player advisor enable flags (shared by `Arc` with the
+    /// tick loop and each spawned advisor task). Disabled by default.
+    pub(super) advisor_enabled: HashMap<String, Arc<AtomicBool>>,
     pub(super) advisor_client_opt: Option<LlmClient>,
     pub(super) interval_ms: u64,
     pub(super) game_start_time: u64,
@@ -160,15 +166,27 @@ pub(crate) fn prepare_game(
     // builds deltas for human pids (`regular_pids`), so a pure-LLM
     // viewpoint would yield an empty file. Pure-LLM games (no human
     // connections) simply aren't recorded.
+    // Arch #13: the file IO lives in a dedicated writer task
+    // (`tick::replay_writer_task`): the tick task only sends line-oriented
+    // strings over `replay_tx` (channel order = file order: full_state,
+    // per-tick deltas, terminal game_end marker — the marker is sent as
+    // the last line before the sender is dropped). The writer owns the
+    // BufWriter and flushes on its own ~1 s cadence. Recording is
+    // deliberately non-fatal: a disk failure degrades to "no replay",
+    // never a broken game. The writer task is deliberately NOT tracked in
+    // `spawned_handles` — it must survive the game-end aborts to flush the
+    // terminal marker.
     let record_pid: Option<String> = players.iter().find_map(|p| p.id().cloned());
-    let mut replay_recorder: Option<std::io::BufWriter<std::fs::File>> = None;
+    let mut replay_tx: Option<mpsc::UnboundedSender<String>> = None;
     if record_pid.is_some() {
         let dir = config.storage.replay_path.clone();
         let _ = std::fs::create_dir_all(&dir);
-        match std::fs::File::create(std::path::Path::new(&dir).join(format!("{}.jsonl", room_id))) {
-            Ok(f) => replay_recorder = Some(std::io::BufWriter::new(f)),
-            Err(e) => tracing::warn!("replay: cannot create file for game {}: {}", room_id, e),
-        }
+        let path = std::path::Path::new(&dir).join(format!("{}.jsonl", room_id));
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        // Drop the JoinHandle — dropping a tokio handle does not abort the
+        // task (the writer outlives the tick loop on purpose).
+        tokio::spawn(replay_writer_task(path, rx));
+        replay_tx = Some(tx);
     }
 
     // Settings payload for the game_metadata row written at game end:
@@ -180,13 +198,13 @@ pub(crate) fn prepare_game(
         let player_id = player.id().cloned().unwrap_or_default();
         let initial_state = game.full_state_with_player_id(&player_id);
         // Replay: log the viewpoint's initial full state (the same
-        // payload about to be sent on the wire), flushed immediately so
-        // the file is playable even if the process dies mid-game.
+        // payload about to be sent on the wire). The writer task flushes
+        // the header line immediately, so the file is playable even if the
+        // process dies mid-game.
         if record_pid.as_deref() == Some(player_id.as_str()) {
-            if let Some(rec) = replay_recorder.as_mut() {
+            if let Some(tx) = replay_tx.as_ref() {
                 if let Ok(v) = serde_json::to_value(&initial_state) {
-                    let _ = writeln!(rec, "{{\"full_state\":{}}}", v);
-                    let _ = rec.flush();
+                    let _ = tx.send(format!("{{\"full_state\":{}}}", v));
                 }
             }
         }
@@ -229,7 +247,8 @@ pub(crate) fn prepare_game(
         llm_pairs.push((agent, client));
     }
 
-    // Create advisors for human players (disabled by default)
+    // Create the advisor LLM client (only when configured) — the shared
+    // per-player enable flags are built from it just below.
     let advisor_client_opt = if let Some(provider_name) = config.llm.advisor_provider.as_ref() {
         if let Some(provider_config) = config
             .llm
@@ -256,18 +275,23 @@ pub(crate) fn prepare_game(
         None
     };
 
-    let mut advisors: std::collections::HashMap<String, crate::llm::advisor::Advisor> =
-        std::collections::HashMap::new();
-    if let Some(ref _advisor_client) = advisor_client_opt {
+    // HIGH #1: per-player advisor enable FLAGS (one `Arc<AtomicBool>` per
+    // human player, disabled by default) — shared with the tick loop
+    // (Command::ToggleAdvisor writes it) and each spawned advisor task
+    // (reads it before every 60 s LLM call). Replaces the old
+    // `HashMap<String, Advisor>`, which was dead state: `spawn_advisors`
+    // built a fresh `Advisor::new()` with `set_enabled(true)` every
+    // iteration, so the tick loop's toggle mutated a copy nobody read —
+    // the toggle did nothing, and the provider was called every 60 s per
+    // human player even when "disabled". The `Advisor` itself now lives
+    // inside the spawned task (created once, outside the loop).
+    let mut advisor_enabled: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+    if advisor_client_opt.is_some() {
         for player in &players {
-            let advisor = crate::llm::advisor::Advisor::new();
             if let Some(id) = player.id() {
-                advisors.insert(id.clone(), advisor);
+                // Intended default: DISABLED (no LLM spend until toggled on).
+                advisor_enabled.insert(id.clone(), Arc::new(AtomicBool::new(false)));
             }
-        }
-        // Set all advisors disabled initially
-        for advisor in advisors.values_mut() {
-            advisor.set_enabled(false);
         }
     }
 
@@ -286,14 +310,14 @@ pub(crate) fn prepare_game(
     PreparedRoom {
         game,
         players,
-        replay_recorder,
+        replay_tx,
         record_pid,
         settings_json,
         llm_pairs,
         cmd_tx,
         cmd_rx,
         state_broadcasts,
-        advisors,
+        advisor_enabled,
         advisor_client_opt,
         interval_ms,
         game_start_time,

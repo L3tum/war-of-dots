@@ -1,7 +1,7 @@
-//! Differential tests for the flat border-edge scan (Perf #3): the renderer
-//! hot path (`detectBorderEdgesFlat`, flat row-major + struct-of-arrays
-//! buffers) must emit exactly the edges of the historical 2-D
-//! `detectBorderEdges`, in the same order.
+// Differential tests for the flat border-edge scan (Perf #3): the renderer
+// hot path (`detectBorderEdgesFlat`, flat row-major + struct-of-arrays
+// buffers) must emit exactly the edges of the historical 2-D
+// `detectBorderEdges`, in the same order.
 
 import { describe, it, expect } from 'vitest';
 import { detectBorderEdges, detectBorderEdgesFlat, type EdgeBuffers } from './geometry';

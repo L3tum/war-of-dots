@@ -1,7 +1,7 @@
-//! Renderer tests — run the REAL Renderer against the recording fake GPU
-//! (frontend/src/test/fake_gpu.ts). Geometry assertions read the recorded
-//! `queue.writeBuffer` payloads (world-space, as emitted — the camera transform
-//! lives in WGSL and is not re-implemented here).
+// Renderer tests — run the REAL Renderer against the recording fake GPU
+// (frontend/src/test/fake_gpu.ts). Geometry assertions read the recorded
+// `queue.writeBuffer` payloads (world-space, as emitted — the camera transform
+// lives in WGSL and is not re-implemented here).
 
 import { describe, it, expect, vi } from 'vitest';
 import { Renderer } from './renderer';

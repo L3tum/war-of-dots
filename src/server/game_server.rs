@@ -73,7 +73,6 @@ pub struct GameServer {
     pub(crate) storage: crate::storage::Storage,
 }
 
-#[allow(dead_code)]
 impl GameServer {
     pub async fn new(config: Config, port: u16) -> anyhow::Result<Self> {
         let storage = crate::storage::Storage::new(
