@@ -21,10 +21,12 @@ over it.
 - CI lives in `.github/workflows/ci.yml`; e2e exit code 77 (skip) is a hard
   failure there, so a silently-skipped e2e cannot pass CI
 
-## reports/ — keep tracked, never gitignore
+## reports/ — keep tracked, never delete
 
-**`reports/` is intentionally tracked. Do not add it to `.gitignore`, delete it,
-or "clean it up" as generated artifacts.**
+**`reports/` is intentionally tracked. NEVER remove it — no gitignoring, no
+deleting files, no "cleaning it up" as generated artifacts. This applies to
+agent-driven bulk deletions and repo-hygiene passes too: the folder's size is
+not bloat, it is the committed performance baseline.**
 
 - It holds the committed benchmark/stress HTML+JSON reports. The benchmark
   harness (`run-benchmark.sh`, `run-stresstest.sh`) writes to the same file
@@ -39,6 +41,10 @@ or "clean it up" as generated artifacts.**
   noisy run would become the baseline everything else is judged against.
 - Comparisons are only meaningful when ticks/units match; the report header
   names the file it was compared against.
+- (2026-09-28: a review-driven "hygiene" commit deleted ~125 report files in
+  violation of this rule; they were restored from the parent commit. If this
+  ever happens again, restore with `git checkout <commit-before-deletion> --
+  reports/`.)
 
 ## Gotchas
 
