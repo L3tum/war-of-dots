@@ -23,7 +23,7 @@
     "@eslint/js": "^9.37.0",
     "@playwright/test": "~1.59.0",
     "@webgpu/types": "^0.1.71",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.28.1",
     "eslint": "^9.37.0",
     "happy-dom": "^20.11.1",
     "json-schema-to-typescript": "^15.0.4",
