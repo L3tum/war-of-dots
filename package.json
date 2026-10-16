@@ -1,5 +1,5 @@
 {
   "devDependencies": {
-    "json-schema-to-typescript": "^15.0.4"
+    "json-schema-to-typescript": "15.0.4"
   }
 }
